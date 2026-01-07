@@ -7,16 +7,13 @@ This extension helps users allocate Slurm resources on SCIAMA and connect VS Cod
 - SSH keys configured for the cluster (agent forwarding recommended).
 - `vscode-shell-proxy.py` available on the login nodes (via module load or PATH).
 
-## Quick start
-1. Install dependencies and build:
-   ```bash
-   npm install
-   npm run compile
-   ```
-2. Configure settings (example below) or use the **Sciama Slurm** activity bar view.
-3. In the side view, fill in login host, username, and identity file, click **Get cluster info**, select resources, then **Save + Connect**.
+## Quick start (users)
+1. Install the extension.
+2. Open the **Sciama Slurm** view from the activity bar.
+3. Enter login host, username, and identity file.
+4. Click **Get cluster info**, choose resources, then **Connect**.
 
-The command will query the login host, prompt for resources, create a temporary SSH config entry, and connect. Your main SSH config is not modified.
+The extension will query the login host, create a temporary SSH config entry, connect, and then restore your previous Remote-SSH config setting. Your main SSH config is not modified.
 
 ## Example settings (SCIAMA)
 ```json
@@ -52,3 +49,14 @@ The command should output hostnames separated by whitespace or newlines.
 - Set `sciamaSlurm.remoteWorkspacePath` to open a specific remote folder. Leave it empty to connect without opening a folder.
 - `sciamaSlurm.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
 - To add GPUs or other flags, use `sciamaSlurm.extraSallocArgs` (e.g. `["--gres=gpu:1"]`).
+
+## Development
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
+2. Build the extension:
+   ```bash
+   npm run compile
+   ```
+3. Press **F5** to launch the Extension Development Host.
