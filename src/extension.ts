@@ -60,6 +60,7 @@ interface PartitionInfo {
 interface ClusterInfo {
   partitions: PartitionInfo[];
   defaultPartition?: string;
+  modules?: string[];
 }
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
@@ -81,6 +82,7 @@ const PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
 export function activate(context: vscode.ExtensionContext): void {
   extensionStoragePath = context.globalStorageUri.fsPath;
   extensionGlobalState = context.globalState;
+  syncConnectionStateFromEnvironment();
   const disposable = vscode.commands.registerCommand('sciamaSlurm.connect', () => {
     void connectCommand();
   });
@@ -261,6 +263,41 @@ function setConnectionState(state: ConnectionState): void {
   postToWebview({ command: 'connectionState', state });
 }
 
+function resolveRemoteSshAlias(): string | undefined {
+  if (vscode.env.remoteName !== 'ssh-remote') {
+    return undefined;
+  }
+  const folders = vscode.workspace.workspaceFolders;
+  const authority = folders && folders.length > 0 ? folders[0].uri.authority : undefined;
+  if (!authority) {
+    return undefined;
+  }
+  const plusIndex = authority.indexOf('+');
+  const raw = plusIndex >= 0 ? authority.slice(plusIndex + 1) : authority;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function syncConnectionStateFromEnvironment(): void {
+  const remoteActive = vscode.env.remoteName === 'ssh-remote';
+  if (remoteActive) {
+    if (connectionState === 'idle') {
+      connectionState = 'connected';
+    }
+    const alias = resolveRemoteSshAlias();
+    if (alias) {
+      lastConnectionAlias = alias;
+    }
+    return;
+  }
+  if (connectionState === 'connected') {
+    connectionState = 'idle';
+  }
+}
+
 function mergeUiValuesWithDefaults(values?: Partial<UiValues>): UiValues {
   const defaults = getUiValuesFromConfig(getConfig());
   if (!values) {
@@ -411,6 +448,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
     webview.onDidReceiveMessage(async (message) => {
       switch (message.command) {
         case 'ready': {
+          syncConnectionStateFromEnvironment();
           let activeProfile = getActiveProfileName();
           const defaults = getUiValuesFromConfig(getConfig());
           let values = defaults;
@@ -431,7 +469,8 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             clusterInfoCachedAt: cached?.fetchedAt,
             profiles: getProfileSummaries(getProfileStore()),
             activeProfile,
-            connectionState
+            connectionState,
+            remoteActive: vscode.env.remoteName === 'ssh-remote'
           });
           break;
         }
@@ -517,6 +556,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             break;
           }
           await setActiveProfileName(name);
+          syncConnectionStateFromEnvironment();
           const host = firstLoginHostFromInput(profile.values.loginHosts);
           const cached = host ? getCachedClusterInfo(host) : undefined;
           webview.postMessage({
@@ -527,6 +567,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             profiles: getProfileSummaries(store),
             activeProfile: name,
             connectionState,
+            remoteActive: vscode.env.remoteName === 'ssh-remote',
             profileStatus: `Loaded profile "${name}".`
           });
           break;
@@ -871,6 +912,32 @@ async function querySimpleList(loginHost: string, cfg: SciamaConfig, command: st
   }
 }
 
+async function queryAvailableModules(loginHost: string, cfg: SciamaConfig): Promise<string[]> {
+  const log = getOutputChannel();
+  const commands = [
+    'module -t avail 2>&1',
+    'bash -lc "module -t avail 2>&1"'
+  ];
+
+  for (const command of commands) {
+    try {
+      log.appendLine(`Module list command: ${command}`);
+      const output = await runSshCommand(loginHost, cfg, command);
+      const lowered = output.toLowerCase();
+      if (lowered.includes('command not found') || lowered.includes('module: not found')) {
+        continue;
+      }
+      const modules = parseSimpleList(output);
+      if (modules.length > 0) {
+        return modules;
+      }
+    } catch (error) {
+      log.appendLine(`Module list command failed: ${formatError(error)}`);
+    }
+  }
+  return [];
+}
+
 async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webview): Promise<void> {
   const overrides = buildOverridesFromUi(values);
   const cfg = getConfigWithOverrides(overrides);
@@ -906,6 +973,7 @@ async function fetchClusterInfo(loginHost: string, cfg: SciamaConfig): Promise<C
   ].filter(Boolean);
 
   let lastInfo: ClusterInfo = { partitions: [] };
+  let bestInfo: ClusterInfo | undefined;
   const log = getOutputChannel();
   for (const command of commands) {
     log.appendLine(`Cluster info command: ${command}`);
@@ -924,10 +992,14 @@ async function fetchClusterInfo(loginHost: string, cfg: SciamaConfig): Promise<C
       continue;
     }
     if (hasMeaningfulClusterInfo(info)) {
-      return info;
+      bestInfo = info;
+      break;
     }
   }
-  return lastInfo;
+  const info = bestInfo ?? lastInfo;
+  const modules = await queryAvailableModules(loginHost, cfg);
+  info.modules = modules;
+  return info;
 }
 
 function hasMeaningfulClusterInfo(info: ClusterInfo): boolean {
@@ -1706,6 +1778,26 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
   const sshCommands = availableCommands.filter((command) => /ssh|openssh|remote\.close/i.test(command));
   log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
 
+  if (vscode.env.remoteName === 'ssh-remote') {
+    const directCommands = [
+      'workbench.action.remote.close',
+      'workbench.action.remote.closeRemoteConnection'
+    ];
+    for (const command of directCommands) {
+      if (!availableCommands.includes(command)) {
+        continue;
+      }
+      try {
+        log.appendLine(`Trying disconnect command: ${command}`);
+        await vscode.commands.executeCommand(command);
+        log.appendLine(`Disconnect command succeeded: ${command}`);
+        return true;
+      } catch (error) {
+        log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
+      }
+    }
+  }
+
   const candidates: Array<[string, unknown]> = [];
   if (alias) {
     candidates.push(
@@ -1726,6 +1818,7 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
     ['remote-ssh.closeRemote', undefined],
     ['remote-ssh.closeRemoteConnection', undefined],
     ['remote-ssh.disconnect', undefined],
+    ['workbench.action.remote.close', undefined],
     ['workbench.action.remote.closeRemoteConnection', undefined]
   );
 
@@ -1982,6 +2075,45 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .hidden { display: none; }
     .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
     details summary { cursor: pointer; margin-bottom: 6px; color: var(--vscode-foreground); }
+    .module-row { align-items: center; }
+    .row > .module-actions { flex: 0 0 auto; }
+    .row > .module-picker { flex: 1; }
+    .module-actions button { width: auto; min-width: 32px; }
+    .module-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+    .module-picker { position: relative; }
+    .module-toggle { width: auto; min-width: 28px; padding: 0 6px; }
+    .module-menu {
+      position: absolute;
+      top: calc(100% + 2px);
+      left: 0;
+      right: 0;
+      max-height: 180px;
+      overflow-y: auto;
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 4px;
+      z-index: 5;
+      display: none;
+    }
+    .module-menu.visible { display: block; }
+    .module-option {
+      padding: 4px 6px;
+      cursor: pointer;
+    }
+    .module-option:hover {
+      background: var(--vscode-list-hoverBackground, var(--vscode-button-hoverBackground));
+    }
+    .module-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 6px;
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 4px;
+      background: var(--vscode-input-background);
+    }
+    .module-item button { width: auto; min-width: 28px; padding: 2px 6px; }
   </style>
 </head>
 <body>
@@ -2066,6 +2198,25 @@ function getWebviewHtml(webview: vscode.Webview): string {
   </div>
 
   <div class="section">
+    <label for="moduleInput">Modules</label>
+    <div class="row module-row">
+      <div class="module-picker">
+        <input id="moduleInput" type="text" placeholder="Type module(s) or pick from the list" />
+        <div id="moduleMenu" class="module-menu"></div>
+      </div>
+      <div class="module-actions">
+        <button id="moduleToggle" class="module-toggle" type="button" aria-label="Show modules">v</button>
+      </div>
+      <div class="module-actions">
+        <button id="moduleAdd" type="button">+</button>
+      </div>
+    </div>
+    <div id="moduleList" class="module-list"></div>
+    <div id="moduleHint" class="hint"></div>
+    <input id="moduleLoad" type="hidden" />
+  </div>
+
+  <div class="section">
     <div class="checkbox">
       <input id="openInNewWindow" type="checkbox" />
       <label for="openInNewWindow">Open in new window</label>
@@ -2088,8 +2239,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="qosCommand" type="text" />
     <label for="accountCommand">Account command (optional)</label>
     <input id="accountCommand" type="text" />
-    <label for="moduleLoad">Module load</label>
-    <input id="moduleLoad" type="text" />
     <label for="proxyCommand">Proxy command</label>
     <input id="proxyCommand" type="text" />
     <label for="proxyArgs">Proxy args (space or newline separated)</label>
@@ -2148,6 +2297,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let clusterMode = false;
     let lastValues = {};
     let connectionState = 'idle';
+    let availableModules = [];
+    let selectedModules = [];
+    let customModuleCommand = '';
 
     const resourceFields = {
       defaultPartition: { select: 'defaultPartitionSelect', input: 'defaultPartitionInput', list: 'partitionOptions' },
@@ -2310,6 +2462,160 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
     }
 
+    function parseModuleList(input) {
+      return String(input || '')
+        .split(/[\s,]+/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
+
+    function updateModuleHint() {
+      const hint = document.getElementById('moduleHint');
+      if (!hint) return;
+      if (customModuleCommand) {
+        hint.textContent = 'Custom module command set; adding modules will replace it.';
+        return;
+      }
+      if (!availableModules.length) {
+        hint.textContent = 'No module list available. Type module names below.';
+        return;
+      }
+      hint.textContent = availableModules.length + ' modules available. Click the dropdown button or type to filter.';
+    }
+
+    function syncModuleLoadValue() {
+      const command = selectedModules.length > 0
+        ? 'module load ' + selectedModules.join(' ')
+        : customModuleCommand;
+      setValue('moduleLoad', command || '');
+    }
+
+    function renderModuleList() {
+      const container = document.getElementById('moduleList');
+      if (!container) return;
+      container.innerHTML = '';
+      selectedModules.forEach((moduleName) => {
+        const row = document.createElement('div');
+        row.className = 'module-item';
+        const label = document.createElement('span');
+        label.textContent = moduleName;
+        row.appendChild(label);
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '-';
+        remove.addEventListener('click', () => {
+          selectedModules = selectedModules.filter((entry) => entry !== moduleName);
+          renderModuleList();
+        });
+        row.appendChild(remove);
+        container.appendChild(row);
+      });
+      syncModuleLoadValue();
+      updateModuleHint();
+    }
+
+    function applyModuleLoad(value) {
+      const trimmed = String(value || '').trim();
+      selectedModules = [];
+      customModuleCommand = '';
+      if (!trimmed) {
+        renderModuleList();
+        return;
+      }
+      const moduleMatch = trimmed.match(/^module\s+load\s+(.+)$/i);
+      const mlMatch = trimmed.match(/^ml\s+(.+)$/i);
+      const match = moduleMatch || mlMatch;
+      if (match) {
+        selectedModules = parseModuleList(match[1]);
+      } else {
+        customModuleCommand = trimmed;
+      }
+      renderModuleList();
+    }
+
+    function setModuleOptions(modules) {
+      const list = Array.isArray(modules) ? modules : [];
+      availableModules = list.slice();
+      const toggle = document.getElementById('moduleToggle');
+      if (toggle) {
+        toggle.disabled = availableModules.length === 0;
+      }
+      updateModuleHint();
+    }
+
+    function filterModules(filterText) {
+      const text = String(filterText || '').trim().toLowerCase();
+      if (!text) {
+        return availableModules.slice();
+      }
+      return availableModules.filter((name) => name.toLowerCase().includes(text));
+    }
+
+    function renderModuleMenu(options) {
+      const menu = document.getElementById('moduleMenu');
+      if (!menu) return;
+      menu.innerHTML = '';
+      const items = Array.isArray(options) ? options : [];
+      if (items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'module-option';
+        empty.textContent = availableModules.length ? 'No matches' : 'No modules available';
+        menu.appendChild(empty);
+        return;
+      }
+      items.forEach((moduleName) => {
+        const option = document.createElement('div');
+        option.className = 'module-option';
+        option.textContent = moduleName;
+        option.addEventListener('mousedown', (event) => {
+          event.preventDefault();
+          const input = document.getElementById('moduleInput');
+          if (input) {
+            input.value = moduleName;
+            input.focus();
+          }
+          hideModuleMenu();
+        });
+        menu.appendChild(option);
+      });
+    }
+
+    function showModuleMenu(showAll) {
+      const menu = document.getElementById('moduleMenu');
+      const input = document.getElementById('moduleInput');
+      if (!menu || !input || availableModules.length === 0) return;
+      const options = showAll ? availableModules.slice() : filterModules(input.value);
+      renderModuleMenu(options);
+      menu.classList.add('visible');
+    }
+
+    function hideModuleMenu() {
+      const menu = document.getElementById('moduleMenu');
+      if (menu) {
+        menu.classList.remove('visible');
+      }
+    }
+
+    function addModulesFromInput() {
+      const input = document.getElementById('moduleInput');
+      const entries = parseModuleList(input ? input.value : '');
+      if (entries.length === 0) {
+        return;
+      }
+      let changed = false;
+      entries.forEach((entry) => {
+        if (!selectedModules.includes(entry)) {
+          selectedModules.push(entry);
+          changed = true;
+        }
+      });
+      if (changed) {
+        customModuleCommand = '';
+        renderModuleList();
+      }
+      if (input) input.value = '';
+    }
+
     function setClusterMode(enabled) {
       clusterMode = enabled;
       Object.values(resourceFields).forEach((field) => {
@@ -2359,6 +2665,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       setClusterMode(false);
       setResourceDisabled(false);
       clearResourceLists();
+      setModuleOptions([]);
       Object.keys(preserved).forEach((key) => {
         if (preserved[key] !== undefined && preserved[key] !== null) {
           setValue(key, preserved[key]);
@@ -2486,6 +2793,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function applyClusterInfo(info) {
       const manualPartition = getValue('defaultPartition');
       clusterInfo = info;
+      setModuleOptions(info && Array.isArray(info.modules) ? info.modules : []);
       if (!info || !info.partitions || info.partitions.length === 0) {
         setStatus('No partitions found.', true);
         clearResourceLists();
@@ -2542,6 +2850,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function gather() {
+      syncModuleLoadValue();
       return {
         loginHosts: getValue('loginHosts'),
         loginHostsCommand: getValue('loginHostsCommand'),
@@ -2594,6 +2903,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         const values = message.values || {};
         lastValues = values;
         Object.keys(values).forEach((key) => setValue(key, values[key]));
+        applyModuleLoad(values.moduleLoad);
         if (message.clusterInfo) {
           applyClusterInfo(message.clusterInfo);
           if (message.clusterInfoCachedAt) {
@@ -2605,6 +2915,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           clearResourceLists();
           const meta = document.getElementById('partitionMeta');
           if (meta) meta.textContent = '';
+          setModuleOptions([]);
           setClusterMode(false);
           setResourceDisabled(false);
           setStatus('Enter values manually or click "Get cluster info" to populate suggestions.', false);
@@ -2635,6 +2946,50 @@ function getWebviewHtml(webview: vscode.Webview): string {
     document.getElementById('clearClusterInfo').addEventListener('click', () => {
       clearClusterInfoUi();
     });
+
+    const moduleAddButton = document.getElementById('moduleAdd');
+    const moduleInput = document.getElementById('moduleInput');
+    const moduleToggle = document.getElementById('moduleToggle');
+    const moduleMenu = document.getElementById('moduleMenu');
+    if (moduleAddButton) {
+      moduleAddButton.addEventListener('click', () => {
+        addModulesFromInput();
+      });
+    }
+    if (moduleInput) {
+      moduleInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          addModulesFromInput();
+        }
+      });
+      moduleInput.addEventListener('input', () => {
+        showModuleMenu(false);
+      });
+      moduleInput.addEventListener('focus', () => {
+        showModuleMenu(true);
+      });
+      moduleInput.addEventListener('blur', () => {
+        setTimeout(() => {
+          hideModuleMenu();
+        }, 150);
+      });
+    }
+    if (moduleToggle) {
+      moduleToggle.addEventListener('click', () => {
+        const isOpen = moduleMenu && moduleMenu.classList.contains('visible');
+        if (isOpen) {
+          hideModuleMenu();
+        } else {
+          showModuleMenu(true);
+        }
+      });
+    }
+    if (moduleMenu) {
+      moduleMenu.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+      });
+    }
 
     function addFieldListener(fieldKey, handler) {
       const field = resourceFields[fieldKey];
