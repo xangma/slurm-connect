@@ -73,6 +73,7 @@ let connectionState: ConnectionState = 'idle';
 let lastConnectionAlias: string | undefined;
 let previousRemoteSshConfigPath: string | undefined;
 let activeTempSshConfigPath: string | undefined;
+let lastSshAuthPrompt: { identityPath: string; timestamp: number } | undefined;
 const PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
 const ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
 const PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
@@ -1082,6 +1083,133 @@ function parseNumericField(value: string): number {
   return Number(match[0]) || 0;
 }
 
+
+function normalizeSshErrorText(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const err = error as { stderr?: string; stdout?: string; message?: string };
+    return [err.message, err.stderr, err.stdout].filter(Boolean).join('\n');
+  }
+  return String(error);
+}
+
+function pickSshErrorSummary(text: string): string {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) {
+    return text.trim();
+  }
+  const patterns = [
+    /permission denied/i,
+    /no identities/i,
+    /could not open a connection to your authentication agent/i,
+    /agent has no identities/i,
+    /sign_and_send_pubkey/i,
+    /identity file .* not accessible/i
+  ];
+  for (const line of lines) {
+    if (patterns.some((pattern) => pattern.test(line))) {
+      return line;
+    }
+  }
+  return lines[lines.length - 1];
+}
+
+function looksLikeAuthFailure(text: string): boolean {
+  return [
+    /permission denied/i,
+    /no identities/i,
+    /authentication agent/i,
+    /sign_and_send_pubkey/i,
+    /identity file .* not accessible/i
+  ].some((pattern) => pattern.test(text));
+}
+
+
+async function ensureAskpassScript(): Promise<string> {
+  const baseDir = extensionStoragePath || os.tmpdir();
+  const scriptPath = path.join(baseDir, 'sciama-ssh-askpass.sh');
+  try {
+    await fs.access(scriptPath);
+    return scriptPath;
+  } catch {
+    // continue to (re)create
+  }
+  const script = ['#!/bin/sh', 'printf "%s\n" "${SCIAMA_SSH_PASSPHRASE:-}"', ''].join('\n');
+  await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+  await fs.writeFile(scriptPath, script, { mode: 0o700 });
+  await fs.chmod(scriptPath, 0o700);
+  return scriptPath;
+}
+
+async function addKeyToAgent(identityPath: string): Promise<boolean> {
+  const passphrase = await vscode.window.showInputBox({
+    title: 'SSH key passphrase',
+    prompt: `Enter the passphrase for ${identityPath} (leave blank if none)`,
+    password: true,
+    ignoreFocusOut: true
+  });
+  if (passphrase === undefined) {
+    return false;
+  }
+  const askpassPath = await ensureAskpassScript();
+  const env = {
+    ...process.env,
+    SCIAMA_SSH_PASSPHRASE: passphrase,
+    SSH_ASKPASS: askpassPath,
+    SSH_ASKPASS_REQUIRE: 'force',
+    DISPLAY: process.env.DISPLAY || '1'
+  };
+  const log = getOutputChannel();
+  try {
+    log.appendLine(`Running ssh-add for ${identityPath}.`);
+    const { stderr } = await execFileAsync('ssh-add', [identityPath], { env, timeout: 15000 });
+    if (stderr && stderr.trim().length > 0) {
+      log.appendLine(stderr.trim());
+    }
+    void vscode.window.showInformationMessage('SSH key added to agent.');
+    return true;
+  } catch (error) {
+    const errorText = normalizeSshErrorText(error);
+    const summary = pickSshErrorSummary(errorText) || 'SSH key add failed.';
+    log.appendLine(`ssh-add failed: ${summary}`);
+    void vscode.window.showWarningMessage(`Failed to add SSH key: ${summary}`);
+    return false;
+  }
+  return false;
+}
+
+async function maybePromptForSshAuth(cfg: SciamaConfig, errorText: string): Promise<boolean> {
+  if (!looksLikeAuthFailure(errorText)) {
+    return false;
+  }
+  const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
+  const now = Date.now();
+  if (lastSshAuthPrompt) {
+    const sameIdentity = lastSshAuthPrompt.identityPath === identityPath;
+    const recentlyPrompted = now - lastSshAuthPrompt.timestamp < 60_000;
+    if (sameIdentity && recentlyPrompted) {
+      return false;
+    }
+  }
+  lastSshAuthPrompt = { identityPath, timestamp: now };
+
+  const actions: string[] = [];
+  if (identityPath) {
+    actions.push('Add key to agent');
+  }
+  actions.push('Open Settings', 'Dismiss');
+  const message = identityPath
+    ? `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent or update sciamaSlurm.identityFile.`
+    : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set sciamaSlurm.identityFile.';
+  const choice = await vscode.window.showWarningMessage(message, ...actions);
+  if (choice === 'Add key to agent' && identityPath) {
+    return await addKeyToAgent(identityPath);
+  }
+  if (choice === 'Open Settings') {
+    void vscode.commands.executeCommand('workbench.action.openSettings', 'sciamaSlurm.identityFile');
+  }
+  return false;
+}
+
 async function runSshCommand(host: string, cfg: SciamaConfig, command: string): Promise<string> {
   const args: string[] = [];
   if (cfg.sshQueryConfigPath) {
@@ -1094,8 +1222,25 @@ async function runSshCommand(host: string, cfg: SciamaConfig, command: string): 
   const target = cfg.user ? `${cfg.user}@${host}` : host;
   args.push(target, command);
 
-  const { stdout } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
-  return stdout.trim();
+  try {
+    const { stdout } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+    return stdout.trim();
+  } catch (error) {
+    const errorText = normalizeSshErrorText(error);
+    const shouldRetry = await maybePromptForSshAuth(cfg, errorText);
+    if (shouldRetry) {
+      try {
+        const { stdout } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+        return stdout.trim();
+      } catch (retryError) {
+        const retryText = normalizeSshErrorText(retryError);
+        const retrySummary = pickSshErrorSummary(retryText);
+        throw new Error(retrySummary || 'SSH command failed');
+      }
+    }
+    const summary = pickSshErrorSummary(errorText);
+    throw new Error(summary || 'SSH command failed');
+  }
 }
 
 function parsePartitionOutput(output: string): PartitionResult {
