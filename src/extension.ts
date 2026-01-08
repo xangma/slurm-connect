@@ -14,7 +14,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-interface SciamaConfig {
+interface SlurmConnectConfig {
   loginHosts: string[];
   loginHostsCommand: string;
   loginHostsQueryHost: string;
@@ -67,15 +67,58 @@ let previousRemoteSshConfigPath: string | undefined;
 let activeTempSshConfigPath: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number } | undefined;
 let clusterInfoRequestInFlight = false;
-const PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
-const ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
-const PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
+const SETTINGS_SECTION = 'slurmConnect';
+const LEGACY_SETTINGS_SECTION = 'sciamaSlurm';
+const PROFILE_STORE_KEY = 'slurmConnect.profiles';
+const ACTIVE_PROFILE_KEY = 'slurmConnect.activeProfile';
+const PENDING_RESTORE_KEY = 'slurmConnect.pendingRestore';
+const CLUSTER_INFO_CACHE_KEY = 'slurmConnect.clusterInfoCache';
+const LEGACY_PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
+const LEGACY_ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
+const LEGACY_PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
+const LEGACY_CLUSTER_INFO_CACHE_KEY = 'sciamaSlurm.clusterInfoCache';
+const CONFIG_KEYS = [
+  'loginHosts',
+  'loginHostsCommand',
+  'loginHostsQueryHost',
+  'partitionCommand',
+  'partitionInfoCommand',
+  'qosCommand',
+  'accountCommand',
+  'user',
+  'identityFile',
+  'forwardAgent',
+  'requestTTY',
+  'moduleLoad',
+  'proxyCommand',
+  'proxyArgs',
+  'extraSallocArgs',
+  'promptForExtraSallocArgs',
+  'defaultPartition',
+  'defaultNodes',
+  'defaultTasksPerNode',
+  'defaultCpusPerTask',
+  'defaultTime',
+  'defaultMemoryMb',
+  'defaultGpuType',
+  'defaultGpuCount',
+  'sshHostPrefix',
+  'openInNewWindow',
+  'remoteWorkspacePath',
+  'temporarySshConfigPath',
+  'restoreSshConfigAfterConnect',
+  'additionalSshOptions',
+  'sshQueryConfigPath',
+  'sshConnectTimeoutSeconds'
+];
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionStoragePath = context.globalStorageUri.fsPath;
   extensionGlobalState = context.globalState;
+  await migrateLegacyState();
+  await migrateLegacySettings();
   syncConnectionStateFromEnvironment();
-  const disposable = vscode.commands.registerCommand('sciamaSlurm.connect', () => {
+  const disposable = vscode.commands.registerCommand('slurmConnect.connect', () => {
     void connectCommand();
   });
   context.subscriptions.push(disposable);
@@ -84,7 +127,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const viewProvider = new SlurmConnectViewProvider(context);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider('sciamaSlurm.connectView', viewProvider)
+    vscode.window.registerWebviewViewProvider('slurmConnect.connectView', viewProvider)
   );
 }
 
@@ -92,9 +135,111 @@ export function deactivate(): void {
   // No-op
 }
 
+async function migrateLegacyState(): Promise<void> {
+  if (!extensionGlobalState) {
+    return;
+  }
+  const migrations: Array<[string, string]> = [
+    [LEGACY_PROFILE_STORE_KEY, PROFILE_STORE_KEY],
+    [LEGACY_ACTIVE_PROFILE_KEY, ACTIVE_PROFILE_KEY],
+    [LEGACY_PENDING_RESTORE_KEY, PENDING_RESTORE_KEY],
+    [LEGACY_CLUSTER_INFO_CACHE_KEY, CLUSTER_INFO_CACHE_KEY]
+  ];
+  for (const [legacyKey, newKey] of migrations) {
+    const current = extensionGlobalState.get(newKey);
+    const legacyValue = extensionGlobalState.get(legacyKey);
+    if (current === undefined && legacyValue !== undefined) {
+      try {
+        await extensionGlobalState.update(newKey, legacyValue);
+      } catch {
+        // Ignore migration failures.
+      }
+    }
+    if (legacyValue !== undefined) {
+      try {
+        await extensionGlobalState.update(legacyKey, undefined);
+      } catch {
+        // Ignore cleanup failures.
+      }
+    }
+  }
+}
+
+async function migrateLegacySettings(): Promise<void> {
+  const legacyConfig = vscode.workspace.getConfiguration(LEGACY_SETTINGS_SECTION);
+  const newConfig = vscode.workspace.getConfiguration(SETTINGS_SECTION);
+
+  for (const key of CONFIG_KEYS) {
+    const oldInspect = legacyConfig.inspect(key);
+    const newInspect = newConfig.inspect(key);
+    if (!oldInspect) {
+      continue;
+    }
+    if (oldInspect.globalValue !== undefined && newInspect?.globalValue === undefined) {
+      try {
+        await newConfig.update(key, oldInspect.globalValue, vscode.ConfigurationTarget.Global);
+      } catch {
+        // Ignore migration failures.
+      }
+    }
+    if (oldInspect.workspaceValue !== undefined && newInspect?.workspaceValue === undefined) {
+      try {
+        await newConfig.update(key, oldInspect.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      } catch {
+        // Ignore migration failures.
+      }
+    }
+    if (oldInspect.globalValue !== undefined) {
+      try {
+        await legacyConfig.update(key, undefined, vscode.ConfigurationTarget.Global);
+      } catch {
+        // Ignore cleanup failures.
+      }
+    }
+    if (oldInspect.workspaceValue !== undefined) {
+      try {
+        await legacyConfig.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+      } catch {
+        // Ignore cleanup failures.
+      }
+    }
+  }
+
+  const folders = vscode.workspace.workspaceFolders || [];
+  for (const folder of folders) {
+    const legacyFolderConfig = vscode.workspace.getConfiguration(LEGACY_SETTINGS_SECTION, folder.uri);
+    const newFolderConfig = vscode.workspace.getConfiguration(SETTINGS_SECTION, folder.uri);
+    for (const key of CONFIG_KEYS) {
+      const oldInspect = legacyFolderConfig.inspect(key);
+      const newInspect = newFolderConfig.inspect(key);
+      if (!oldInspect) {
+        continue;
+      }
+      if (oldInspect.workspaceFolderValue !== undefined && newInspect?.workspaceFolderValue === undefined) {
+        try {
+          await newFolderConfig.update(
+            key,
+            oldInspect.workspaceFolderValue,
+            vscode.ConfigurationTarget.WorkspaceFolder
+          );
+        } catch {
+          // Ignore migration failures.
+        }
+      }
+      if (oldInspect.workspaceFolderValue !== undefined) {
+        try {
+          await legacyFolderConfig.update(key, undefined, vscode.ConfigurationTarget.WorkspaceFolder);
+        } catch {
+          // Ignore cleanup failures.
+        }
+      }
+    }
+  }
+}
+
 function getOutputChannel(): vscode.OutputChannel {
   if (!outputChannel) {
-    const baseChannel = vscode.window.createOutputChannel('Sciama Slurm');
+    const baseChannel = vscode.window.createOutputChannel('Slurm Connect');
     outputChannel = {
       name: baseChannel.name,
       append: (value: string) => {
@@ -142,7 +287,7 @@ function resolveLogFilePath(): string {
     return logFilePath;
   }
   const baseDir = extensionStoragePath || os.tmpdir();
-  logFilePath = path.join(baseDir, 'sciama-slurm.log');
+  logFilePath = path.join(baseDir, 'slurm-connect.log');
   return logFilePath;
 }
 
@@ -374,8 +519,8 @@ async function maybeRestorePendingOnStartup(): Promise<void> {
   await restoreRemoteSshConfigIfNeeded();
 }
 
-function getConfig(): SciamaConfig {
-  const cfg = vscode.workspace.getConfiguration('sciamaSlurm');
+function getConfig(): SlurmConnectConfig {
+  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
   const user = (cfg.get<string>('user') || '').trim();
   return {
     loginHosts: cfg.get<string[]>('loginHosts', []),
@@ -413,7 +558,7 @@ function getConfig(): SciamaConfig {
   };
 }
 
-function getConfigWithOverrides(overrides?: Partial<SciamaConfig>): SciamaConfig {
+function getConfigWithOverrides(overrides?: Partial<SlurmConnectConfig>): SlurmConnectConfig {
   const base = getConfig();
   if (!overrides) {
     return base;
@@ -637,7 +782,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'openSettings': {
-          void vscode.commands.executeCommand('workbench.action.openSettings', 'sciamaSlurm');
+          void vscode.commands.executeCommand('workbench.action.openSettings', SETTINGS_SECTION);
           break;
         }
         case 'openLogs': {
@@ -657,21 +802,21 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
 
 
 async function connectCommand(
-  overrides?: Partial<SciamaConfig>,
+  overrides?: Partial<SlurmConnectConfig>,
   options?: { interactive?: boolean }
 ): Promise<boolean> {
   const cfg = getConfigWithOverrides(overrides);
   const interactive = options?.interactive !== false;
   const log = getOutputChannel();
   log.clear();
-  log.appendLine('Sciama Slurm connect started.');
+  log.appendLine('Slurm Connect started.');
 
   let didConnect = false;
 
   const loginHosts = await resolveLoginHosts(cfg, { interactive });
   log.appendLine(`Login hosts resolved: ${loginHosts.join(', ') || '(none)'}`);
   if (loginHosts.length === 0) {
-    void vscode.window.showErrorMessage('No login hosts available. Configure sciamaSlurm.loginHosts or loginHostsCommand.');
+    void vscode.window.showErrorMessage('No login hosts available. Configure slurmConnect.loginHosts or loginHostsCommand.');
     return false;
   }
 
@@ -797,11 +942,11 @@ async function connectCommand(
   });
   const remoteCommand = buildRemoteCommand(cfg, [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs]);
   if (!remoteCommand) {
-    void vscode.window.showErrorMessage('RemoteCommand is empty. Check sciamaSlurm.proxyCommand.');
+    void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
     return false;
   }
 
-  const defaultAlias = buildDefaultAlias(cfg.sshHostPrefix || 'sciama', loginHost, partition, nodes, cpusPerTask);
+  const defaultAlias = buildDefaultAlias(cfg.sshHostPrefix || 'slurm', loginHost, partition, nodes, cpusPerTask);
   let alias = defaultAlias;
   if (interactive) {
     const aliasInput = await vscode.window.showInputBox({
@@ -881,7 +1026,7 @@ async function connectCommand(
 }
 
 async function resolveLoginHosts(
-  cfg: SciamaConfig,
+  cfg: SlurmConnectConfig,
   options?: { interactive?: boolean }
 ): Promise<string[]> {
   const interactive = options?.interactive !== false;
@@ -927,7 +1072,7 @@ async function resolveLoginHosts(
   return hosts;
 }
 
-async function queryPartitions(loginHost: string, cfg: SciamaConfig): Promise<PartitionResult> {
+async function queryPartitions(loginHost: string, cfg: SlurmConnectConfig): Promise<PartitionResult> {
   if (!cfg.partitionCommand) {
     return { partitions: [] };
   }
@@ -940,7 +1085,7 @@ async function queryPartitions(loginHost: string, cfg: SciamaConfig): Promise<Pa
   }
 }
 
-async function querySimpleList(loginHost: string, cfg: SciamaConfig, command: string): Promise<string[]> {
+async function querySimpleList(loginHost: string, cfg: SlurmConnectConfig, command: string): Promise<string[]> {
   if (!command) {
     return [];
   }
@@ -953,7 +1098,7 @@ async function querySimpleList(loginHost: string, cfg: SciamaConfig, command: st
   }
 }
 
-async function queryAvailableModules(loginHost: string, cfg: SciamaConfig): Promise<string[]> {
+async function queryAvailableModules(loginHost: string, cfg: SlurmConnectConfig): Promise<string[]> {
   const log = getOutputChannel();
   const commands = [
     'module -t avail 2>&1',
@@ -1012,7 +1157,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
   }
 }
 
-async function fetchClusterInfo(loginHost: string, cfg: SciamaConfig): Promise<ClusterInfo> {
+async function fetchClusterInfo(loginHost: string, cfg: SlurmConnectConfig): Promise<ClusterInfo> {
   const commands = [
     cfg.partitionInfoCommand,
     'sinfo -h -N -o "%P|%n|%c|%m|%G"',
@@ -1165,7 +1310,7 @@ function buildTerminalSshAddCommand(identityPath: string): string {
 }
 
 function openSshAddTerminal(identityPath: string): vscode.Terminal {
-  const terminal = vscode.window.createTerminal({ name: 'Sciama SSH Add' });
+  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH Add' });
   terminal.show(true);
   const command = buildTerminalSshAddCommand(identityPath);
   terminal.sendText(command, true);
@@ -1200,7 +1345,7 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function maybePromptForSshAuth(cfg: SciamaConfig, errorText: string): Promise<boolean> {
+async function maybePromptForSshAuth(cfg: SlurmConnectConfig, errorText: string): Promise<boolean> {
   if (!looksLikeAuthFailure(errorText)) {
     return false;
   }
@@ -1228,10 +1373,10 @@ async function maybePromptForSshAuth(cfg: SciamaConfig, errorText: string): Prom
   }
   actions.push('Dismiss');
   const message = identityPath && !identityExists
-    ? `SSH authentication failed while querying the cluster. The identity file ${identityPath} was not found. Update sciamaSlurm.identityFile to a valid key.`
+    ? `SSH authentication failed while querying the cluster. The identity file ${identityPath} was not found. Update slurmConnect.identityFile to a valid key.`
     : identityPath
       ? `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent.`
-      : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set sciamaSlurm.identityFile.';
+      : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set slurmConnect.identityFile.';
   const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
   if (choice === 'Open Terminal' && identityPath) {
     const terminal = openSshAddTerminal(identityPath);
@@ -1253,12 +1398,12 @@ async function maybePromptForSshAuth(cfg: SciamaConfig, errorText: string): Prom
     return false;
   }
   if (choice === 'Open Settings') {
-    void vscode.commands.executeCommand('workbench.action.openSettings', 'sciamaSlurm.identityFile');
+    void vscode.commands.executeCommand('workbench.action.openSettings', `${SETTINGS_SECTION}.identityFile`);
   }
   return false;
 }
 
-async function runSshCommand(host: string, cfg: SciamaConfig, command: string): Promise<string> {
+async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
   const args: string[] = [];
   if (cfg.sshQueryConfigPath) {
     args.push('-F', expandHome(cfg.sshQueryConfigPath));
@@ -1473,7 +1618,7 @@ function buildSallocArgs(params: {
 }
 
 
-function buildRemoteCommand(cfg: SciamaConfig, sallocArgs: string[]): string {
+function buildRemoteCommand(cfg: SlurmConnectConfig, sallocArgs: string[]): string {
   const proxyParts = [cfg.proxyCommand, ...cfg.proxyArgs.filter(Boolean)];
   const proxyCommand = proxyParts.filter(Boolean).join(' ').trim();
   if (!proxyCommand) {
@@ -1498,7 +1643,7 @@ function buildDefaultAlias(
   cpusPerTask: number
 ): string {
   const hostShort = loginHost.split('.')[0];
-  const pieces = [prefix || 'sciama', hostShort];
+  const pieces = [prefix || 'slurm', hostShort];
   if (partition) {
     pieces.push(partition);
   }
@@ -1508,12 +1653,12 @@ function buildDefaultAlias(
 
 async function writeTemporarySshConfig(
   entry: string,
-  cfg: SciamaConfig,
+  cfg: SlurmConnectConfig,
   includePaths: string[]
 ): Promise<string> {
   const basePath = cfg.temporarySshConfigPath
     ? expandHome(cfg.temporarySshConfigPath)
-    : path.join(extensionStoragePath || os.tmpdir(), 'sciama-ssh-config');
+    : path.join(extensionStoragePath || os.tmpdir(), 'slurm-connect-ssh-config');
   const dir = path.dirname(basePath);
   await fs.mkdir(dir, { recursive: true });
   const resolvedBase = path.resolve(basePath);
@@ -1779,8 +1924,8 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
   return false;
 }
 
-function getUiValuesFromConfig(cfg: SciamaConfig): UiValues {
-  const config = vscode.workspace.getConfiguration('sciamaSlurm');
+function getUiValuesFromConfig(cfg: SlurmConnectConfig): UiValues {
+  const config = vscode.workspace.getConfiguration(SETTINGS_SECTION);
   const hasValue = (key: string): boolean => {
     const inspected = config.inspect(key);
     if (!inspected) {
@@ -1835,7 +1980,7 @@ function getUiValuesFromConfig(cfg: SciamaConfig): UiValues {
 }
 
 async function updateConfigFromUi(values: UiValues, target: vscode.ConfigurationTarget): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration('sciamaSlurm');
+  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
 
   const updates: Array<[string, unknown]> = [
     ['loginHosts', parseListInput(values.loginHosts)],
@@ -1923,7 +2068,7 @@ function getCachedClusterInfo(host: string): { info: ClusterInfo; fetchedAt: str
     return undefined;
   }
   const cache = extensionGlobalState.get<Record<string, { info: ClusterInfo; fetchedAt: string }>>(
-    'sciamaSlurm.clusterInfoCache'
+    CLUSTER_INFO_CACHE_KEY
   );
   return cache ? cache[host] : undefined;
 }
@@ -1934,10 +2079,10 @@ function cacheClusterInfo(host: string, info: ClusterInfo): void {
   }
   const cache =
     extensionGlobalState.get<Record<string, { info: ClusterInfo; fetchedAt: string }>>(
-      'sciamaSlurm.clusterInfoCache'
+      CLUSTER_INFO_CACHE_KEY
     ) || {};
   cache[host] = { info, fetchedAt: new Date().toISOString() };
-  void extensionGlobalState.update('sciamaSlurm.clusterInfoCache', cache);
+  void extensionGlobalState.update(CLUSTER_INFO_CACHE_KEY, cache);
 }
 
 function parseNumberValue(input: string, fallback: number): number {
@@ -1948,7 +2093,7 @@ function parseNumberValue(input: string, fallback: number): number {
   return Math.floor(parsed);
 }
 
-function buildOverridesFromUi(values: UiValues): Partial<SciamaConfig> {
+function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
   return {
     loginHosts: parseListInput(values.loginHosts),
     loginHostsCommand: values.loginHostsCommand.trim(),
@@ -1997,7 +2142,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
   <meta charset="UTF-8">
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sciama Slurm</title>
+  <title>Slurm Connect</title>
   <style>
     :root { color-scheme: light dark; }
     body {
@@ -2094,7 +2239,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <h2>Sciama Slurm</h2>
+  <h2>Slurm Connect</h2>
 
   <div class="section">
     <label for="loginHosts">Login host</label>

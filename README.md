@@ -1,6 +1,6 @@
-# Sciama Slurm Connect (VS Code extension)
+# Slurm Connect (VS Code extension)
 
-This extension helps users allocate Slurm resources on SCIAMA and connect VS Code Remote-SSH through a compute node. It discovers partitions (and optionally QoS/accounts), builds the `RemoteCommand` for `vscode-shell-proxy.py`, creates a temporary SSH host entry, and optionally connects right away.
+This extension helps users allocate Slurm resources on a cluster and connect VS Code Remote-SSH through a compute node. It discovers partitions (and optionally QoS/accounts), builds the `RemoteCommand` for a proxy script, creates a temporary SSH host entry, and optionally connects right away.
 
 ## Requirements
 - VS Code with **Remote - SSH** installed.
@@ -10,7 +10,7 @@ This extension helps users allocate Slurm resources on SCIAMA and connect VS Cod
 
 ## Quick start (users)
 1. Install the extension.
-2. Open the **Sciama Slurm** view from the activity bar.
+2. Open the **Slurm Connect** view from the activity bar.
 3. Enter login host, username, and identity file.
 4. Click **Get cluster info**, choose resources, then **Connect**.
 
@@ -22,7 +22,7 @@ The extension will query the login host, create a temporary SSH config entry, co
 Cluster info queries use non-interactive SSH (`BatchMode=yes`), so your SSH key must be available to the agent.
 
 - If the key is **not** in your agent, the extension will prompt you to add it.
-- When prompted, it will ask for your passphrase inside VS Code and run `ssh-add` on your behalf.
+- When prompted, it will open a terminal, run `ssh-add`, and wait for the key to appear in your agent.
 
 If you prefer to do this manually:
 ```bash
@@ -36,18 +36,18 @@ The extension runs your **module load** command before starting the proxy on the
 Example:
 ```json
 {
-  "sciamaSlurm.moduleLoad": "module load anaconda3/2024.02"
+  "slurmConnect.moduleLoad": "module load anaconda3/2024.02"
 }
 ```
 
-### Proxy command (do not change)
-This extension **requires** the Sciama proxy script on the cluster:
+### Proxy command (cluster-specific)
+This extension expects a proxy script on your cluster's login nodes. The default is:
 
 ```
 python /usr/bin/vscode-shell-proxy.py
 ```
 
-That script is already installed on the HPC and is required for Remote-SSH to attach to the compute allocation. You should **not** change this value unless the cluster administrators move the proxy script.
+Remote-SSH needs the proxy to attach to the compute allocation. If your cluster uses a different path or script name, update `slurmConnect.proxyCommand` accordingly.
 
 ### Remote folder (recommended)
 If you forget to set a remote folder, VS Code may reconnect and create a new Slurm job when you later open a folder. To avoid that, you should set a remote folder up front:
@@ -56,24 +56,24 @@ If you forget to set a remote folder, VS Code may reconnect and create a new Slu
 - Or set it in settings:
 ```json
 {
-  "sciamaSlurm.remoteWorkspacePath": "/home/youruser/project"
+  "slurmConnect.remoteWorkspacePath": "/home/youruser/project"
 }
 ```
 
-## Example settings (SCIAMA)
+## Example settings
 ```json
 {
-  "sciamaSlurm.loginHosts": [
+  "slurmConnect.loginHosts": [
     "hostname1.com",
   ],
-  "sciamaSlurm.loginHostsCommand": "",
-  "sciamaSlurm.proxyCommand": "python /usr/bin/vscode-shell-proxy.py",
-  "sciamaSlurm.identityFile": "~/.ssh/id_rsa",
-  "sciamaSlurm.defaultNodes": 1,
-  "sciamaSlurm.defaultTasksPerNode": 1,
-  "sciamaSlurm.defaultCpusPerTask": 8,
-  "sciamaSlurm.defaultTime": "24:00:00",
-  "sciamaSlurm.remoteWorkspacePath": "/home/youruser/project"
+  "slurmConnect.loginHostsCommand": "",
+  "slurmConnect.proxyCommand": "python /usr/bin/vscode-shell-proxy.py",
+  "slurmConnect.identityFile": "~/.ssh/id_rsa",
+  "slurmConnect.defaultNodes": 1,
+  "slurmConnect.defaultTasksPerNode": 1,
+  "slurmConnect.defaultCpusPerTask": 8,
+  "slurmConnect.defaultTime": "24:00:00",
+  "slurmConnect.remoteWorkspacePath": "/home/youruser/project"
 }
 ```
 
@@ -81,8 +81,8 @@ If you forget to set a remote folder, VS Code may reconnect and create a new Slu
 If your cluster can return login hosts via a command, set:
 ```json
 {
-  "sciamaSlurm.loginHostsCommand": "your-command-here",
-  "sciamaSlurm.loginHostsQueryHost": "hostname1.com"
+  "slurmConnect.loginHostsCommand": "your-command-here",
+  "slurmConnect.loginHostsQueryHost": "hostname1.com"
 }
 ```
 The command should output hostnames separated by whitespace or newlines.
@@ -91,9 +91,9 @@ The command should output hostnames separated by whitespace or newlines.
 - Ensure **Remote.SSH: Enable Remote Command** is enabled (the extension will prompt to enable it).
 - **Remote.SSH: Lockfiles In Tmp** is recommended on shared filesystems (the extension will prompt to enable it).
 - This extension uses a temporary SSH config for each connection and does not modify your main SSH config.
-- Use `sciamaSlurm.openInNewWindow` to control whether the connection opens in a new window (default: false).
-- `sciamaSlurm.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
-- To add GPUs or other flags, use `sciamaSlurm.extraSallocArgs` (e.g. `["--gres=gpu:1"]`).
+- Use `slurmConnect.openInNewWindow` to control whether the connection opens in a new window (default: false).
+- `slurmConnect.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
+- To add GPUs or other flags, use `slurmConnect.extraSallocArgs` (e.g. `["--gres=gpu:1"]`).
 
 ## Development
 1. Install dependencies:

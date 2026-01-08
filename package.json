@@ -1,10 +1,10 @@
 {
-  "name": "sciama-vscode",
-  "displayName": "Sciama Slurm Connect",
+  "name": "slurm-connect",
+  "displayName": "Slurm Connect",
   "description": "Select Slurm resources and connect VS Code Remote-SSH through a compute allocation.",
   "version": "0.1.4",
   "publisher": "xangma",
-  "repository": "https://github.com/xangma/sciama-vscode",
+  "repository": "https://github.com/xangma/slurm-connect",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -12,8 +12,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:sciamaSlurm.connect",
-    "onView:sciamaSlurm.connectView"
+    "onCommand:slurmConnect.connect",
+    "onView:slurmConnect.connectView"
   ],
   "main": "./out/extension.js",
   "extensionKind": [
@@ -22,189 +22,189 @@
   "contributes": {
     "commands": [
       {
-        "command": "sciamaSlurm.connect",
-        "title": "Sciama: Connect to Slurm"
+        "command": "slurmConnect.connect",
+        "title": "Slurm Connect: Connect to Slurm"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "sciamaSlurm",
-          "title": "Sciama Slurm",
-          "icon": "media/sciama.svg"
+          "id": "slurmConnect",
+          "title": "Slurm Connect",
+          "icon": "media/slurm-connect.svg"
         }
       ]
     },
     "views": {
-      "sciamaSlurm": [
+      "slurmConnect": [
         {
-          "id": "sciamaSlurm.connectView",
+          "id": "slurmConnect.connectView",
           "name": "Connect",
           "type": "webview"
         }
       ]
     },
     "configuration": {
-      "title": "Sciama Slurm",
+      "title": "Slurm Connect",
       "properties": {
-        "sciamaSlurm.loginHosts": {
+        "slurmConnect.loginHosts": {
           "type": "array",
           "default": [
             ""
           ],
           "description": "Login hosts available for connection. Used when loginHostsCommand is empty."
         },
-        "sciamaSlurm.loginHostsCommand": {
+        "slurmConnect.loginHostsCommand": {
           "type": "string",
           "default": "",
           "description": "Remote command that outputs login hosts (newline or whitespace separated). If set, it is executed over SSH to discover login nodes."
         },
-        "sciamaSlurm.loginHostsQueryHost": {
+        "slurmConnect.loginHostsQueryHost": {
           "type": "string",
           "default": "",
           "description": "Host used to run loginHostsCommand. Defaults to the first login host or the selected login host."
         },
-        "sciamaSlurm.partitionCommand": {
+        "slurmConnect.partitionCommand": {
           "type": "string",
           "default": "sinfo -h -o \"%P\"",
           "description": "Remote command that outputs partition names."
         },
-        "sciamaSlurm.partitionInfoCommand": {
+        "slurmConnect.partitionInfoCommand": {
           "type": "string",
           "default": "sinfo -h -N -o \"%P|%n|%c|%m|%G\"",
           "description": "Remote command that outputs partition info in the format name|node|cpus|memMB|gres."
         },
-        "sciamaSlurm.qosCommand": {
+        "slurmConnect.qosCommand": {
           "type": "string",
           "default": "",
           "description": "Optional remote command that outputs QoS names."
         },
-        "sciamaSlurm.accountCommand": {
+        "slurmConnect.accountCommand": {
           "type": "string",
           "default": "",
           "description": "Optional remote command that outputs account names."
         },
-        "sciamaSlurm.user": {
+        "slurmConnect.user": {
           "type": "string",
           "default": "",
           "description": "SSH username. Leave blank to use the local OS username."
         },
-        "sciamaSlurm.identityFile": {
+        "slurmConnect.identityFile": {
           "type": "string",
           "default": "~/.ssh/id_rsa",
           "description": "SSH identity file to include in generated host entries and used for resource queries."
         },
-        "sciamaSlurm.forwardAgent": {
+        "slurmConnect.forwardAgent": {
           "type": "boolean",
           "default": true,
           "description": "Whether to set ForwardAgent yes in generated host entries."
         },
-        "sciamaSlurm.requestTTY": {
+        "slurmConnect.requestTTY": {
           "type": "boolean",
           "default": true,
           "description": "Whether to set RequestTTY yes in generated host entries."
         },
-        "sciamaSlurm.moduleLoad": {
+        "slurmConnect.moduleLoad": {
           "type": "string",
           "default": "",
           "description": "Optional module load command prepended to the RemoteCommand."
         },
-        "sciamaSlurm.proxyCommand": {
+        "slurmConnect.proxyCommand": {
           "type": "string",
           "default": "python /usr/bin/vscode-shell-proxy.py",
           "description": "Command that launches the Slurm proxy script on the remote host."
         },
-        "sciamaSlurm.proxyArgs": {
+        "slurmConnect.proxyArgs": {
           "type": "array",
           "default": [],
           "description": "Extra arguments appended to the proxy command."
         },
-        "sciamaSlurm.extraSallocArgs": {
+        "slurmConnect.extraSallocArgs": {
           "type": "array",
           "default": [],
           "description": "Extra salloc arguments appended to every request (e.g. --gres=gpu:1)."
         },
-        "sciamaSlurm.promptForExtraSallocArgs": {
+        "slurmConnect.promptForExtraSallocArgs": {
           "type": "boolean",
           "default": false,
           "description": "Prompt for additional salloc arguments each time you connect."
         },
-        "sciamaSlurm.defaultPartition": {
+        "slurmConnect.defaultPartition": {
           "type": "string",
           "default": "",
           "description": "Default partition selection."
         },
-        "sciamaSlurm.defaultNodes": {
+        "slurmConnect.defaultNodes": {
           "type": "number",
           "default": 1,
           "description": "Default number of nodes."
         },
-        "sciamaSlurm.defaultTasksPerNode": {
+        "slurmConnect.defaultTasksPerNode": {
           "type": "number",
           "default": 1,
           "description": "Default tasks per node."
         },
-        "sciamaSlurm.defaultCpusPerTask": {
+        "slurmConnect.defaultCpusPerTask": {
           "type": "number",
           "default": 8,
           "description": "Default CPUs per task."
         },
-        "sciamaSlurm.defaultTime": {
+        "slurmConnect.defaultTime": {
           "type": "string",
           "default": "24:00:00",
           "description": "Default wall time in HH:MM:SS or D-HH:MM:SS format."
         },
-        "sciamaSlurm.defaultMemoryMb": {
+        "slurmConnect.defaultMemoryMb": {
           "type": "number",
           "default": 0,
           "description": "Default memory per node in MB. Set to 0 to leave unset."
         },
-        "sciamaSlurm.defaultGpuType": {
+        "slurmConnect.defaultGpuType": {
           "type": "string",
           "default": "",
           "description": "Default GPU type (e.g. A100). Leave blank for any type."
         },
-        "sciamaSlurm.defaultGpuCount": {
+        "slurmConnect.defaultGpuCount": {
           "type": "number",
           "default": 0,
           "description": "Default GPU count. Set to 0 to leave unset."
         },
-        "sciamaSlurm.sshHostPrefix": {
+        "slurmConnect.sshHostPrefix": {
           "type": "string",
-          "default": "sciama",
+          "default": "slurm",
           "description": "Prefix for generated SSH host aliases."
         },
-        "sciamaSlurm.openInNewWindow": {
+        "slurmConnect.openInNewWindow": {
           "type": "boolean",
           "default": false,
           "description": "Open the Remote-SSH connection in a new window."
         },
-        "sciamaSlurm.remoteWorkspacePath": {
+        "slurmConnect.remoteWorkspacePath": {
           "type": "string",
           "default": "",
           "description": "Remote folder to open after connecting (e.g. /home/user/project). Leave blank to just connect."
         },
-        "sciamaSlurm.temporarySshConfigPath": {
+        "slurmConnect.temporarySshConfigPath": {
           "type": "string",
           "default": "",
           "description": "Optional path for the temporary SSH config file. Leave blank to use the extension storage folder."
         },
-        "sciamaSlurm.restoreSshConfigAfterConnect": {
+        "slurmConnect.restoreSshConfigAfterConnect": {
           "type": "boolean",
           "default": true,
           "description": "Restore Remote.SSH configFile after connecting when using a temporary SSH config."
         },
-        "sciamaSlurm.additionalSshOptions": {
+        "slurmConnect.additionalSshOptions": {
           "type": "object",
           "default": {},
           "description": "Additional SSH config options to include in generated host entries."
         },
-        "sciamaSlurm.sshQueryConfigPath": {
+        "slurmConnect.sshQueryConfigPath": {
           "type": "string",
           "default": "",
           "description": "Optional SSH config path to use when querying the cluster."
         },
-        "sciamaSlurm.sshConnectTimeoutSeconds": {
+        "slurmConnect.sshConnectTimeoutSeconds": {
           "type": "number",
           "default": 15,
           "description": "Timeout for SSH resource queries in seconds."
