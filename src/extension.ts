@@ -630,6 +630,14 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           setConnectionState(connected ? 'connected' : 'idle');
           break;
         }
+        case 'saveSettings': {
+          const target = message.target === 'workspace'
+            ? vscode.ConfigurationTarget.Workspace
+            : vscode.ConfigurationTarget.Global;
+          const uiValues = message.values as UiValues;
+          await updateConfigFromUi(uiValues, target);
+          break;
+        }
         case 'disconnect': {
           setConnectionState('disconnecting');
           const disconnected = await disconnectFromHost(lastConnectionAlias);
@@ -1998,13 +2006,13 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
     ['extraSallocArgs', parseListInput(values.extraSallocArgs)],
     ['promptForExtraSallocArgs', Boolean(values.promptForExtraSallocArgs)],
     ['defaultPartition', values.defaultPartition.trim()],
-    ['defaultNodes', parseNumberValue(values.defaultNodes, 1)],
-    ['defaultTasksPerNode', parseNumberValue(values.defaultTasksPerNode, 1)],
-    ['defaultCpusPerTask', parseNumberValue(values.defaultCpusPerTask, 1)],
+    ['defaultNodes', parsePositiveNumberInput(values.defaultNodes)],
+    ['defaultTasksPerNode', parsePositiveNumberInput(values.defaultTasksPerNode)],
+    ['defaultCpusPerTask', parsePositiveNumberInput(values.defaultCpusPerTask)],
     ['defaultTime', values.defaultTime.trim()],
-    ['defaultMemoryMb', parseNumberValue(values.defaultMemoryMb, 0)],
+    ['defaultMemoryMb', parseNonNegativeNumberInput(values.defaultMemoryMb)],
     ['defaultGpuType', values.defaultGpuType.trim()],
-    ['defaultGpuCount', parseNumberValue(values.defaultGpuCount, 0)],
+    ['defaultGpuCount', parseNonNegativeNumberInput(values.defaultGpuCount)],
     ['sshHostPrefix', values.sshHostPrefix.trim()],
     ['forwardAgent', Boolean(values.forwardAgent)],
     ['requestTTY', Boolean(values.requestTTY)],
@@ -2085,10 +2093,26 @@ function cacheClusterInfo(host: string, info: ClusterInfo): void {
   void extensionGlobalState.update(CLUSTER_INFO_CACHE_KEY, cache);
 }
 
-function parseNumberValue(input: string, fallback: number): number {
-  const parsed = Number(input);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return fallback;
+function parsePositiveNumberInput(input: string): number {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return 0;
+  }
+  return Math.floor(parsed);
+}
+
+function parseNonNegativeNumberInput(input: string): number {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return 0;
   }
   return Math.floor(parsed);
 }
@@ -2110,13 +2134,13 @@ function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
     extraSallocArgs: parseListInput(values.extraSallocArgs),
     promptForExtraSallocArgs: Boolean(values.promptForExtraSallocArgs),
     defaultPartition: values.defaultPartition.trim(),
-    defaultNodes: parseNumberValue(values.defaultNodes, 1),
-    defaultTasksPerNode: parseNumberValue(values.defaultTasksPerNode, 1),
-    defaultCpusPerTask: parseNumberValue(values.defaultCpusPerTask, 1),
+    defaultNodes: parsePositiveNumberInput(values.defaultNodes),
+    defaultTasksPerNode: parsePositiveNumberInput(values.defaultTasksPerNode),
+    defaultCpusPerTask: parsePositiveNumberInput(values.defaultCpusPerTask),
     defaultTime: values.defaultTime.trim(),
-    defaultMemoryMb: parseNumberValue(values.defaultMemoryMb, 0),
+    defaultMemoryMb: parseNonNegativeNumberInput(values.defaultMemoryMb),
     defaultGpuType: values.defaultGpuType.trim(),
-    defaultGpuCount: parseNumberValue(values.defaultGpuCount, 0),
+    defaultGpuCount: parseNonNegativeNumberInput(values.defaultGpuCount),
     sshHostPrefix: values.sshHostPrefix.trim(),
     forwardAgent: Boolean(values.forwardAgent),
     requestTTY: Boolean(values.requestTTY),
@@ -2320,7 +2344,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       </div>
     </div>
     <label for="defaultTime">Wall time</label>
-    <input id="defaultTime" type="text" />
+    <input id="defaultTime" type="text" placeholder="HH:MM:SS" />
     <div class="buttons" style="margin-top: 8px;">
       <button id="clearResources" type="button">Clear resources</button>
     </div>
@@ -2425,6 +2449,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let availableModules = [];
     let selectedModules = [];
     let customModuleCommand = '';
+    let autoSaveTimer = 0;
+    let suppressAutoSave = true;
 
     const resourceFields = {
       defaultPartition: {
@@ -2502,6 +2528,30 @@ function getWebviewHtml(webview: vscode.Webview): string {
       button.textContent = label;
       button.disabled = disabled;
       status.textContent = statusText;
+    }
+
+
+    function scheduleAutoSave() {
+      if (suppressAutoSave) return;
+      const saveTarget = document.getElementById('saveTarget');
+      if (!saveTarget) return;
+      if (autoSaveTimer) {
+        clearTimeout(autoSaveTimer);
+      }
+      autoSaveTimer = setTimeout(() => {
+        vscode.postMessage({
+          command: 'saveSettings',
+          values: gather(),
+          target: saveTarget.value
+        });
+      }, 500);
+    }
+
+    function initializeAutoSave() {
+      const fields = document.querySelectorAll('input, textarea, select');
+      fields.forEach((field) => {
+        field.addEventListener('change', scheduleAutoSave);
+      });
     }
 
     function updateProfileList(list, activeName) {
@@ -2753,6 +2803,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
       syncModuleLoadValue();
       updateModuleHint();
+      scheduleAutoSave();
     }
 
     function applyModuleLoad(value) {
@@ -2951,6 +3002,14 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const meta = document.getElementById('partitionMeta');
       if (meta) meta.textContent = '';
       updatePartitionDetails();
+      const saveTarget = document.getElementById('saveTarget');
+      if (saveTarget) {
+        vscode.postMessage({
+          command: 'saveSettings',
+          values: gather(),
+          target: saveTarget.value
+        });
+      }
     }
 
     function buildRangeOptions(maxValue) {
@@ -3168,6 +3227,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (message.command === 'load') {
+        suppressAutoSave = true;
         const values = message.values || {};
         lastValues = values;
         Object.keys(values).forEach((key) => setValue(key, values[key]));
@@ -3188,6 +3248,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           setStatus('Enter values manually or click "Get cluster info" to populate suggestions.', false);
         }
         applyMessageState(message);
+        suppressAutoSave = false;
       } else if (message.command === 'clusterInfo') {
         applyClusterInfo(message.info);
         applyMessageState(message);
@@ -3427,6 +3488,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       vscode.postMessage({ command: 'openRemoteSshLog' });
     });
 
+    initializeAutoSave();
     setConnectState('idle');
     vscode.postMessage({ command: 'ready' });
   </script>
