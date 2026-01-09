@@ -1113,7 +1113,10 @@ async function connectCommand(
     return false;
   }
 
-  await maybePromptForSshAuthOnConnect(cfg, loginHost);
+  const proceed = await maybePromptForSshAuthOnConnect(cfg, loginHost);
+  if (!proceed) {
+    return false;
+  }
 
   let partition: string | undefined;
   let qos: string | undefined;
@@ -1433,6 +1436,18 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
 
     const loginHost = loginHosts[0];
     log.appendLine(`Fetching cluster info from ${loginHost}...`);
+    const proceed = await maybePromptForSshAuthOnConnect(cfg, loginHost);
+    if (!proceed) {
+      const message = 'Set an SSH identity file in the Slurm Connect view, then retry.';
+      const agentStatus = await buildAgentStatusMessage(values.identityFile);
+      webview.postMessage({
+        command: 'clusterInfoError',
+        message,
+        agentStatus: agentStatus.text,
+        agentStatusError: agentStatus.isError
+      });
+      return;
+    }
 
     const info = await fetchClusterInfo(loginHost, cfg);
     cacheClusterInfo(loginHost, info);
@@ -2089,22 +2104,32 @@ async function maybePromptForSshAuth(
   return undefined;
 }
 
-async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost: string): Promise<void> {
+async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost: string): Promise<boolean> {
   const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
   if (!identityPath) {
-    return;
+    const choice = await vscode.window.showWarningMessage(
+      'SSH identity file is not set. Configure it in the Slurm Connect view.',
+      { modal: true },
+      'Open Slurm Connect',
+      'Dismiss'
+    );
+    if (choice === 'Open Slurm Connect') {
+      await openSlurmConnectView();
+      return false;
+    }
+    return true;
   }
   const identityExists = await fileExists(identityPath);
   const agentInfo = identityExists ? await getSshAgentInfo() : undefined;
   if (identityExists && agentInfo?.status === 'available') {
     const loaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
     if (loaded) {
-      return;
+      return true;
     }
   }
   if (identityExists && agentInfo?.status === 'unavailable') {
     // Remote-SSH will handle passphrase prompts during connect.
-    return;
+    return true;
   }
 
   const now = Date.now();
@@ -2112,11 +2137,11 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
     const sameIdentity = lastSshAuthPrompt.identityPath === identityPath;
     const recentlyPrompted = now - lastSshAuthPrompt.timestamp < 60_000;
     if (sameIdentity && recentlyPrompted) {
-      return;
+      return true;
     }
   }
 
-  const canAddToAgent = Boolean(identityExists && agentInfo?.status === 'available');
+  const canAddToAgent = Boolean(identityExists && agentInfo?.status !== 'unavailable');
 
   const actions: string[] = [];
   if (canAddToAgent) {
@@ -2153,12 +2178,14 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
         'SSH key not detected in agent yet. Continue once ssh-add completes.'
       );
     }
-    return;
+    return true;
   }
 
   if (choice === 'Open Slurm Connect') {
     await openSlurmConnectView();
+    return false;
   }
+  return true;
 }
 
 async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
