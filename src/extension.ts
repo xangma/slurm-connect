@@ -1269,44 +1269,46 @@ async function connectCommand(
 
   if (interactive) {
     const nodesInput = await promptNumber('Nodes', cfg.defaultNodes, 1);
-    if (!nodesInput) {
+    if (nodesInput === undefined) {
       return false;
     }
     nodes = nodesInput;
 
     const tasksInput = await promptNumber('Tasks per node', cfg.defaultTasksPerNode, 1);
-    if (!tasksInput) {
+    if (tasksInput === undefined) {
       return false;
     }
     tasksPerNode = tasksInput;
 
     const cpusInput = await promptNumber('CPUs per task', cfg.defaultCpusPerTask, 1);
-    if (!cpusInput) {
+    if (cpusInput === undefined) {
       return false;
     }
     cpusPerTask = cpusInput;
 
-    const timeInput = await promptTime('Wall time', cfg.defaultTime || '01:00:00');
-    if (!timeInput) {
+    const timeInput = await promptTime('Wall time', cfg.defaultTime || '24:00:00');
+    if (timeInput === undefined) {
       return false;
     }
     time = timeInput;
-  } else {
-    if (!nodes || nodes < 1) {
-      void vscode.window.showErrorMessage('Default nodes is not set. Fill it in the side panel or settings.');
-      return false;
+  }
+
+  if (!partition || partition.trim().length === 0) {
+    const resolvedPartition = await resolveDefaultPartitionForHost(loginHost, cfg);
+    if (resolvedPartition) {
+      partition = resolvedPartition;
+      log.appendLine(`Using default partition: ${partition}`);
     }
-    if (!tasksPerNode || tasksPerNode < 1) {
-      void vscode.window.showErrorMessage('Default tasks per node is not set. Fill it in the side panel or settings.');
-      return false;
-    }
-    if (!cpusPerTask || cpusPerTask < 1) {
-      void vscode.window.showErrorMessage('Default CPUs per task is not set. Fill it in the side panel or settings.');
-      return false;
-    }
-    if (!time) {
-      void vscode.window.showErrorMessage('Default wall time is not set. Fill it in the side panel or settings.');
-      return false;
+  }
+
+  if (!time || time.trim().length === 0) {
+    const resolvedTime = await resolvePartitionDefaultTimeForHost(loginHost, partition, cfg);
+    if (resolvedTime) {
+      time = resolvedTime;
+      log.appendLine(`Using partition default time: ${time}`);
+    } else {
+      time = '24:00:00';
+      log.appendLine(`No partition default time found; using fallback wall time: ${time}`);
     }
   }
 
@@ -1544,6 +1546,129 @@ async function queryAvailableModules(loginHost: string, cfg: SlurmConnectConfig)
   return [];
 }
 
+type PartitionDefaults = {
+  defaultTime?: string;
+  defaultNodes?: number;
+  defaultTasksPerNode?: number;
+  defaultCpusPerTask?: number;
+  defaultMemoryMb?: number;
+  defaultGpuType?: string;
+  defaultGpuCount?: number;
+};
+
+function mergePartitionDefaults(
+  base: Record<string, PartitionDefaults>,
+  incoming: Record<string, PartitionDefaults>
+): Record<string, PartitionDefaults> {
+  const merged: Record<string, PartitionDefaults> = { ...base };
+  for (const [name, defaults] of Object.entries(incoming)) {
+    if (!merged[name]) {
+      merged[name] = { ...defaults };
+      continue;
+    }
+    const existing = merged[name] as Record<string, unknown>;
+    for (const [key, value] of Object.entries(defaults)) {
+      if (value !== undefined) {
+        existing[key] = value;
+      }
+    }
+  }
+  return merged;
+}
+
+function applyPartitionDefaultTimes(info: ClusterInfo, defaults: Record<string, PartitionDefaults>): void {
+  if (!info.partitions || info.partitions.length === 0) {
+    return;
+  }
+  for (const partition of info.partitions) {
+    const entry = defaults[partition.name];
+    if (!entry) {
+      continue;
+    }
+    if (entry.defaultTime) {
+      partition.defaultTime = entry.defaultTime;
+    }
+    if (entry.defaultNodes !== undefined) {
+      partition.defaultNodes = entry.defaultNodes;
+    }
+    if (entry.defaultTasksPerNode !== undefined) {
+      partition.defaultTasksPerNode = entry.defaultTasksPerNode;
+    }
+    if (entry.defaultCpusPerTask !== undefined) {
+      partition.defaultCpusPerTask = entry.defaultCpusPerTask;
+    }
+    if (entry.defaultMemoryMb !== undefined) {
+      partition.defaultMemoryMb = entry.defaultMemoryMb;
+    }
+    if (entry.defaultGpuType !== undefined) {
+      partition.defaultGpuType = entry.defaultGpuType;
+    }
+    if (entry.defaultGpuCount !== undefined) {
+      partition.defaultGpuCount = entry.defaultGpuCount;
+    }
+  }
+}
+
+function resolveDefaultPartitionName(info: ClusterInfo): string | undefined {
+  if (info.defaultPartition) {
+    return info.defaultPartition;
+  }
+  const flagged = info.partitions.find((partition) => partition.isDefault);
+  return flagged ? flagged.name : undefined;
+}
+
+function resolvePartitionDefaultTime(info: ClusterInfo, partition?: string): string | undefined {
+  const effective = partition || resolveDefaultPartitionName(info);
+  if (!effective) {
+    return undefined;
+  }
+  const match = info.partitions.find((item) => item.name === effective);
+  return match?.defaultTime;
+}
+
+async function resolveDefaultPartitionForHost(
+  loginHost: string,
+  cfg: SlurmConnectConfig
+): Promise<string | undefined> {
+  const cached = getCachedClusterInfo(loginHost)?.info;
+  if (cached) {
+    const cachedPartition = resolveDefaultPartitionName(cached);
+    if (cachedPartition) {
+      return cachedPartition;
+    }
+  }
+  try {
+    const info = await fetchClusterInfo(loginHost, cfg);
+    cacheClusterInfo(loginHost, info);
+    return resolveDefaultPartitionName(info);
+  } catch (error) {
+    getOutputChannel().appendLine(`Failed to resolve default partition: ${formatError(error)}`);
+    return undefined;
+  }
+}
+
+async function resolvePartitionDefaultTimeForHost(
+  loginHost: string,
+  partition: string | undefined,
+  cfg: SlurmConnectConfig
+): Promise<string | undefined> {
+  const cached = getCachedClusterInfo(loginHost)?.info;
+  if (cached) {
+    const cachedTime = resolvePartitionDefaultTime(cached, partition);
+    if (cachedTime) {
+      return cachedTime;
+    }
+  }
+  try {
+    const info = await fetchClusterInfo(loginHost, cfg);
+    cacheClusterInfo(loginHost, info);
+    return resolvePartitionDefaultTime(info, partition);
+  } catch (error) {
+    getOutputChannel().appendLine(`Failed to resolve partition default time: ${formatError(error)}`);
+    return undefined;
+  }
+}
+
 async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webview): Promise<void> {
   if (clusterInfoRequestInFlight) {
     return;
@@ -1611,42 +1736,63 @@ async function fetchClusterInfo(loginHost: string, cfg: SlurmConnectConfig): Pro
   const commands = [
     cfg.partitionInfoCommand,
     'sinfo -h -N -o "%P|%n|%c|%m|%G"',
-    'sinfo -h -o "%P|%D|%c|%m|%G"'
+    'sinfo -h -o "%P|%D|%c|%m|%G"',
+    'scontrol show partition -o'
   ].filter(Boolean);
 
   const log = getOutputChannel();
+  let info: ClusterInfo | undefined;
   try {
-    return await fetchClusterInfoSingleCall(loginHost, cfg, commands);
+    info = await fetchClusterInfoSingleCall(loginHost, cfg, commands);
   } catch (error) {
     log.appendLine(`Single-call cluster info failed, falling back. ${formatError(error)}`);
   }
 
-  let lastInfo: ClusterInfo = { partitions: [] };
-  let bestInfo: ClusterInfo | undefined;
-  for (const command of commands) {
-    log.appendLine(`Cluster info command: ${command}`);
-    const output = await runSshCommand(loginHost, cfg, command);
-    const info = parsePartitionInfoOutput(output);
-    lastInfo = info;
-    const maxFields = getMaxFieldCount(output);
-    const outputHasGpu = output.includes('gpu:');
-    const hasGpu = info.partitions.some((partition) => partition.gpuMax > 0);
-    log.appendLine(`Cluster info fields: ${maxFields}, partitions: ${info.partitions.length}, outputHasGpu: ${outputHasGpu}, hasGpu: ${hasGpu}`);
-    if (outputHasGpu && !hasGpu) {
-      log.appendLine('GPU data present but parse yielded none; trying next command.');
-      continue;
+  if (!info) {
+    let lastInfo: ClusterInfo = { partitions: [] };
+    let bestInfo: ClusterInfo | undefined;
+    let partitionDefaults: Record<string, PartitionDefaults> = {};
+    let defaultPartitionFromScontrol: string | undefined;
+    for (const command of commands) {
+      log.appendLine(`Cluster info command: ${command}`);
+      const output = await runSshCommand(loginHost, cfg, command);
+      const defaultsResult = parsePartitionDefaultTimesOutput(output);
+      if (Object.keys(defaultsResult.defaults).length > 0 || defaultsResult.defaultPartition) {
+        partitionDefaults = mergePartitionDefaults(partitionDefaults, defaultsResult.defaults);
+        if (!defaultPartitionFromScontrol && defaultsResult.defaultPartition) {
+          defaultPartitionFromScontrol = defaultsResult.defaultPartition;
+        }
+        continue;
+      }
+      const parsed = parsePartitionInfoOutput(output);
+      lastInfo = parsed;
+      const maxFields = getMaxFieldCount(output);
+      const outputHasGpu = output.includes('gpu:');
+      const hasGpu = parsed.partitions.some((partition) => partition.gpuMax > 0);
+      log.appendLine(
+        `Cluster info fields: ${maxFields}, partitions: ${parsed.partitions.length}, outputHasGpu: ${outputHasGpu}, hasGpu: ${hasGpu}`
+      );
+      if (outputHasGpu && !hasGpu) {
+        log.appendLine('GPU data present but parse yielded none; trying next command.');
+        continue;
+      }
+      if (maxFields < 5) {
+        continue;
+      }
+      if (hasMeaningfulClusterInfo(parsed)) {
+        bestInfo = parsed;
+        break;
+      }
     }
-    if (maxFields < 5) {
-      continue;
+    info = bestInfo ?? lastInfo;
+    const modules = await queryAvailableModules(loginHost, cfg);
+    info.modules = modules;
+    if (defaultPartitionFromScontrol && !info.defaultPartition) {
+      info.defaultPartition = defaultPartitionFromScontrol;
     }
-    if (hasMeaningfulClusterInfo(info)) {
-      bestInfo = info;
-      break;
-    }
+    applyPartitionDefaultTimes(info, partitionDefaults);
   }
-  const info = bestInfo ?? lastInfo;
-  const modules = await queryAvailableModules(loginHost, cfg);
-  info.modules = modules;
+
   return info;
 }
 
@@ -1752,9 +1898,19 @@ async function fetchClusterInfoSingleCall(
 
   let lastInfo: ClusterInfo = { partitions: [] };
   let bestInfo: ClusterInfo | undefined;
+  let partitionDefaults: Record<string, PartitionDefaults> = {};
+  let defaultPartitionFromScontrol: string | undefined;
   for (let i = 0; i < commandOutputs.length; i += 1) {
     const cmdOutput = commandOutputs[i];
     if (!cmdOutput) {
+      continue;
+    }
+    const defaultsResult = parsePartitionDefaultTimesOutput(cmdOutput);
+    if (Object.keys(defaultsResult.defaults).length > 0 || defaultsResult.defaultPartition) {
+      partitionDefaults = mergePartitionDefaults(partitionDefaults, defaultsResult.defaults);
+      if (!defaultPartitionFromScontrol && defaultsResult.defaultPartition) {
+        defaultPartitionFromScontrol = defaultsResult.defaultPartition;
+      }
       continue;
     }
     const info = parsePartitionInfoOutput(cmdOutput);
@@ -1780,6 +1936,10 @@ async function fetchClusterInfoSingleCall(
 
   const info = bestInfo ?? lastInfo;
   info.modules = parseModulesOutput(modulesOutput);
+  if (defaultPartitionFromScontrol && !info.defaultPartition) {
+    info.defaultPartition = defaultPartitionFromScontrol;
+  }
+  applyPartitionDefaultTimes(info, partitionDefaults);
   return info;
 }
 
@@ -2393,6 +2553,243 @@ function parseSimpleList(output: string): string[] {
   );
 }
 
+function parsePartitionDefaultTimesOutput(
+  output: string
+): { defaults: Record<string, PartitionDefaults>; defaultPartition?: string } {
+  const defaults: Record<string, PartitionDefaults> = {};
+  let defaultPartition: string | undefined;
+  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const timePattern = /^(\d+-)?\d{1,2}:\d{2}:\d{2}$/;
+  const normalizeTimeValue = (value: string): string | undefined => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const upper = trimmed.toUpperCase();
+    if (upper === 'NONE' || upper === 'UNLIMITED') {
+      return undefined;
+    }
+    return timePattern.test(trimmed) ? trimmed : undefined;
+  };
+  const parsePositiveInt = (value: string): number | undefined => {
+    const match = value.match(/\d+/);
+    if (!match) {
+      return undefined;
+    }
+    const parsed = Number(match[0]);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      return undefined;
+    }
+    return Math.floor(parsed);
+  };
+  const parseMemoryMb = (value: string): number | undefined => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const upper = trimmed.toUpperCase();
+    if (upper === 'NONE' || upper === 'UNLIMITED') {
+      return undefined;
+    }
+    const match = upper.match(/^(\d+(?:\.\d+)?)([KMGTP])?$/);
+    if (!match) {
+      return undefined;
+    }
+    const amount = Number(match[1]);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return undefined;
+    }
+    const unit = match[2] || 'M';
+    const multipliers: Record<string, number> = {
+      K: 1 / 1024,
+      M: 1,
+      G: 1024,
+      T: 1024 * 1024,
+      P: 1024 * 1024 * 1024
+    };
+    const multiplier = multipliers[unit] ?? 1;
+    const mb = Math.round(amount * multiplier);
+    return mb > 0 ? mb : undefined;
+  };
+  const parseGpuDefaults = (value: string): { count?: number; type?: string } | undefined => {
+    const parts = value.split(',').map((entry) => entry.trim()).filter(Boolean);
+    for (const part of parts) {
+      if (part.includes('gres/gpu')) {
+        const [left, right] = part.split('=');
+        if (!right) {
+          continue;
+        }
+        const count = parsePositiveInt(right);
+        if (!count) {
+          continue;
+        }
+        const typeMatch = left.match(/gres\/gpu:([^=]+)/);
+        const type = typeMatch ? typeMatch[1] : undefined;
+        return { count, type };
+      }
+      if (part.startsWith('gpu=')) {
+        const count = parsePositiveInt(part.slice('gpu='.length));
+        if (count) {
+          return { count };
+        }
+      }
+      if (part.startsWith('gpu:')) {
+        const segments = part.split(':').map((entry) => entry.trim()).filter(Boolean);
+        if (segments.length >= 2 && segments[0] === 'gpu') {
+          const count = parsePositiveInt(segments[segments.length - 1]);
+          if (!count) {
+            continue;
+          }
+          const type = segments.length >= 3 ? segments[1] : undefined;
+          return { count, type };
+        }
+      }
+    }
+    return undefined;
+  };
+  const applyGpuDefaults = (value: string, target: PartitionDefaults): void => {
+    const gpu = parseGpuDefaults(value);
+    if (!gpu) {
+      return;
+    }
+    if (gpu.count && target.defaultGpuCount === undefined) {
+      target.defaultGpuCount = gpu.count;
+    }
+    if (gpu.type && target.defaultGpuType === undefined) {
+      target.defaultGpuType = gpu.type;
+    }
+  };
+  const applyDefaultToken = (key: string, value: string, target: PartitionDefaults): void => {
+    const keyLower = key.toLowerCase();
+    if (keyLower === 'defaulttime' || keyLower === 'deftime') {
+      const timeValue = normalizeTimeValue(value);
+      if (timeValue && !target.defaultTime) {
+        target.defaultTime = timeValue;
+      }
+      return;
+    }
+    if (keyLower === 'defmempernode') {
+      const memValue = parseMemoryMb(value);
+      if (memValue !== undefined && target.defaultMemoryMb === undefined) {
+        target.defaultMemoryMb = memValue;
+      }
+      return;
+    }
+    if (
+      keyLower === 'defcpupertask' ||
+      keyLower === 'defcpuspertask' ||
+      keyLower === 'defaultcpupertask' ||
+      keyLower === 'defaultcpuspertask'
+    ) {
+      const cpuValue = parsePositiveInt(value);
+      if (cpuValue !== undefined && target.defaultCpusPerTask === undefined) {
+        target.defaultCpusPerTask = cpuValue;
+      }
+      return;
+    }
+    if (keyLower === 'defaultnodes') {
+      const nodesValue = parsePositiveInt(value);
+      if (nodesValue !== undefined && target.defaultNodes === undefined) {
+        target.defaultNodes = nodesValue;
+      }
+      return;
+    }
+    if (keyLower === 'defaulttaskspernode') {
+      const tasksValue = parsePositiveInt(value);
+      if (tasksValue !== undefined && target.defaultTasksPerNode === undefined) {
+        target.defaultTasksPerNode = tasksValue;
+      }
+      return;
+    }
+    if (
+      keyLower === 'defaultgres' ||
+      keyLower === 'defgres' ||
+      keyLower.startsWith('defaulttres') ||
+      keyLower.startsWith('deftres')
+    ) {
+      applyGpuDefaults(value, target);
+    }
+  };
+  const applyJobDefaults = (value: string, target: PartitionDefaults): void => {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.toLowerCase() === '(null)') {
+      return;
+    }
+    const entries = trimmed.split(',').map((entry) => entry.trim()).filter(Boolean);
+    for (const entry of entries) {
+      const equalsIndex = entry.indexOf('=');
+      if (equalsIndex === -1) {
+        continue;
+      }
+      const key = entry.slice(0, equalsIndex);
+      const val = entry.slice(equalsIndex + 1);
+      if (!key) {
+        continue;
+      }
+      if (key.toLowerCase() === 'gres' || key.toLowerCase() === 'defgres') {
+        applyGpuDefaults(val, target);
+      } else {
+        applyDefaultToken(key, val, target);
+      }
+    }
+  };
+
+  for (const line of lines) {
+    const tokens = line.split(/\s+/).filter(Boolean);
+    let rawName = '';
+    let isDefault = false;
+    const lineDefaults: PartitionDefaults = {};
+    for (const token of tokens) {
+      const equalsIndex = token.indexOf('=');
+      if (equalsIndex === -1) {
+        continue;
+      }
+      const key = token.slice(0, equalsIndex);
+      const value = token.slice(equalsIndex + 1);
+      if (!key) {
+        continue;
+      }
+      if (key === 'PartitionName') {
+        rawName = value;
+        continue;
+      }
+      if (key === 'Default' && value === 'YES') {
+        isDefault = true;
+        continue;
+      }
+      if (key === 'JobDefaults') {
+        applyJobDefaults(value, lineDefaults);
+        continue;
+      }
+      if (key.startsWith('Def') || key.startsWith('Default')) {
+        applyDefaultToken(key, value, lineDefaults);
+      }
+    }
+    if (!rawName) {
+      continue;
+    }
+    const names = rawName
+      .split(',')
+      .map((entry) => entry.replace(/\*/g, '').trim())
+      .filter(Boolean);
+    for (const name of names) {
+      if (!defaults[name]) {
+        defaults[name] = {};
+      }
+      const existing = defaults[name] as Record<string, unknown>;
+      for (const [key, value] of Object.entries(lineDefaults)) {
+        if (value !== undefined) {
+          existing[key] = value;
+        }
+      }
+    }
+    if (isDefault && !defaultPartition) {
+      defaultPartition = names[0];
+    }
+  }
+  return { defaults, defaultPartition };
+}
+
 async function pickFromList(title: string, items: string[], allowManual: boolean): Promise<string | undefined> {
   const picks: vscode.QuickPickItem[] = items.map((item) => ({ label: item }));
   if (allowManual) {
@@ -2422,7 +2819,7 @@ async function pickPartition(
 ): Promise<string | undefined | null> {
   if (partitions.length === 0) {
     const manual = await vscode.window.showInputBox({
-      title: 'Partition (optional)',
+      title: 'Partition',
       prompt: 'Enter partition or leave blank to use cluster default'
     });
     if (manual === undefined) {
@@ -2452,7 +2849,7 @@ async function pickPartition(
   }
 
   if (picked.label === 'Use cluster default') {
-    return undefined;
+    return defaultPartition || undefined;
   }
 
   return picked.label;
@@ -2481,18 +2878,27 @@ async function promptNumber(title: string, defaultValue: number, minValue: numbe
   const value = await vscode.window.showInputBox({
     title,
     value: String(defaultValue),
+    prompt: 'Leave blank to use cluster default.',
     validateInput: (input) => {
-      const parsed = Number(input);
+      const trimmed = input.trim();
+      if (!trimmed) {
+        return undefined;
+      }
+      const parsed = Number(trimmed);
       if (!Number.isInteger(parsed) || parsed < minValue) {
-        return `Enter an integer >= ${minValue}.`;
+        return `Enter an integer >= ${minValue}, or leave blank for default.`;
       }
       return undefined;
     }
   });
-  if (!value) {
+  if (value === undefined) {
     return undefined;
   }
-  return Number(value);
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  return Number(trimmed);
 }
 
 async function promptTime(title: string, defaultValue: string): Promise<string | undefined> {
@@ -2500,10 +2906,19 @@ async function promptTime(title: string, defaultValue: string): Promise<string |
   const value = await vscode.window.showInputBox({
     title,
     value: defaultValue,
-    prompt: 'HH:MM:SS or D-HH:MM:SS',
-    validateInput: (input) => (timePattern.test(input) ? undefined : 'Invalid time format.')
+    prompt: 'HH:MM:SS or D-HH:MM:SS (leave blank for cluster default)',
+    validateInput: (input) => {
+      const trimmed = input.trim();
+      if (!trimmed) {
+        return undefined;
+      }
+      return timePattern.test(trimmed) ? undefined : 'Invalid time format.';
+    }
   });
-  return value?.trim() || undefined;
+  if (value === undefined) {
+    return undefined;
+  }
+  return value.trim();
 }
 
 function buildSallocArgs(params: {
@@ -2522,10 +2937,18 @@ function buildSallocArgs(params: {
   if (params.partition) {
     args.push(`--partition=${params.partition}`);
   }
-  args.push(`--nodes=${params.nodes}`);
-  args.push(`--ntasks-per-node=${params.tasksPerNode}`);
-  args.push(`--cpus-per-task=${params.cpusPerTask}`);
-  args.push(`--time=${params.time}`);
+  if (params.nodes > 0) {
+    args.push(`--nodes=${params.nodes}`);
+  }
+  if (params.tasksPerNode > 0) {
+    args.push(`--ntasks-per-node=${params.tasksPerNode}`);
+  }
+  if (params.cpusPerTask > 0) {
+    args.push(`--cpus-per-task=${params.cpusPerTask}`);
+  }
+  if (params.time && params.time.trim().length > 0) {
+    args.push(`--time=${params.time}`);
+  }
   if (params.qos) {
     args.push(`--qos=${params.qos}`);
   }
@@ -2565,15 +2988,20 @@ function buildDefaultAlias(
   prefix: string,
   loginHost: string,
   partition: string | undefined,
-  nodes: number,
-  cpusPerTask: number
+  nodes?: number,
+  cpusPerTask?: number
 ): string {
   const hostShort = loginHost.split('.')[0];
   const pieces = [prefix || 'slurm', hostShort];
   if (partition) {
     pieces.push(partition);
   }
-  pieces.push(`${nodes}n`, `${cpusPerTask}c`);
+  if (nodes && nodes > 0) {
+    pieces.push(`${nodes}n`);
+  }
+  if (cpusPerTask && cpusPerTask > 0) {
+    pieces.push(`${cpusPerTask}c`);
+  }
   return pieces.join('-').replace(/[^a-zA-Z0-9_-]/g, '-');
 }
 
@@ -3336,7 +3764,7 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     defaultCpusPerTask: hasDefaultCpusPerTask
       ? fromCache('defaultCpusPerTask', String(cfg.defaultCpusPerTask || ''))
       : '',
-    defaultTime: hasDefaultTime ? fromCache('defaultTime', cfg.defaultTime || '') : '',
+    defaultTime: hasDefaultTime ? fromCache('defaultTime', cfg.defaultTime || '') : '24:00:00',
     defaultMemoryMb: hasDefaultMemoryMb ? fromCache('defaultMemoryMb', String(cfg.defaultMemoryMb || '')) : '',
     defaultGpuType: hasDefaultGpuType ? fromCache('defaultGpuType', cfg.defaultGpuType || '') : '',
     defaultGpuCount: hasDefaultGpuCount ? fromCache('defaultGpuCount', String(cfg.defaultGpuCount || '')) : '',
@@ -3673,7 +4101,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
   <div class="section">
     <label for="defaultPartitionInput">Partition</label>
     <div class="combo-picker" id="defaultPartitionPicker">
-      <input id="defaultPartitionInput" type="text" placeholder="(optional)" />
+      <input id="defaultPartitionInput" type="text" placeholder="Cluster default if blank" />
       <div id="defaultPartitionMenu" class="dropdown-menu"></div>
     </div>
     <div id="partitionMeta" class="hint"></div>
@@ -3725,6 +4153,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <label for="defaultTime">Wall time</label>
     <input id="defaultTime" type="text" placeholder="HH:MM:SS" />
     <div class="buttons" style="margin-top: 8px;">
+      <button id="fillPartitionDefaults" type="button">Use partition defaults</button>
       <button id="clearResources" type="button">Clear resources</button>
     </div>
   </div>
@@ -3816,7 +4245,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <button id="connectToggle">Connect</button>
     </div>
     <div id="connectStatus" class="hint"></div>
-    <div class="hint">Defaults save on connect (change in Advanced).</div>
   <div class="hint">Connections add a small Slurm Connect Include block to your SSH config and update the Slurm Connect include file.</div>
   </div>
 
@@ -4435,10 +4863,23 @@ function getWebviewHtml(webview: vscode.Webview): string {
       return options;
     }
 
+    function getClusterDefaultPartitionName() {
+      if (!clusterInfo || !clusterInfo.partitions) return '';
+      if (clusterInfo.defaultPartition) return clusterInfo.defaultPartition;
+      const flagged = clusterInfo.partitions.find((partition) => partition.isDefault);
+      return flagged ? flagged.name : '';
+    }
+
     function updatePartitionDetails() {
       if (!clusterInfo || !clusterInfo.partitions) return;
       const selected = getValue('defaultPartition').trim();
       let chosen = selected ? clusterInfo.partitions.find((p) => p.name === selected) : undefined;
+      if (!chosen && !selected) {
+        const fallback = getClusterDefaultPartitionName();
+        if (fallback) {
+          chosen = clusterInfo.partitions.find((p) => p.name === fallback);
+        }
+      }
       if (!chosen) {
         const meta = document.getElementById('partitionMeta');
         if (meta) meta.textContent = '';
@@ -4509,6 +4950,57 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
     }
 
+    function applyPartitionDefaults() {
+      if (!clusterInfo || !clusterInfo.partitions) {
+        setStatus('Load cluster info to apply partition defaults.', true);
+        return;
+      }
+      const selected = getValue('defaultPartition').trim();
+      let chosen = selected ? clusterInfo.partitions.find((p) => p.name === selected) : undefined;
+      if (!chosen && !selected) {
+        const fallback = getClusterDefaultPartitionName();
+        if (fallback) {
+          chosen = clusterInfo.partitions.find((p) => p.name === fallback);
+        }
+      }
+      if (!chosen) {
+        setStatus('Select a partition before applying defaults.', true);
+        return;
+      }
+
+      const setFieldValue = (key, value) => {
+        setValue(key, value);
+        lastValues[key] = value;
+      };
+      const applyNumberDefault = (key, value) => {
+        if (typeof value === 'number' && value > 0) {
+          setFieldValue(key, String(value));
+        }
+      };
+      const applyStringDefault = (key, value) => {
+        if (typeof value === 'string' && value.trim().length > 0) {
+          setFieldValue(key, value.trim());
+        }
+      };
+
+      applyNumberDefault('defaultNodes', chosen.defaultNodes);
+      applyNumberDefault('defaultTasksPerNode', chosen.defaultTasksPerNode);
+      applyNumberDefault('defaultCpusPerTask', chosen.defaultCpusPerTask);
+      applyNumberDefault('defaultMemoryMb', chosen.defaultMemoryMb);
+
+      applyStringDefault('defaultGpuType', chosen.defaultGpuType);
+      applyNumberDefault('defaultGpuCount', chosen.defaultGpuCount);
+
+      if (typeof chosen.defaultTime === 'string' && chosen.defaultTime.trim().length > 0) {
+        setFieldValue('defaultTime', chosen.defaultTime.trim());
+      } else {
+        setFieldValue('defaultTime', '24:00:00');
+      }
+
+      updatePartitionDetails();
+      scheduleAutoSave();
+    }
+
     function applyClusterInfo(info) {
       const manualPartition = getValue('defaultPartition');
       clusterInfo = info;
@@ -4524,8 +5016,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
         value: partition.name,
         label: partition.isDefault ? partition.name + ' (default)' : partition.name
       }));
-      const preferredPartition = manualPartition || lastValues.defaultPartition;
+      const resolvedDefault = getClusterDefaultPartitionName();
+      const preferredPartition = manualPartition || lastValues.defaultPartition || resolvedDefault;
       setFieldOptions('defaultPartition', options, preferredPartition);
+      if (!manualPartition && !lastValues.defaultPartition && resolvedDefault) {
+        lastValues.defaultPartition = resolvedDefault;
+      }
       updatePartitionDetails();
       setStatus('Loaded ' + info.partitions.length + ' partitions.', false);
     }
@@ -4666,6 +5162,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     document.getElementById('clearClusterInfo').addEventListener('click', () => {
       clearClusterInfoUi();
+    });
+
+    document.getElementById('fillPartitionDefaults').addEventListener('click', () => {
+      applyPartitionDefaults();
     });
 
     document.getElementById('clearResources').addEventListener('click', () => {

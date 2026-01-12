@@ -6,6 +6,13 @@ export interface PartitionInfo {
   gpuMax: number;
   gpuTypes: Record<string, number>;
   isDefault: boolean;
+  defaultTime?: string;
+  defaultNodes?: number;
+  defaultTasksPerNode?: number;
+  defaultCpusPerTask?: number;
+  defaultMemoryMb?: number;
+  defaultGpuType?: string;
+  defaultGpuCount?: number;
 }
 
 export interface ClusterInfo {
