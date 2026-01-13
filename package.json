@@ -2,7 +2,7 @@
   "name": "slurm-connect",
   "displayName": "Slurm Connect",
   "description": "Select Slurm resources and connect VS Code Remote-SSH through a compute allocation.",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "publisher": "xangma",
   "repository": "https://github.com/xangma/slurm-connect",
   "engines": {
