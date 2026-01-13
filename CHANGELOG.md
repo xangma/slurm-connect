@@ -1,0 +1,56 @@
+# Changelog
+All notable changes to this project are documented in this file based on git tags and commit history.
+
+## Unreleased
+- No unreleased changes.
+
+## 0.3.2 - 2026-01-12
+### Added
+- SSH config backup support and a new setting for a managed Include block.
+- Default partition properties to `PartitionInfo`.
+
+### Changed
+- Migrated legacy module commands and sanitized module cache handling in the extension.
+- Clarified SSH include file usage and connection handling in configuration and the README.
+
+## 0.3.1 - 2026-01-09
+### Docs
+- Expanded README details for cluster info and profiles.
+
+## 0.3.0 - 2026-01-09
+### Changed
+- Improved SSH authentication flow and prompts.
+- Improved cluster info fetching logic.
+- Refactored code structure for readability and maintainability.
+
+## 0.2.1 - 2026-01-09
+### Added
+- Unit tests and utility functions for SSH config and cluster info parsing.
+- Auto-save for settings with enhanced input validation.
+
+### Changed
+- Renamed the extension from Sciama to Slurm Connect and migrated legacy settings.
+- Updated README requirements (Python 3.9+) and proxy script accessibility notes.
+- Bumped the package version to 0.2.0.
+
+## 0.1.4 - 2026-01-08
+### Docs
+- Clarified SSH agent requirements and remote workspace path configuration in the README.
+
+## 0.1.3 - 2026-01-08
+### Added
+- Module management features and improved connection state synchronization.
+
+## 0.1.2 - 2026-01-08
+### Changed
+- Improved SSH authentication handling with prompts and normalized errors.
+
+## 0.1.1 - 2026-01-07
+### Added
+- Initial public release.
+- Quick start and development setup documentation.
+- Repository metadata in `package.json`.
+
+### Changed
+- Refactored code structure for readability and maintainability.
+- Updated proxy command path and SSH config restoration logic.
