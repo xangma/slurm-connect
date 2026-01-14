@@ -9,6 +9,10 @@ All notable changes to this project are documented in this file based on git tag
 - Stale-data warning for free-resource filtering to prompt refreshes.
 - Module list section headers as non-selectable dividers, with section-aware searching.
 - Webview remembers collapsed/expanded states for connection/resource/profiles/advanced sections.
+- Resource warning hints for invalid or likely-to-fail Slurm requests.
+
+### Fixed
+- Wall-time validation ignores hidden characters and punctuation, preventing false warnings.
 
 ### Fixed
 - Module list parsing now strips terminal control codes and legend markers from `module -t avail`.

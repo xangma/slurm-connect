@@ -25,6 +25,8 @@ The **Get cluster info** button queries your login host to discover available Sl
 the dropdowns and suggestions in the UI so you can pick valid values quickly. You can still type values manually,
 and the fetched data is cached per login host to speed up the next load.
 
+When cluster info is available, the UI shows warning hints if selected resources exceed partition limits or (when free-resource filtering is on) the currently free capacity. Warnings are advisory and do not block connecting.
+
 #### Free-resource filtering (default on)
 When enabled, the UI filters suggestions to **currently free** resources. This is computed from the same SSH
 cluster-info call (no extra prompts) by combining:

@@ -4793,6 +4793,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     </div>
     <div id="clusterStatus" class="hint"></div>
     <div id="freeResourceWarning" class="hint warning"></div>
+    <div id="resourceWarning" class="hint warning"></div>
 
     <label for="defaultPartitionInput">Partition</label>
     <div class="combo-picker" id="defaultPartitionPicker">
@@ -5014,6 +5015,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
       el.textContent = text || '';
     }
 
+    function setResourceWarning(text) {
+      const el = document.getElementById('resourceWarning');
+      if (!el) return;
+      el.textContent = text || '';
+    }
+
     initSectionState();
 
     function setProfileStatus(text, isError) {
@@ -5088,6 +5095,232 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
       const ageLabel = formatAgeLabel(ageMs);
       setFreeResourceWarning('Free resource data is ' + ageLabel + ' old. Click "Get cluster info" to refresh.');
+    }
+
+    function parseIntInput(value, allowZero) {
+      const trimmed = String(value || '').trim();
+      if (!trimmed) {
+        return undefined;
+      }
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed)) {
+        return undefined;
+      }
+      const integer = Math.floor(parsed);
+      if (allowZero) {
+        return integer < 0 ? undefined : integer;
+      }
+      return integer < 1 ? undefined : integer;
+    }
+
+    function getSelectedPartitionInfo() {
+      if (!clusterInfo || !clusterInfo.partitions) {
+        return { selected: '', partition: undefined };
+      }
+      const selected = String(getValue('defaultPartition') || '').trim();
+      let partition = selected ? clusterInfo.partitions.find((item) => item.name === selected) : undefined;
+      if (!partition && !selected) {
+        const defaultName = getClusterDefaultPartitionName();
+        if (defaultName) {
+          partition = clusterInfo.partitions.find((item) => item.name === defaultName);
+        }
+      }
+      return { selected, partition };
+    }
+
+    function normalizeGpuKey(value) {
+      return String(value || '').trim().toLowerCase();
+    }
+
+    function buildNormalizedKeyMap(values) {
+      const map = {};
+      values.forEach((value) => {
+        map[normalizeGpuKey(value)] = value;
+      });
+      return map;
+    }
+
+    function getDigitGroups(value) {
+      const trimmed = String(value || '').trim();
+      if (!trimmed) {
+        return [];
+      }
+      const groups = [];
+      let current = '';
+      for (let i = 0; i < trimmed.length; i += 1) {
+        const ch = trimmed[i];
+        if (ch >= '0' && ch <= '9') {
+          current += ch;
+        } else if (current) {
+          groups.push(current);
+          current = '';
+        }
+      }
+      if (current) {
+        groups.push(current);
+      }
+      return groups;
+    }
+
+    function isValidTimeInput(value) {
+      const trimmed = String(value || '').trim();
+      if (!trimmed) {
+        return true;
+      }
+      const parts = getDigitGroups(trimmed);
+      if (parts.length === 3) {
+        return parts[1].length === 2 && parts[2].length === 2;
+      }
+      if (parts.length === 4) {
+        return parts[2].length === 2 && parts[3].length === 2;
+      }
+      return false;
+    }
+
+    function updateResourceWarning() {
+      const warnings = [];
+      const timeValue = getValue('defaultTime');
+      if (!isValidTimeInput(timeValue)) {
+        warnings.push('Wall time must be HH:MM:SS or D-HH:MM:SS.');
+      }
+
+      if (!clusterInfo || !clusterInfo.partitions || clusterInfo.partitions.length === 0) {
+        setResourceWarning(warnings.join(' | '));
+        return;
+      }
+
+      const { selected, partition } = getSelectedPartitionInfo();
+      if (!partition) {
+        if (selected) {
+          warnings.push('Selected partition not found in cluster info; refresh to validate limits.');
+        }
+        setResourceWarning(warnings.join(' | '));
+        return;
+      }
+
+      const nodes = parseIntInput(getValue('defaultNodes'), false);
+      const tasksPerNode = parseIntInput(getValue('defaultTasksPerNode'), false);
+      const cpusPerTask = parseIntInput(getValue('defaultCpusPerTask'), false);
+      const memoryMb = parseIntInput(getValue('defaultMemoryMb'), true);
+      const gpuCount = parseIntInput(getValue('defaultGpuCount'), true);
+      const gpuType = String(getValue('defaultGpuType') || '').trim();
+
+      const cpusPerNode = partition.cpus || 0;
+      if (cpusPerTask && cpusPerNode && cpusPerTask > cpusPerNode) {
+        warnings.push('CPUs per task (' + cpusPerTask + ') exceeds CPUs per node (' + cpusPerNode + ').');
+      } else if (tasksPerNode && cpusPerTask && cpusPerNode && tasksPerNode * cpusPerTask > cpusPerNode) {
+        warnings.push(
+          'Tasks per node x CPUs per task (' +
+            tasksPerNode * cpusPerTask +
+            ') exceeds CPUs per node (' +
+            cpusPerNode +
+            ').'
+        );
+      } else if (tasksPerNode && cpusPerNode && tasksPerNode > cpusPerNode) {
+        warnings.push('Tasks per node (' + tasksPerNode + ') exceeds CPUs per node (' + cpusPerNode + ').');
+      }
+
+      if (nodes && partition.nodes && nodes > partition.nodes) {
+        warnings.push('Nodes (' + nodes + ') exceeds partition total nodes (' + partition.nodes + ').');
+      }
+
+      if (memoryMb && partition.memMb && memoryMb > partition.memMb) {
+        warnings.push(
+          'Memory per node (' + memoryMb + ' MB) exceeds partition max (' + partition.memMb + ' MB).'
+        );
+      }
+
+      if (gpuType) {
+        const typeMap = partition.gpuTypes || {};
+        const normalized = buildNormalizedKeyMap(Object.keys(typeMap));
+        if (!normalized[normalizeGpuKey(gpuType)]) {
+          warnings.push('GPU type "' + gpuType + '" is not available in this partition.');
+        }
+      }
+
+      if (gpuCount && gpuCount > 0) {
+        if (gpuType) {
+          const typeMap = partition.gpuTypes || {};
+          const normalized = buildNormalizedKeyMap(Object.keys(typeMap));
+          const matchedKey = normalized[normalizeGpuKey(gpuType)];
+          const maxForType = matchedKey ? typeMap[matchedKey] : 0;
+          if (maxForType && gpuCount > maxForType) {
+            warnings.push(
+              'GPU count (' + gpuCount + ') exceeds partition max for ' + gpuType + ' (' + maxForType + ').'
+            );
+          }
+        } else if (partition.gpuMax && gpuCount > partition.gpuMax) {
+          warnings.push('GPU count (' + gpuCount + ') exceeds partition max (' + partition.gpuMax + ').');
+        }
+      }
+
+      if (Boolean(getValue('filterFreeResources')) && hasFreeResourceData(partition)) {
+        if (!clusterInfoFetchedAt) {
+          setResourceWarning(warnings.length ? warnings.join(' | ') : '');
+          return;
+        }
+        const ageMs = Date.now() - clusterInfoFetchedAt;
+        if (!Number.isFinite(ageMs) || ageMs >= FREE_RESOURCE_STALE_MS) {
+          setResourceWarning(warnings.length ? warnings.join(' | ') : '');
+          return;
+        }
+        if (nodes && typeof partition.freeNodes === 'number' && nodes > partition.freeNodes) {
+          warnings.push('Nodes (' + nodes + ') exceeds currently free nodes (' + partition.freeNodes + ').');
+        }
+        const requestedCpus =
+          tasksPerNode && cpusPerTask
+            ? tasksPerNode * cpusPerTask
+            : cpusPerTask
+              ? cpusPerTask
+              : tasksPerNode
+                ? tasksPerNode
+                : undefined;
+        if (requestedCpus && typeof partition.freeCpusPerNode === 'number') {
+          if (partition.freeCpusPerNode === 0) {
+            warnings.push('No free CPUs currently reported for this partition.');
+          } else if (requestedCpus > partition.freeCpusPerNode) {
+            warnings.push(
+              'CPUs per node requested (' +
+                requestedCpus +
+                ') exceeds currently free CPUs per node (' +
+                partition.freeCpusPerNode +
+                ').'
+            );
+          }
+        }
+
+        if (gpuCount && gpuCount > 0) {
+          const freeTypeMap = partition.freeGpuTypes || {};
+          if (gpuType) {
+            const normalized = buildNormalizedKeyMap(Object.keys(freeTypeMap));
+            const matchedKey = normalized[normalizeGpuKey(gpuType)];
+            const maxForType = matchedKey ? freeTypeMap[matchedKey] : 0;
+            if (matchedKey && maxForType === 0) {
+              warnings.push('No free ' + gpuType + ' GPUs currently reported for this partition.');
+            } else if (maxForType && gpuCount > maxForType) {
+              warnings.push(
+                'GPU count (' + gpuCount + ') exceeds currently free ' + gpuType + ' GPUs (' + maxForType + ').'
+              );
+            } else if (!matchedKey) {
+              const partitionTypes = partition.gpuTypes || {};
+              const partitionKeys = buildNormalizedKeyMap(Object.keys(partitionTypes));
+              if (partitionKeys[normalizeGpuKey(gpuType)]) {
+                warnings.push('No free ' + gpuType + ' GPUs currently reported for this partition.');
+              }
+            }
+          } else if (typeof partition.freeGpuMax === 'number') {
+            if (partition.freeGpuMax === 0) {
+              warnings.push('No free GPUs currently reported for this partition.');
+            } else if (gpuCount > partition.freeGpuMax) {
+              warnings.push(
+                'GPU count (' + gpuCount + ') exceeds currently free GPUs (' + partition.freeGpuMax + ').'
+              );
+            }
+          }
+        }
+      }
+
+      setResourceWarning(warnings.length ? warnings.join(' | ') : '');
     }
 
     function initSectionState() {
@@ -5649,6 +5882,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       clusterInfo = null;
       setClusterInfoFetchedAt(null);
       setFreeResourceWarning('');
+      setResourceWarning('');
       setResourceDisabled(false);
       clearResourceOptions();
       setModuleOptions([]);
@@ -5684,6 +5918,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (moduleInput) moduleInput.value = '';
       const meta = document.getElementById('partitionMeta');
       if (meta) meta.textContent = '';
+      updateResourceWarning();
       updatePartitionDetails();
       const saveTarget = document.getElementById('saveTarget');
       if (saveTarget) {
@@ -5771,7 +6006,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function updatePartitionDetails() {
-      if (!clusterInfo || !clusterInfo.partitions) return;
+      if (!clusterInfo || !clusterInfo.partitions) {
+        updateResourceWarning();
+        return;
+      }
       const selected = getValue('defaultPartition').trim();
       let chosen = selected ? clusterInfo.partitions.find((p) => p.name === selected) : undefined;
       if (!chosen && !selected) {
@@ -5788,6 +6026,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         setFieldOptions('defaultMemoryMb', [], '');
         setFieldOptions('defaultGpuType', [], '');
         setFieldOptions('defaultGpuCount', [], '');
+        updateResourceWarning();
         return;
       }
 
@@ -5859,6 +6098,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         setFieldDisabled('defaultGpuType', false);
         setFieldDisabled('defaultGpuCount', false);
       }
+      updateResourceWarning();
     }
 
     function applyPartitionDefaults() {
@@ -5917,6 +6157,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       clusterInfo = info;
       setModuleOptions(info && Array.isArray(info.modules) ? info.modules : []);
       updateFreeResourceWarning();
+      updateResourceWarning();
       if (!info || !info.partitions || info.partitions.length === 0) {
         setStatus('No partitions found.', true);
         clearResourceOptions();
@@ -6057,6 +6298,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           setModuleOptions([]);
           setResourceDisabled(false);
           setStatus('Enter values manually or click "Get cluster info" to populate suggestions.', false);
+          updateResourceWarning();
         }
         applyMessageState(message);
         suppressAutoSave = false;
@@ -6235,6 +6477,21 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     addFieldListener('defaultPartition', updatePartitionDetails);
     addFieldListener('defaultGpuType', updatePartitionDetails);
+    addFieldListener('defaultNodes', updateResourceWarning);
+    addFieldListener('defaultCpusPerTask', updateResourceWarning);
+    addFieldListener('defaultMemoryMb', updateResourceWarning);
+    addFieldListener('defaultGpuCount', updateResourceWarning);
+
+    const tasksPerNodeInput = document.getElementById('defaultTasksPerNode');
+    if (tasksPerNodeInput) {
+      tasksPerNodeInput.addEventListener('change', updateResourceWarning);
+      tasksPerNodeInput.addEventListener('input', updateResourceWarning);
+    }
+    const defaultTimeInput = document.getElementById('defaultTime');
+    if (defaultTimeInput) {
+      defaultTimeInput.addEventListener('change', updateResourceWarning);
+      defaultTimeInput.addEventListener('input', updateResourceWarning);
+    }
 
     const filterToggle = document.getElementById('filterFreeResources');
     if (filterToggle) {
@@ -6327,6 +6584,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     initializeAutoSave();
     setConnectState('idle');
     vscode.postMessage({ command: 'ready' });
+    //# sourceURL=slurm-connect-webview.js
   </script>
 </body>
 </html>`;
