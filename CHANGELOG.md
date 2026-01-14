@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file based on git tag
 ## Unreleased
 - No unreleased changes.
 
+## 0.3.4 - 2026-01-14
+### Added
+- Stale-data warning for free-resource filtering to prompt refreshes.
+- Module list section headers as non-selectable dividers, with section-aware searching.
+
+### Fixed
+- Module list parsing now strips terminal control codes and legend markers from `module -t avail`.
+
 ## 0.3.3 - 2026-01-13
 ### Added
 - Free-resource filtering for cluster info suggestions (default on) with a UI toggle and setting.
