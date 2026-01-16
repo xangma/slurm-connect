@@ -134,6 +134,30 @@
           "default": false,
           "description": "Prompt for additional salloc arguments each time you connect."
         },
+        "slurmConnect.sessionMode": {
+          "type": "string",
+          "enum": [
+            "ephemeral",
+            "persistent"
+          ],
+          "default": "persistent",
+          "description": "Allocation mode. Persistent reuses a Slurm allocation across reconnects."
+        },
+        "slurmConnect.sessionKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional key to identify a persistent session. Leave blank to reuse the SSH alias."
+        },
+        "slurmConnect.sessionIdleTimeoutSeconds": {
+          "type": "number",
+          "default": 600,
+          "description": "Idle timeout in seconds before cancelling a persistent allocation. Set to 0 to disable."
+        },
+        "slurmConnect.sessionStateDir": {
+          "type": "string",
+          "default": "",
+          "description": "Optional directory for persistent session state (markers/job info). Leave blank to use the proxy default."
+        },
         "slurmConnect.defaultPartition": {
           "type": "string",
           "default": "",

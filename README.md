@@ -27,6 +27,10 @@ and the fetched data is cached per login host to speed up the next load.
 
 When cluster info is available, the UI shows warning hints if selected resources exceed partition limits or (when free-resource filtering is on) the currently free capacity. Warnings are advisory and do not block connecting.
 
+When you click **Get cluster info**, Slurm Connect also checks for existing persistent sessions. If any are found,
+an **Existing sessions** selector appears. Choosing one disables the resource fields and attaches the connection
+to that allocation when you click **Connect**.
+
 #### Free-resource filtering (default on)
 When enabled, the UI filters suggestions to **currently free** resources. This is computed from the same SSH
 cluster-info call (no extra prompts) by combining:
@@ -91,6 +95,28 @@ The "slurmConnect.proxyCommand" setting must execute it, e.g.:
 ```json
 "slurmConnect.proxyCommand": "python /usr/bin/vscode-shell-proxy.py"
 ```
+
+### Persistent sessions (optional)
+By default, Slurm Connect uses persistent sessions so allocations survive reconnects and are cancelled after an idle timeout
+(default 10 minutes). Set the timeout to 0 to disable auto-cancel.
+
+Requirements:
+- An updated `vscode-shell-proxy.py` with persistent session support.
+- A shared filesystem between login and compute nodes (used for session state/markers).
+
+Settings:
+- `slurmConnect.sessionMode`: `persistent` (default) or `ephemeral`.
+- `slurmConnect.sessionKey`: Optional identifier for reuse; defaults to the SSH alias.
+- `slurmConnect.sessionIdleTimeoutSeconds`: Seconds of idle time before cancelling (0 = never).
+- `slurmConnect.sessionStateDir`: Optional base directory for session state (default handled by the proxy).
+
+In persistent mode, the proxy submits an allocation via `sbatch`, reuses it on reconnect, and launches each
+VS Code connection as a job step (`srun --overlap`). When no session markers remain, the idle timer starts and
+the allocation is cancelled once it expires.
+
+Session state is stored under `sessionStateDir/sessions/<username>/<sessionKey>` to avoid cross-user clashes on
+shared filesystems. Legacy sessions that live directly under `sessionStateDir/sessions/<sessionKey>` are still
+recognized.
 
 ### Remote folder (recommended)
 If you forget to set a remote folder, VS Code may reconnect and create a new Slurm job when you later open a folder. To avoid that, you should set a remote folder up front in the side panel, set **Remote folder** (recommended).

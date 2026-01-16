@@ -41,6 +41,10 @@ interface SlurmConnectConfig {
   proxyArgs: string[];
   extraSallocArgs: string[];
   promptForExtraSallocArgs: boolean;
+  sessionMode: SessionMode;
+  sessionKey: string;
+  sessionIdleTimeoutSeconds: number;
+  sessionStateDir: string;
   defaultPartition: string;
   defaultNodes: number;
   defaultTasksPerNode: number;
@@ -67,6 +71,19 @@ interface PartitionResult {
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
 type SshAuthMode = 'agent' | 'terminal';
+type SessionMode = 'ephemeral' | 'persistent';
+
+interface SessionSummary {
+  sessionKey: string;
+  jobId: string;
+  state: string;
+  jobName?: string;
+  createdAt?: string;
+  partition?: string;
+  nodes?: number;
+  cpus?: number;
+  timeLimit?: string;
+}
 
 let outputChannel: vscode.OutputChannel | undefined;
 let logFilePath: string | undefined;
@@ -92,6 +109,7 @@ const LEGACY_PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
 const LEGACY_ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
 const LEGACY_PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
 const LEGACY_CLUSTER_INFO_CACHE_KEY = 'sciamaSlurm.clusterInfoCache';
+const DEFAULT_SESSION_STATE_DIR = '~/.slurm-connect';
 const CONFIG_KEYS = [
   'loginHosts',
   'loginHostsCommand',
@@ -110,6 +128,10 @@ const CONFIG_KEYS = [
   'proxyArgs',
   'extraSallocArgs',
   'promptForExtraSallocArgs',
+  'sessionMode',
+  'sessionKey',
+  'sessionIdleTimeoutSeconds',
+  'sessionStateDir',
   'defaultPartition',
   'defaultNodes',
   'defaultTasksPerNode',
@@ -141,6 +163,10 @@ const CLUSTER_SETTING_KEYS = [
   'proxyCommand',
   'proxyArgs',
   'extraSallocArgs',
+  'sessionMode',
+  'sessionKey',
+  'sessionIdleTimeoutSeconds',
+  'sessionStateDir',
   'defaultPartition',
   'defaultNodes',
   'defaultTasksPerNode',
@@ -468,6 +494,13 @@ function mapConfigValueToUi(key: ClusterSettingKey, value: unknown): string {
       }
       return String(Math.floor(numeric));
     }
+    case 'sessionIdleTimeoutSeconds': {
+      const numeric = typeof value === 'number' ? value : Number(value);
+      if (!Number.isFinite(numeric) || numeric < 0) {
+        return '0';
+      }
+      return String(Math.floor(numeric));
+    }
     default:
       return value === undefined || value === null ? '' : String(value);
   }
@@ -685,6 +718,10 @@ interface UiValues {
   proxyArgs: string;
   extraSallocArgs: string;
   promptForExtraSallocArgs: boolean;
+  sessionMode: string;
+  sessionKey: string;
+  sessionIdleTimeoutSeconds: string;
+  sessionStateDir: string;
   defaultPartition: string;
   defaultNodes: string;
   defaultTasksPerNode: string;
@@ -722,6 +759,10 @@ const CLUSTER_UI_KEYS = new Set<keyof UiValues>([
   'proxyCommand',
   'proxyArgs',
   'extraSallocArgs',
+  'sessionMode',
+  'sessionKey',
+  'sessionIdleTimeoutSeconds',
+  'sessionStateDir',
   'defaultPartition',
   'defaultNodes',
   'defaultTasksPerNode',
@@ -974,6 +1015,10 @@ function getConfigFromSettings(): SlurmConnectConfig {
     proxyArgs: cfg.get<string[]>('proxyArgs', []),
     extraSallocArgs: cfg.get<string[]>('extraSallocArgs', []),
     promptForExtraSallocArgs: cfg.get<boolean>('promptForExtraSallocArgs', false),
+    sessionMode: normalizeSessionMode(cfg.get<string>('sessionMode') || 'persistent'),
+    sessionKey: (cfg.get<string>('sessionKey') || '').trim(),
+    sessionIdleTimeoutSeconds: normalizeNonNegativeInteger(cfg.get<number>('sessionIdleTimeoutSeconds', 600)),
+    sessionStateDir: (cfg.get<string>('sessionStateDir') || '').trim(),
     defaultPartition: (cfg.get<string>('defaultPartition') || '').trim(),
     defaultNodes: cfg.get<number>('defaultNodes', 1),
     defaultTasksPerNode: cfg.get<number>('defaultTasksPerNode', 1),
@@ -1061,6 +1106,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             values,
             clusterInfo: cached?.info,
             clusterInfoCachedAt: cached?.fetchedAt,
+            sessions: [],
             profiles: getProfileSummaries(getProfileStore()),
             activeProfile,
             connectionState,
@@ -1076,9 +1122,15 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global;
           const uiValues = message.values as UiValues;
+          const sessionSelection =
+            typeof message.sessionSelection === 'string' ? message.sessionSelection.trim() : '';
           await updateConfigFromUi(uiValues, target);
           setConnectionState('connecting');
           const overrides = buildOverridesFromUi(uiValues);
+          if (sessionSelection) {
+            overrides.sessionMode = 'persistent';
+            overrides.sessionKey = sessionSelection;
+          }
           const connected = await connectCommand(overrides, { interactive: false });
           setConnectionState(connected ? 'connected' : 'idle');
           break;
@@ -1429,11 +1481,6 @@ async function connectCommand(
     qos,
     account
   });
-  const remoteCommand = buildRemoteCommand(cfg, [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs]);
-  if (!remoteCommand) {
-    void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
-    return false;
-  }
 
   const defaultAlias = buildDefaultAlias(cfg.sshHostPrefix || 'slurm', loginHost, partition, nodes, cpusPerTask);
   let alias = defaultAlias;
@@ -1451,6 +1498,13 @@ async function connectCommand(
   }
 
   lastConnectionAlias = alias.trim();
+
+  const sessionKey = resolveSessionKey(cfg, alias.trim());
+  const remoteCommand = buildRemoteCommand(cfg, [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs], sessionKey);
+  if (!remoteCommand) {
+    void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
+    return false;
+  }
 
   const hostEntry = buildHostEntry(alias.trim(), loginHost, cfg, remoteCommand);
   log.appendLine('Generated SSH host entry:');
@@ -1775,6 +1829,188 @@ async function resolvePartitionDefaultTimeForHost(
   }
 }
 
+async function fetchExistingSessions(loginHost: string, cfg: SlurmConnectConfig): Promise<SessionSummary[]> {
+  const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
+  const command = buildSessionQueryCommand(stateDir);
+  const output = await runSshCommand(loginHost, cfg, command);
+  return parseSessionListOutput(output);
+}
+
+async function fetchClusterInfoWithSessions(
+  loginHost: string,
+  cfg: SlurmConnectConfig
+): Promise<{ info: ClusterInfo; sessions: SessionSummary[] }> {
+  const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg, cfg.filterFreeResources);
+  const log = getOutputChannel();
+  const sessionsCommand = buildSessionQueryCommand(cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR);
+  const combinedCommand = buildCombinedClusterInfoCommand(commands, sessionsCommand);
+  log.appendLine(`Cluster info single-call (with sessions) command: ${combinedCommand}`);
+  const output = await runSshCommand(loginHost, cfg, combinedCommand);
+  const { commandOutputs, modulesOutput, sessionsOutput } = parseCombinedClusterInfoOutput(output, commands.length);
+  const info = buildClusterInfoFromOutputs(commandOutputs, modulesOutput, freeResourceIndexes);
+  const sessions = parseSessionListOutput(sessionsOutput);
+  return { info, sessions };
+}
+
+function buildSessionQueryCommand(stateDir: string): string {
+  const dirLiteral = JSON.stringify(stateDir);
+  const script = [
+    'import json, os, subprocess, sys, re',
+    `state_dir = os.path.expanduser(${dirLiteral})`,
+    'sessions_dir = os.path.join(state_dir, "sessions")',
+    'if not os.path.isdir(sessions_dir):',
+    '    print("[]")',
+    '    sys.exit(0)',
+    'session_key_re = re.compile(r"[^A-Za-z0-9_.-]+")',
+    'def sanitize(value):',
+    '    trimmed = (value or "").strip()',
+    '    if not trimmed:',
+    '        return "default"',
+    '    sanitized = session_key_re.sub("-", trimmed).strip(".-")',
+    '    return sanitized[:64] if sanitized else "default"',
+    'try:',
+    '    user = os.environ.get("USER") or subprocess.check_output(["id", "-un"], text=True).strip()',
+    'except Exception:',
+    '    user = None',
+    'safe_user = sanitize(user or "unknown")',
+    'state_map = {}',
+    'job_ids = []',
+    'try:',
+    '    cmd = ["squeue", "-h", "-o", "%i|%T|%j"]',
+    '    if user:',
+    '        cmd[2:2] = ["-u", user]',
+    '    output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)',
+    '    for line in output.splitlines():',
+    '        parts = line.split("|", 2)',
+    '        if len(parts) >= 2:',
+    '            job_id = parts[0].strip()',
+    '            state = parts[1].strip()',
+    '            job_name = parts[2].strip() if len(parts) > 2 else ""',
+    '            if job_id:',
+    '                state_map[job_id] = {"state": state, "jobName": job_name}',
+    '                job_ids.append(job_id)',
+    'except Exception:',
+    '    pass',
+    'job_details = {}',
+    'if job_ids:',
+    '    try:',
+    '        detail_out = subprocess.check_output(["scontrol", "show", "job", "-o"] + job_ids, text=True, stderr=subprocess.DEVNULL)',
+    '        for line in detail_out.splitlines():',
+    '            fields = {}',
+    '            for token in line.split():',
+    '                if "=" not in token:',
+    '                    continue',
+    '                key, value = token.split("=", 1)',
+    '                fields[key] = value',
+    '            job_id = fields.get("JobId") or fields.get("JobID")',
+    '            if not job_id:',
+    '                continue',
+    '            detail = {}',
+    '            if fields.get("Partition"):',
+    '                detail["partition"] = fields.get("Partition")',
+    '            if fields.get("NumNodes"):',
+    '                detail["nodes"] = fields.get("NumNodes")',
+    '            if fields.get("NumCPUs"):',
+    '                detail["cpus"] = fields.get("NumCPUs")',
+    '            if fields.get("TimeLimit"):',
+    '                detail["timeLimit"] = fields.get("TimeLimit")',
+    '            if detail:',
+    '                job_details[job_id] = detail',
+    '    except Exception:',
+    '        pass',
+    'session_dirs = []',
+    'user_root = os.path.join(sessions_dir, safe_user)',
+    'if os.path.isdir(user_root):',
+    '    for entry in sorted(os.listdir(user_root)):',
+    '        session_dirs.append((entry, os.path.join(user_root, entry)))',
+    'for entry in sorted(os.listdir(sessions_dir)):',
+    '    path = os.path.join(sessions_dir, entry)',
+    '    job_path = os.path.join(path, "job.json")',
+    '    if not os.path.isfile(job_path):',
+    '        continue',
+    '    session_dirs.append((entry, path))',
+    'sessions = []',
+    'seen_job_ids = set()',
+    'for entry, session_dir in session_dirs:',
+    '    job_path = os.path.join(session_dir, "job.json")',
+    '    if not os.path.isfile(job_path):',
+    '        continue',
+    '    try:',
+    '        with open(job_path, "r") as handle:',
+    '            data = json.load(handle)',
+    '    except Exception:',
+    '        continue',
+    '    job_id = str(data.get("job_id", "")).strip()',
+    '    if not job_id:',
+    '        continue',
+    '    if job_id in seen_job_ids:',
+    '        continue',
+    '    info = state_map.get(job_id)',
+    '    if not info:',
+    '        continue',
+    '    seen_job_ids.add(job_id)',
+    '    detail = job_details.get(job_id, {})',
+    '    sessions.append({',
+    '        "sessionKey": str(data.get("session_key") or entry),',
+    '        "jobId": job_id,',
+    '        "state": info.get("state", ""),',
+    '        "jobName": (info.get("jobName") or data.get("job_name") or ""),',
+    '        "createdAt": str(data.get("created_at") or ""),',
+    '        "partition": detail.get("partition", ""),',
+    '        "nodes": detail.get("nodes", ""),',
+    '        "cpus": detail.get("cpus", ""),',
+    '        "timeLimit": detail.get("timeLimit", "")',
+    '    })',
+    'print(json.dumps(sessions))'
+  ].join('\n');
+  return `python3 - <<'PY'\n${script}\nPY`;
+}
+
+function parseSessionListOutput(output: string): SessionSummary[] {
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    const results: SessionSummary[] = [];
+    for (const entry of parsed) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      const sessionKey = typeof entry.sessionKey === 'string' ? entry.sessionKey.trim() : '';
+      const jobId = typeof entry.jobId === 'string' ? entry.jobId.trim() : '';
+      if (!sessionKey || !jobId) {
+        continue;
+      }
+      const state = typeof entry.state === 'string' ? entry.state.trim() : '';
+      const jobName = typeof entry.jobName === 'string' ? entry.jobName.trim() : '';
+      const createdAt = typeof entry.createdAt === 'string' ? entry.createdAt.trim() : '';
+      const partition = typeof entry.partition === 'string' ? entry.partition.trim() : '';
+      const timeLimit = typeof entry.timeLimit === 'string' ? entry.timeLimit.trim() : '';
+      const nodes = Number(entry.nodes);
+      const cpus = Number(entry.cpus);
+      results.push({
+        sessionKey,
+        jobId,
+        state,
+        jobName: jobName || undefined,
+        createdAt: createdAt || undefined,
+        partition: partition || undefined,
+        nodes: Number.isFinite(nodes) && nodes > 0 ? nodes : undefined,
+        cpus: Number.isFinite(cpus) && cpus > 0 ? cpus : undefined,
+        timeLimit: timeLimit || undefined
+      });
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
 async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webview): Promise<void> {
   if (clusterInfoRequestInFlight) {
     return;
@@ -1784,6 +2020,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
   const cfg = getConfigWithOverrides(overrides);
   const loginHosts = parseListInput(values.loginHosts);
   const log = getOutputChannel();
+  let sessions: SessionSummary[] = [];
 
   try {
     if (loginHosts.length === 0) {
@@ -1793,6 +2030,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
       webview.postMessage({
         command: 'clusterInfoError',
         message,
+        sessions: [],
         agentStatus: agentStatus.text,
         agentStatusError: agentStatus.isError
       });
@@ -1808,19 +2046,29 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
       webview.postMessage({
         command: 'clusterInfoError',
         message,
+        sessions: [],
         agentStatus: agentStatus.text,
         agentStatusError: agentStatus.isError
       });
       return;
     }
 
-    const info = await fetchClusterInfo(loginHost, cfg);
+    let info: ClusterInfo;
+    try {
+      const result = await fetchClusterInfoWithSessions(loginHost, cfg);
+      info = result.info;
+      sessions = result.sessions;
+    } catch (error) {
+      log.appendLine(`Single-call cluster info failed, falling back. ${formatError(error)}`);
+      info = await fetchClusterInfo(loginHost, cfg);
+    }
     cacheClusterInfo(loginHost, info);
     const cached = getCachedClusterInfo(loginHost);
     const agentStatus = await buildAgentStatusMessage(values.identityFile);
     webview.postMessage({
       command: 'clusterInfo',
       info,
+      sessions,
       fetchedAt: cached?.fetchedAt,
       agentStatus: agentStatus.text,
       agentStatusError: agentStatus.isError
@@ -1832,6 +2080,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
     webview.postMessage({
       command: 'clusterInfoError',
       message,
+      sessions,
       agentStatus: agentStatus.text,
       agentStatusError: agentStatus.isError
     });
@@ -1907,8 +2156,10 @@ const CLUSTER_CMD_START = '__SC_CMD_START__';
 const CLUSTER_CMD_END = '__SC_CMD_END__';
 const CLUSTER_MODULES_START = '__SC_MODULES_START__';
 const CLUSTER_MODULES_END = '__SC_MODULES_END__';
+const CLUSTER_SESSIONS_START = '__SC_SESSIONS_START__';
+const CLUSTER_SESSIONS_END = '__SC_SESSIONS_END__';
 
-function buildCombinedClusterInfoCommand(commands: string[]): string {
+function buildCombinedClusterInfoCommand(commands: string[], sessionsCommand?: string): string {
   const encodedCommands = commands.map((command) => Buffer.from(command, 'utf8').toString('base64'));
   const commandArray = encodedCommands.map((encoded) => `'${encoded}'`).join(' ');
   const script = [
@@ -1922,6 +2173,9 @@ function buildCombinedClusterInfoCommand(commands: string[]): string {
     `  echo "${CLUSTER_CMD_END}\${i}__"`,
     '  i=$((i+1))',
     'done',
+    sessionsCommand ? `echo "${CLUSTER_SESSIONS_START}"` : '',
+    sessionsCommand ? sessionsCommand : '',
+    sessionsCommand ? `echo "${CLUSTER_SESSIONS_END}"` : '',
     `echo "${CLUSTER_MODULES_START}"`,
     'modules=$(module -t avail 2>&1)',
     'status=$?',
@@ -1939,14 +2193,25 @@ function buildCombinedClusterInfoCommand(commands: string[]): string {
 function parseCombinedClusterInfoOutput(
   output: string,
   commandCount: number
-): { commandOutputs: string[]; modulesOutput: string } {
+): { commandOutputs: string[]; modulesOutput: string; sessionsOutput: string } {
   const commandOutputs: string[] = Array.from({ length: commandCount }, () => '');
   let currentIndex: number | null = null;
   let inModules = false;
+  let inSessions = false;
   const moduleLines: string[] = [];
+  const sessionLines: string[] = [];
   const lines = output.split(/\r?\n/);
 
   for (const line of lines) {
+    if (line === CLUSTER_SESSIONS_START) {
+      inSessions = true;
+      currentIndex = null;
+      continue;
+    }
+    if (line === CLUSTER_SESSIONS_END) {
+      inSessions = false;
+      continue;
+    }
     if (line === CLUSTER_MODULES_START) {
       inModules = true;
       currentIndex = null;
@@ -1970,6 +2235,10 @@ function parseCombinedClusterInfoOutput(
       moduleLines.push(line);
       continue;
     }
+    if (inSessions) {
+      sessionLines.push(line);
+      continue;
+    }
     if (currentIndex !== null && currentIndex >= 0 && currentIndex < commandOutputs.length) {
       commandOutputs[currentIndex] += line + '\n';
     }
@@ -1977,7 +2246,8 @@ function parseCombinedClusterInfoOutput(
 
   return {
     commandOutputs: commandOutputs.map((text) => text.trim()),
-    modulesOutput: moduleLines.join('\n').trim()
+    modulesOutput: moduleLines.join('\n').trim(),
+    sessionsOutput: sessionLines.join('\n').trim()
   };
 }
 
@@ -2095,7 +2365,15 @@ async function fetchClusterInfoSingleCall(
   log.appendLine(`Cluster info single-call command: ${combinedCommand}`);
   const output = await runSshCommand(loginHost, cfg, combinedCommand);
   const { commandOutputs, modulesOutput } = parseCombinedClusterInfoOutput(output, commands.length);
+  return buildClusterInfoFromOutputs(commandOutputs, modulesOutput, freeResourceIndexes);
+}
 
+function buildClusterInfoFromOutputs(
+  commandOutputs: string[],
+  modulesOutput: string,
+  freeResourceIndexes?: FreeResourceCommandIndexes
+): ClusterInfo {
+  const log = getOutputChannel();
   let lastInfo: ClusterInfo = { partitions: [] };
   let bestInfo: ClusterInfo | undefined;
   let partitionDefaults: Record<string, PartitionDefaults> = {};
@@ -3563,9 +3841,35 @@ function buildSallocArgs(params: {
   return args;
 }
 
+function resolveSessionKey(cfg: SlurmConnectConfig, alias: string): string {
+  const trimmed = (cfg.sessionKey || '').trim();
+  if (trimmed) {
+    return trimmed;
+  }
+  return alias.trim();
+}
 
-function buildRemoteCommand(cfg: SlurmConnectConfig, sallocArgs: string[]): string {
-  const proxyParts = [cfg.proxyCommand, ...cfg.proxyArgs.filter(Boolean)];
+function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string): string[] {
+  const args = cfg.proxyArgs.filter(Boolean);
+  if (cfg.sessionMode !== 'persistent') {
+    return args;
+  }
+  const key = (sessionKey || cfg.sessionKey || '').trim();
+  const sessionArgs = ['--session-mode=persistent'];
+  if (key) {
+    sessionArgs.push(`--session-key=${key}`);
+  }
+  if (cfg.sessionIdleTimeoutSeconds > 0) {
+    sessionArgs.push(`--session-idle-timeout=${Math.floor(cfg.sessionIdleTimeoutSeconds)}`);
+  }
+  if (cfg.sessionStateDir && cfg.sessionStateDir.trim().length > 0) {
+    sessionArgs.push(`--session-state-dir=${cfg.sessionStateDir.trim()}`);
+  }
+  return args.concat(sessionArgs);
+}
+
+function buildRemoteCommand(cfg: SlurmConnectConfig, sallocArgs: string[], sessionKey?: string): string {
+  const proxyParts = [cfg.proxyCommand, ...buildProxyArgs(cfg, sessionKey)];
   const proxyCommand = proxyParts.filter(Boolean).join(' ').trim();
   if (!proxyCommand) {
     return '';
@@ -4383,6 +4687,13 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     proxyArgs: fromCache('proxyArgs', cfg.proxyArgs.join('\n')),
     extraSallocArgs: fromCache('extraSallocArgs', cfg.extraSallocArgs.join('\n')),
     promptForExtraSallocArgs: cfg.promptForExtraSallocArgs,
+    sessionMode: fromCache('sessionMode', cfg.sessionMode || 'persistent'),
+    sessionKey: fromCache('sessionKey', cfg.sessionKey || ''),
+    sessionIdleTimeoutSeconds: fromCache(
+      'sessionIdleTimeoutSeconds',
+      String(cfg.sessionIdleTimeoutSeconds ?? 600)
+    ),
+    sessionStateDir: fromCache('sessionStateDir', cfg.sessionStateDir || ''),
     defaultPartition: hasDefaultPartition ? fromCache('defaultPartition', cfg.defaultPartition || '') : '',
     defaultNodes: hasDefaultNodes ? fromCache('defaultNodes', String(cfg.defaultNodes || '')) : '',
     defaultTasksPerNode: hasDefaultTasksPerNode
@@ -4412,6 +4723,10 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
 
   const updates: Array<[string, unknown]> = [
     ['promptForExtraSallocArgs', Boolean(values.promptForExtraSallocArgs)],
+    ['sessionMode', normalizeSessionMode(values.sessionMode)],
+    ['sessionKey', values.sessionKey.trim()],
+    ['sessionIdleTimeoutSeconds', parseNonNegativeNumberInput(values.sessionIdleTimeoutSeconds)],
+    ['sessionStateDir', values.sessionStateDir.trim()],
     ['filterFreeResources', Boolean(values.filterFreeResources)],
     ['sshHostPrefix', values.sshHostPrefix.trim()],
     ['forwardAgent', Boolean(values.forwardAgent)],
@@ -4458,6 +4773,12 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
   if (has('proxyCommand')) overrides.proxyCommand = String(values.proxyCommand ?? '').trim();
   if (has('proxyArgs')) overrides.proxyArgs = parseListInput(String(values.proxyArgs ?? ''));
   if (has('extraSallocArgs')) overrides.extraSallocArgs = parseListInput(String(values.extraSallocArgs ?? ''));
+  if (has('sessionMode')) overrides.sessionMode = normalizeSessionMode(String(values.sessionMode ?? ''));
+  if (has('sessionKey')) overrides.sessionKey = String(values.sessionKey ?? '').trim();
+  if (has('sessionIdleTimeoutSeconds')) {
+    overrides.sessionIdleTimeoutSeconds = parseNonNegativeNumberInput(String(values.sessionIdleTimeoutSeconds ?? ''));
+  }
+  if (has('sessionStateDir')) overrides.sessionStateDir = String(values.sessionStateDir ?? '').trim();
   if (has('defaultPartition')) overrides.defaultPartition = String(values.defaultPartition ?? '').trim();
   if (has('defaultNodes')) overrides.defaultNodes = parsePositiveNumberInput(String(values.defaultNodes ?? ''));
   if (has('defaultTasksPerNode')) {
@@ -4563,6 +4884,17 @@ function parseNonNegativeNumberInput(input: string): number {
   return Math.floor(parsed);
 }
 
+function normalizeNonNegativeInteger(value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    return 0;
+  }
+  return Math.floor(value);
+}
+
+function normalizeSessionMode(value: string): SessionMode {
+  return value === 'persistent' ? 'persistent' : 'ephemeral';
+}
+
 function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
   const moduleLoad = values.moduleLoad.trim();
   const moduleCustom = normalizeModuleCustomCommand(values.moduleCustomCommand);
@@ -4585,6 +4917,10 @@ function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
     proxyArgs: parseListInput(values.proxyArgs),
     extraSallocArgs: parseListInput(values.extraSallocArgs),
     promptForExtraSallocArgs: Boolean(values.promptForExtraSallocArgs),
+    sessionMode: normalizeSessionMode(values.sessionMode),
+    sessionKey: values.sessionKey.trim(),
+    sessionIdleTimeoutSeconds: parseNonNegativeNumberInput(values.sessionIdleTimeoutSeconds),
+    sessionStateDir: values.sessionStateDir.trim(),
     defaultPartition: values.defaultPartition.trim(),
     defaultNodes: parsePositiveNumberInput(values.defaultNodes),
     defaultTasksPerNode: parsePositiveNumberInput(values.defaultTasksPerNode),
@@ -4637,6 +4973,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
       color: var(--vscode-input-foreground, var(--vscode-foreground));
       border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
       box-shadow: 0 0 0 1px var(--vscode-input-border, var(--vscode-widget-border)) inset;
+    }
+    input:disabled, textarea:disabled, select:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
     }
     input:not([type="checkbox"]):focus, textarea:focus, select:focus {
       outline: 1px solid var(--vscode-focusBorder);
@@ -4698,6 +5039,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .module-actions button { width: auto; min-width: 32px; }
     .module-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
     .combo-picker { position: relative; }
+    .combo-picker.disabled {
+      opacity: 0.6;
+    }
     .combo-picker::after {
       content: '';
       position: absolute;
@@ -4759,6 +5103,33 @@ function getWebviewHtml(webview: vscode.Webview): string {
       background: var(--vscode-input-background);
     }
     .module-item button { width: auto; min-width: 28px; padding: 2px 6px; }
+    #moduleSection.disabled {
+      opacity: 0.6;
+      pointer-events: none;
+    }
+    .session-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .session-option {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 4px;
+      background: var(--vscode-input-background);
+      cursor: pointer;
+    }
+    .session-option input[type="radio"] {
+      width: auto;
+      margin: 0;
+    }
+    .session-option.selected {
+      border-color: var(--vscode-focusBorder);
+      box-shadow: 0 0 0 1px var(--vscode-focusBorder) inset;
+    }
   </style>
 </head>
 <body>
@@ -4779,19 +5150,24 @@ function getWebviewHtml(webview: vscode.Webview): string {
     </div>
     <label for="remoteWorkspacePath">Remote folder to open (optional)</label>
     <input id="remoteWorkspacePath" type="text" placeholder="/home/user/project" />
-  </details>
-
-  <details class="section" id="resourceSection" open>
-    <summary>Resource settings</summary>
     <div class="buttons" style="margin-top: 8px;">
       <button id="getClusterInfo">Get cluster info</button>
       <button id="clearClusterInfo">Clear cluster info</button>
     </div>
+    <div id="clusterStatus" class="hint"></div>
+    <div id="sessionSelector" class="hidden" style="margin-top: 8px;">
+      <label>Existing sessions</label>
+      <div id="sessionSelectionList" class="session-list"></div>
+      <div id="sessionSelectionHint" class="hint"></div>
+    </div>
+  </details>
+
+  <details class="section" id="resourceSection" open>
+    <summary>Resource settings</summary>
     <div class="checkbox" style="margin-top: 6px;">
       <input id="filterFreeResources" type="checkbox" />
       <label for="filterFreeResources">Show only free resources</label>
     </div>
-    <div id="clusterStatus" class="hint"></div>
     <div id="freeResourceWarning" class="hint warning"></div>
     <div id="resourceWarning" class="hint warning"></div>
 
@@ -4853,19 +5229,21 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <button id="clearResources" type="button">Clear resources</button>
     </div>
 
-    <label for="moduleInput">Modules</label>
-    <div class="row module-row">
-      <div class="combo-picker" id="modulePicker">
-        <input id="moduleInput" type="text" placeholder="Type module(s) or pick from the list" />
-        <div id="moduleMenu" class="dropdown-menu"></div>
+    <div id="moduleSection">
+      <label for="moduleInput">Modules</label>
+      <div class="row module-row">
+        <div class="combo-picker" id="modulePicker">
+          <input id="moduleInput" type="text" placeholder="Type module(s) or pick from the list" />
+          <div id="moduleMenu" class="dropdown-menu"></div>
+        </div>
+        <div class="module-actions">
+          <button id="moduleAdd" type="button">+</button>
+        </div>
       </div>
-      <div class="module-actions">
-        <button id="moduleAdd" type="button">+</button>
-      </div>
+      <div id="moduleList" class="module-list"></div>
+      <div id="moduleHint" class="hint"></div>
+      <input id="moduleLoad" type="hidden" />
     </div>
-    <div id="moduleList" class="module-list"></div>
-    <div id="moduleHint" class="hint"></div>
-    <input id="moduleLoad" type="hidden" />
   </details>
 
   <details class="section" id="profilesSection">
@@ -4904,6 +5282,18 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <input id="promptForExtraSallocArgs" type="checkbox" />
       <label for="promptForExtraSallocArgs">Prompt for extra salloc args</label>
     </div>
+    <label for="sessionMode">Session mode</label>
+    <select id="sessionMode">
+      <option value="ephemeral">Ephemeral (new job per connection)</option>
+      <option value="persistent">Persistent (reuse allocation)</option>
+    </select>
+    <label for="sessionKey">Session key (optional)</label>
+    <input id="sessionKey" type="text" placeholder="Defaults to SSH alias" />
+    <label for="sessionIdleTimeoutSeconds">Session idle timeout (seconds, 0 = never)</label>
+    <input id="sessionIdleTimeoutSeconds" type="number" min="0" placeholder="600" />
+    <div class="hint">Set to 0 to disable auto-cancel.</div>
+    <label for="sessionStateDir">Session state directory (optional)</label>
+    <input id="sessionStateDir" type="text" placeholder="~/.slurm-connect" />
     <label for="sshHostPrefix">SSH host prefix</label>
     <input id="sshHostPrefix" type="text" />
     <label for="temporarySshConfigPath">Slurm Connect include file path</label>
@@ -4958,6 +5348,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let lastValues = {};
     let connectionState = 'idle';
     let availableModules = [];
+    let availableSessions = [];
+    let selectedSessionKey = '';
     let selectedModules = [];
     let customModuleCommand = '';
     let autoSaveTimer = 0;
@@ -4974,6 +5366,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         input: 'defaultNodesInput',
         menu: 'defaultNodesMenu',
         picker: 'defaultNodesPicker',
+        options: []
+      },
+      defaultTasksPerNode: {
+        input: 'defaultTasksPerNode',
         options: []
       },
       defaultCpusPerTask: {
@@ -4998,6 +5394,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         input: 'defaultGpuCountInput',
         menu: 'defaultGpuCountMenu',
         picker: 'defaultGpuCountPicker',
+        options: []
+      },
+      defaultTime: {
+        input: 'defaultTime',
         options: []
       }
     };
@@ -5465,17 +5865,21 @@ function getWebviewHtml(webview: vscode.Webview): string {
           input.value = String(selectedValue);
         }
       }
-      const picker = document.getElementById(field.picker);
-      if (picker) {
-        if (normalized.length === 0) {
-          picker.classList.add('no-options');
-        } else {
-          picker.classList.remove('no-options');
+      if (field.picker) {
+        const picker = document.getElementById(field.picker);
+        if (picker) {
+          if (normalized.length === 0) {
+            picker.classList.add('no-options');
+          } else {
+            picker.classList.remove('no-options');
+          }
         }
       }
-      const menu = document.getElementById(field.menu);
-      if (menu && menu.classList.contains('visible')) {
-        showFieldMenu(fieldKey, false, false);
+      if (field.menu) {
+        const menu = document.getElementById(field.menu);
+        if (menu && menu.classList.contains('visible')) {
+          showFieldMenu(fieldKey, false, false);
+        }
       }
     }
 
@@ -5539,9 +5943,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function hideFieldMenu(fieldKey) {
       const field = resourceFields[fieldKey];
       if (!field) return;
-      const menu = document.getElementById(field.menu);
-      if (menu) {
-        menu.classList.remove('visible');
+      if (field.menu) {
+        const menu = document.getElementById(field.menu);
+        if (menu) {
+          menu.classList.remove('visible');
+        }
       }
     }
 
@@ -5853,12 +6259,15 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (!field) return;
       const input = document.getElementById(field.input);
       if (input) input.disabled = disabled;
-      const picker = document.getElementById(field.picker);
-      if (picker) {
-        if (disabled || field.options.length === 0) {
-          picker.classList.add('no-options');
-        } else {
-          picker.classList.remove('no-options');
+      if (field.picker) {
+        const picker = document.getElementById(field.picker);
+        if (picker) {
+          if (disabled || field.options.length === 0) {
+            picker.classList.add('no-options');
+          } else {
+            picker.classList.remove('no-options');
+          }
+          picker.classList.toggle('disabled', disabled);
         }
       }
       if (disabled) {
@@ -5874,6 +6283,134 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
     }
 
+    function formatSessionLabel(session) {
+      const name = session.jobName ? String(session.jobName).trim() : '';
+      const state = session.state ? String(session.state).trim() : '';
+      const pieces = [];
+      if (name) pieces.push(name);
+      pieces.push('job ' + session.jobId);
+      if (state) pieces.push(state);
+      return session.sessionKey + ' (' + pieces.join(', ') + ')';
+    }
+
+    function getSelectedSessionDetails() {
+      if (!selectedSessionKey) return null;
+      return availableSessions.find((session) => session.sessionKey === selectedSessionKey) || null;
+    }
+
+    function buildSessionHint(session) {
+      if (!session) return '';
+      const parts = [];
+      if (session.partition) parts.push('Partition: ' + session.partition);
+      if (session.nodes) parts.push('Nodes: ' + session.nodes);
+      if (session.cpus) parts.push('CPUs: ' + session.cpus);
+      if (session.timeLimit) parts.push('Time limit: ' + session.timeLimit);
+      parts.push('Job: ' + session.jobId);
+      if (session.state) parts.push('State: ' + session.state);
+      return parts.join(' • ');
+    }
+
+    function setSessionSelection(value) {
+      selectedSessionKey = String(value || '').trim();
+      const list = document.getElementById('sessionSelectionList');
+      if (list) {
+        const items = list.querySelectorAll('.session-option');
+        items.forEach((item) => {
+          const key = item.getAttribute('data-key') || '';
+          const radio = item.querySelector('input[type="radio"]');
+          const isSelected = key === selectedSessionKey;
+          item.classList.toggle('selected', isSelected);
+          if (radio) {
+            radio.checked = isSelected;
+          }
+        });
+      }
+      updateSessionLockState();
+    }
+
+    function updateSessionLockState() {
+      const locked = Boolean(selectedSessionKey);
+      setResourceDisabled(locked);
+      const fillButton = document.getElementById('fillPartitionDefaults');
+      if (fillButton) fillButton.disabled = locked;
+      const clearButton = document.getElementById('clearResources');
+      if (clearButton) clearButton.disabled = locked;
+      const filterToggle = document.getElementById('filterFreeResources');
+      if (filterToggle) filterToggle.disabled = locked;
+      const hint = document.getElementById('sessionSelectionHint');
+      if (hint) {
+        if (locked) {
+          const details = buildSessionHint(getSelectedSessionDetails());
+          hint.textContent = details
+            ? 'Connecting will attach to this allocation. ' + details
+            : 'Connecting will attach to this allocation; resource fields are disabled.';
+        } else {
+          hint.textContent = '';
+        }
+      }
+      const resourceSection = document.getElementById('resourceSection');
+      if (resourceSection && locked && resourceSection.open) {
+        resourceSection.open = false;
+      }
+      if (resourceSection && !locked && !resourceSection.open) {
+        resourceSection.open = true;
+      }
+      const moduleSection = document.getElementById('moduleSection');
+      if (moduleSection) {
+        moduleSection.classList.toggle('disabled', locked);
+      }
+      if (locked) {
+        setFreeResourceWarning('');
+        setResourceWarning('');
+      }
+    }
+
+    function setSessionOptions(sessions) {
+      const list = Array.isArray(sessions) ? sessions : [];
+      availableSessions = list.slice();
+      const container = document.getElementById('sessionSelector');
+      const listEl = document.getElementById('sessionSelectionList');
+      if (!container || !listEl) return;
+      if (list.length === 0) {
+        container.classList.add('hidden');
+        listEl.innerHTML = '';
+        setSessionSelection('');
+        return;
+      }
+      container.classList.remove('hidden');
+      listEl.innerHTML = '';
+      const entries = [{ sessionKey: '', label: 'New allocation' }]
+        .concat(
+          list.map((session) => ({
+            sessionKey: session.sessionKey,
+            label: formatSessionLabel(session)
+          }))
+        );
+      entries.forEach((entry) => {
+        const row = document.createElement('label');
+        row.className = 'session-option';
+        row.setAttribute('data-key', entry.sessionKey);
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'sessionSelection';
+        radio.value = entry.sessionKey;
+        const text = document.createElement('span');
+        text.textContent = entry.label;
+        row.appendChild(radio);
+        row.appendChild(text);
+        row.addEventListener('click', () => {
+          setSessionSelection(entry.sessionKey);
+        });
+        listEl.appendChild(row);
+      });
+      const stillExists = list.some((session) => session.sessionKey === selectedSessionKey);
+      setSessionSelection(stillExists ? selectedSessionKey : '');
+    }
+
+    function getSelectedSessionKey() {
+      return selectedSessionKey;
+    }
+
     function clearClusterInfoUi() {
       const preserved = {};
       Object.keys(resourceFields).forEach((key) => {
@@ -5884,6 +6421,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       setFreeResourceWarning('');
       setResourceWarning('');
       setResourceDisabled(false);
+      setSessionOptions([]);
       clearResourceOptions();
       setModuleOptions([]);
       Object.keys(preserved).forEach((key) => {
@@ -6234,6 +6772,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         proxyArgs: getValue('proxyArgs'),
         extraSallocArgs: getValue('extraSallocArgs'),
         promptForExtraSallocArgs: getValue('promptForExtraSallocArgs'),
+        sessionMode: getValue('sessionMode'),
+        sessionKey: getValue('sessionKey'),
+        sessionIdleTimeoutSeconds: getValue('sessionIdleTimeoutSeconds'),
+        sessionStateDir: getValue('sessionStateDir'),
         defaultPartition: getValue('defaultPartition'),
         defaultNodes: getValue('defaultNodes'),
         defaultTasksPerNode: getValue('defaultTasksPerNode'),
@@ -6281,6 +6823,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           saveTarget.value = message.saveTarget;
         }
         applyModuleState(values);
+        setSessionOptions(Array.isArray(message.sessions) ? message.sessions : []);
         updateSshIncludeHints();
         if (message.clusterInfo) {
           setClusterInfoFetchedAt(message.clusterInfoCachedAt);
@@ -6305,10 +6848,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
       } else if (message.command === 'clusterInfo') {
         setClusterInfoFetchedAt(message.fetchedAt || new Date());
         applyClusterInfo(message.info);
+        setSessionOptions(Array.isArray(message.sessions) ? message.sessions : []);
         applyMessageState(message);
       } else if (message.command === 'clusterInfoError') {
         setStatus(message.message || 'Failed to load cluster info.', true);
         setResourceDisabled(false);
+        setSessionOptions(Array.isArray(message.sessions) ? message.sessions : []);
         applyMessageState(message);
       } else if (message.command === 'profiles') {
         applyMessageState(message);
@@ -6562,6 +7107,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       vscode.postMessage({
         command: 'connect',
         values: gather(),
+        sessionSelection: getSelectedSessionKey(),
         target: document.getElementById('saveTarget').value
       });
     });

@@ -2,7 +2,12 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
-- No unreleased changes.
+### Added
+- Persistent session mode for Slurm allocations, with configurable session keys, idle timeouts, and state directory settings.
+- Existing session selector in the cluster info UI, allowing connections to reuse a running allocation.
+### Changed
+- Default session mode is now persistent with a 10-minute idle timeout (set to 0 to disable).
+- Persistent session state is now namespaced by username under `sessionStateDir/sessions/<user>` to avoid collisions on shared filesystems (legacy layout still supported).
 
 ## 0.3.4 - 2026-01-14
 ### Added
