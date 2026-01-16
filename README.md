@@ -131,9 +131,10 @@ If you forget to set a remote folder, VS Code may reconnect and create a new Slu
 - **Remote.SSH: Lockfiles In Tmp** is recommended on shared filesystems (the extension will prompt to enable it).
 - The extension will also prompt to put `"remote.SSH.useLocalServer": true` in your vscode settings file if you're on Windows due to a bug with the Remote-SSH extension not respecting the default value from the GUI.
 - `remote.SSH.useExecServer` may need to be disabled to reliably reconnect to persistent Slurm sessions (the extension will prompt).
-- This extension installs a managed Include block (with a note) in your SSH config that points at the Slurm Connect include file and updates that file on each connection.
+- This extension installs a managed Include block (with a note) at the top of your SSH config that points at the Slurm Connect include file and updates that file on each connection.
 - The include file path defaults to `~/.ssh/slurm-connect.conf` and can be overridden with `slurmConnect.temporarySshConfigPath`.
 - When updating your SSH config, the extension writes a timestamped backup alongside it (prefixed with `.slurm-connect.backup-`).
+- Module load commands will shell-escape module names that contain special characters so the RemoteCommand can be parsed correctly.
 - Set `slurmConnect.useSshIncludeBlock` to false to use the legacy temporary Remote.SSH configFile override instead.
 - Use `slurmConnect.openInNewWindow` to control whether the connection opens in a new window (default: false).
 - `slurmConnect.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).

@@ -11,6 +11,7 @@ import {
   buildSlurmConnectIncludeContent,
   buildTemporarySshConfigContent,
   expandHome,
+  formatSshConfigValue,
   SLURM_CONNECT_INCLUDE_END,
   SLURM_CONNECT_INCLUDE_START
 } from './utils/sshConfig';
@@ -313,8 +314,24 @@ function normalizeModuleSelections(value: unknown): string[] {
   }
   return value
     .filter((entry) => typeof entry === 'string')
-    .map((entry) => entry.trim())
+    .map((entry) => stripModuleTagSuffix(entry.trim()))
     .filter((entry) => entry.length > 0);
+}
+
+function stripModuleTagSuffix(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  const defaultMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*(?:default|d)\s*[>)]\s*)$/i);
+  if (defaultMatch) {
+    return defaultMatch[1].trim();
+  }
+  const shortTagMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*[a-zA-Z]{1,3}\s*[>)]\s*)$/);
+  if (shortTagMatch) {
+    return shortTagMatch[1].trim();
+  }
+  return trimmed;
 }
 
 function normalizeModuleCustomCommand(value: unknown): string {
@@ -334,7 +351,7 @@ function parseLegacyModuleLoad(
   if (match) {
     const selections = match[1]
       .split(/[\s,]+/)
-      .map((entry) => entry.trim())
+      .map((entry) => stripModuleTagSuffix(entry.trim()))
       .filter((entry) => entry.length > 0);
     if (selections.length === 0) {
       return undefined;
@@ -2296,9 +2313,17 @@ function parseModulesOutput(output: string): string[] {
   };
   const stripTrailingTag = (value: string): string => {
     let trimmed = value.trim();
-    const tagPattern = /\s*[<(]\s*(?:default|[a-zA-Z]{1,3})\s*[>)]\s*$/;
-    while (tagPattern.test(trimmed)) {
-      trimmed = trimmed.replace(tagPattern, '').trim();
+    if (!trimmed) {
+      return trimmed;
+    }
+    const defaultMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*(?:default|d)\s*[>)]\s*)$/i);
+    if (defaultMatch) {
+      const base = defaultMatch[1].trim();
+      return base ? `${base} (default)` : trimmed;
+    }
+    const shortTagPattern = /^(.*?)(?:\s*[<(]\s*[a-zA-Z]{1,3}\s*[>)]\s*)$/;
+    while (shortTagPattern.test(trimmed)) {
+      trimmed = trimmed.replace(shortTagPattern, '$1').trim();
     }
     return trimmed;
   };
@@ -3868,6 +3893,80 @@ function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string): string[] 
   return args.concat(sessionArgs);
 }
 
+function isShellOperatorToken(token: string): boolean {
+  return token === '&&' || token === '||' || token === ';' || token === '|' || token === '&';
+}
+
+function escapeModuleLoadCommand(command: string): string {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  const tokens = splitSshConfigArgs(trimmed);
+  if (tokens.length === 0) {
+    return trimmed;
+  }
+  const moduleSubcommands = new Set(['load', 'add', 'switch', 'swap', 'try-load', 'unload']);
+  const result: string[] = [];
+  let changed = false;
+  let i = 0;
+  while (i < tokens.length) {
+    const token = tokens[i];
+    if (isShellOperatorToken(token)) {
+      result.push(token);
+      i += 1;
+      continue;
+    }
+    const lower = token.toLowerCase();
+    if (lower === 'module' && i + 1 < tokens.length) {
+      const sub = tokens[i + 1];
+      const lowerSub = sub.toLowerCase();
+      if (moduleSubcommands.has(lowerSub)) {
+        result.push(token, sub);
+        i += 2;
+        while (i < tokens.length && !isShellOperatorToken(tokens[i])) {
+          const cleaned = stripModuleTagSuffix(tokens[i]);
+          if (!cleaned) {
+            i += 1;
+            continue;
+          }
+          const escaped = quoteShellArg(cleaned);
+          if (cleaned !== tokens[i] || escaped !== cleaned) {
+            changed = true;
+          }
+          result.push(escaped);
+          i += 1;
+        }
+        continue;
+      }
+    }
+    if (lower === 'ml') {
+      result.push(token);
+      i += 1;
+      while (i < tokens.length && !isShellOperatorToken(tokens[i])) {
+        const cleaned = stripModuleTagSuffix(tokens[i]);
+        if (!cleaned) {
+          i += 1;
+          continue;
+        }
+        const escaped = quoteShellArg(cleaned);
+        if (cleaned !== tokens[i] || escaped !== cleaned) {
+          changed = true;
+        }
+        result.push(escaped);
+        i += 1;
+      }
+      continue;
+    }
+    result.push(token);
+    i += 1;
+  }
+  if (!changed) {
+    return trimmed;
+  }
+  return result.join(' ');
+}
+
 function buildRemoteCommand(cfg: SlurmConnectConfig, sallocArgs: string[], sessionKey?: string): string {
   const proxyParts = [cfg.proxyCommand, ...buildProxyArgs(cfg, sessionKey)];
   const proxyCommand = proxyParts.filter(Boolean).join(' ').trim();
@@ -3876,8 +3975,9 @@ function buildRemoteCommand(cfg: SlurmConnectConfig, sallocArgs: string[], sessi
   }
   const sallocFlags = sallocArgs.map((arg) => `--salloc-arg=${arg}`);
   const fullProxyCommand = [proxyCommand, ...sallocFlags].join(' ').trim();
-  const baseCommand = cfg.moduleLoad
-    ? `${cfg.moduleLoad} && ${fullProxyCommand}`.trim()
+  const moduleLoad = cfg.moduleLoad ? escapeModuleLoadCommand(cfg.moduleLoad) : '';
+  const baseCommand = moduleLoad
+    ? `${moduleLoad} && ${fullProxyCommand}`.trim()
     : fullProxyCommand;
   if (!baseCommand) {
     return '';
@@ -4047,6 +4147,48 @@ function replaceIncludeLineWithBlock(content: string, includePath: string, block
   return content;
 }
 
+function removeIncludePathFromLines(
+  content: string,
+  includePath: string
+): { content: string; removed: boolean } {
+  const lineEnding = detectLineEnding(content);
+  const lines = content.split(/\r?\n/);
+  const target = normalizeSshPath(includePath);
+  let removed = false;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    const targets = extractIncludeTargets(line);
+    if (targets.length === 0) {
+      continue;
+    }
+    const remaining = targets.filter((candidate) => normalizeSshPath(candidate) !== target);
+    if (remaining.length === targets.length) {
+      continue;
+    }
+    removed = true;
+    if (remaining.length === 0) {
+      lines.splice(i, 1);
+      continue;
+    }
+    const indentMatch = line.match(/^(\s*)Include\b/i);
+    const indent = indentMatch ? indentMatch[1] : '';
+    const rebuilt = `${indent}Include ${remaining.map((value) => formatSshConfigValue(value)).join(' ')}`;
+    lines[i] = rebuilt;
+  }
+  return { content: lines.join(lineEnding), removed };
+}
+
+function stripManagedIncludeBlock(content: string): { content: string; removed: boolean } {
+  const blockRegex = new RegExp(
+    `${SLURM_CONNECT_INCLUDE_START.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${SLURM_CONNECT_INCLUDE_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+    'm'
+  );
+  if (!blockRegex.test(content)) {
+    return { content, removed: false };
+  }
+  return { content: content.replace(blockRegex, ''), removed: true };
+}
+
 function ensureTrailingNewline(value: string, lineEnding: string): string {
   if (!value) {
     return value;
@@ -4096,28 +4238,22 @@ async function ensureSshIncludeInstalled(baseConfigPath: string, includePath: st
   }
   const lineEnding = detectLineEnding(content);
   const block = buildSlurmConnectIncludeBlock(includePath).split('\n').join(lineEnding);
-  const blockRegex = new RegExp(
-    `${SLURM_CONNECT_INCLUDE_START.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${SLURM_CONNECT_INCLUDE_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
-    'm'
-  );
-  let next = content;
+  const hadInclude = sshConfigHasIncludePath(content, includePath);
+  const stripped = stripManagedIncludeBlock(content);
+  const withoutBlock = stripped.content;
+  const withoutTarget = removeIncludePathFromLines(withoutBlock, includePath);
+  const bom = withoutTarget.content.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const bodyRaw = bom ? withoutTarget.content.slice(1) : withoutTarget.content;
+  const body = bodyRaw.replace(/^[\r\n]+/, '');
+  const combined = body ? `${bom}${block}${lineEnding}${lineEnding}${body}` : `${bom}${block}${lineEnding}`;
+  const next = ensureTrailingNewline(combined, lineEnding);
   let status: 'added' | 'updated' | 'already' = 'already';
-  if (blockRegex.test(content)) {
-    next = content.replace(blockRegex, block);
-    status = next === content ? 'already' : 'updated';
-  } else if (sshConfigHasIncludePath(content, includePath)) {
-    next = replaceIncludeLineWithBlock(content, includePath, block);
-    status = next === content ? 'already' : 'updated';
-  } else {
-    let prefix = content;
-    if (prefix && !prefix.endsWith(lineEnding)) {
-      prefix = `${prefix}${lineEnding}`;
-    }
-    if (prefix && !prefix.endsWith(`${lineEnding}${lineEnding}`)) {
-      prefix = `${prefix}${lineEnding}`;
-    }
-    next = `${prefix}${block}${lineEnding}`;
+  if (!stripped.removed && !hadInclude) {
     status = 'added';
+  } else if (next === content) {
+    status = 'already';
+  } else {
+    status = 'updated';
   }
   if (next !== content) {
     await fs.mkdir(path.dirname(resolvedBase), { recursive: true });
@@ -5359,6 +5495,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let lastValues = {};
     let connectionState = 'idle';
     let availableModules = [];
+    let moduleDisplayMap = new Map();
     let availableSessions = [];
     let selectedSessionKey = '';
     let selectedModules = [];
@@ -5989,12 +6126,37 @@ function getWebviewHtml(webview: vscode.Webview): string {
       return trimmed.endsWith(':') ? trimmed.slice(0, -1) : trimmed;
     }
 
+    function stripModuleTag(value) {
+      const trimmed = String(value || '').trim();
+      if (!trimmed) {
+        return '';
+      }
+      const defaultMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*(?:default|d)\s*[>)]\s*)$/i);
+      if (defaultMatch) {
+        return defaultMatch[1].trim();
+      }
+      const shortTagMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*[a-zA-Z]{1,3}\s*[>)]\s*)$/);
+      if (shortTagMatch) {
+        return shortTagMatch[1].trim();
+      }
+      return trimmed;
+    }
+
+    function isDefaultTagged(value) {
+      return /[<(]\s*(?:default|d)\s*[>)]\s*$/i.test(String(value || '').trim());
+    }
+
+    function getModuleDisplayLabel(value) {
+      const canonical = stripModuleTag(value);
+      return moduleDisplayMap.get(canonical) || value;
+    }
+
     function getSelectableModuleCount() {
       return availableModules.filter((entry) => !isModuleHeaderEntry(entry)).length;
     }
 
     function normalizeModuleName(value) {
-      return String(value || '').replace(/\s+/g, '');
+      return stripModuleTag(value).replace(/\s+/g, '');
     }
 
     function coalesceModuleTokens(tokens) {
@@ -6039,7 +6201,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
         .split(/[\s,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
-      return coalesceModuleTokens(tokens).filter((entry) => !isModuleHeaderEntry(entry));
+      return coalesceModuleTokens(tokens)
+        .map((entry) => stripModuleTag(entry))
+        .filter((entry) => entry.length > 0 && !isModuleHeaderEntry(entry));
     }
 
     function updateModuleHint() {
@@ -6072,7 +6236,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         const row = document.createElement('div');
         row.className = 'module-item';
         const label = document.createElement('span');
-        label.textContent = moduleName;
+        label.textContent = getModuleDisplayLabel(moduleName);
         row.appendChild(label);
         const remove = document.createElement('button');
         remove.type = 'button';
@@ -6114,7 +6278,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         : [];
       const custom = typeof values.moduleCustomCommand === 'string' ? values.moduleCustomCommand.trim() : '';
       if (selections.length > 0) {
-        selectedModules = selections.map((entry) => entry.trim()).filter(Boolean);
+        selectedModules = selections.map((entry) => stripModuleTag(entry)).filter(Boolean);
         customModuleCommand = '';
         renderModuleList();
         return;
@@ -6131,6 +6295,20 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function setModuleOptions(modules) {
       const list = Array.isArray(modules) ? modules : [];
       availableModules = list.slice();
+      moduleDisplayMap = new Map();
+      availableModules.forEach((entry) => {
+        if (isModuleHeaderEntry(entry)) {
+          return;
+        }
+        const canonical = stripModuleTag(entry);
+        if (!canonical) {
+          return;
+        }
+        const existing = moduleDisplayMap.get(canonical);
+        if (!existing || (isDefaultTagged(entry) && !isDefaultTagged(existing))) {
+          moduleDisplayMap.set(canonical, entry);
+        }
+      });
       const picker = document.getElementById('modulePicker');
       if (getSelectableModuleCount() === 0) {
         hideModuleMenu();
