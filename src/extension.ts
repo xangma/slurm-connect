@@ -1857,7 +1857,7 @@ async function fetchClusterInfoWithSessions(
   loginHost: string,
   cfg: SlurmConnectConfig
 ): Promise<{ info: ClusterInfo; sessions: SessionSummary[] }> {
-  const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg, cfg.filterFreeResources);
+  const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg);
   const log = getOutputChannel();
   const sessionsCommand = buildSessionQueryCommand(cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR);
   const combinedCommand = buildCombinedClusterInfoCommand(commands, sessionsCommand);
@@ -2107,7 +2107,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
 }
 
 async function fetchClusterInfo(loginHost: string, cfg: SlurmConnectConfig): Promise<ClusterInfo> {
-  const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg, cfg.filterFreeResources);
+  const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg);
 
   const log = getOutputChannel();
   let info: ClusterInfo | undefined;
@@ -2122,7 +2122,7 @@ async function fetchClusterInfo(loginHost: string, cfg: SlurmConnectConfig): Pro
     let bestInfo: ClusterInfo | undefined;
     let partitionDefaults: Record<string, PartitionDefaults> = {};
     let defaultPartitionFromScontrol: string | undefined;
-    const fallbackCommands = buildClusterInfoCommandSet(cfg, false).commands;
+    const fallbackCommands = commands.slice(0, freeResourceIndexes.infoCommandCount);
     for (const command of fallbackCommands) {
       log.appendLine(`Cluster info command: ${command}`);
       const output = await runSshCommand(loginHost, cfg, command);
@@ -3330,9 +3330,8 @@ interface FreeResourceCommandIndexes {
 }
 
 function buildClusterInfoCommandSet(
-  cfg: SlurmConnectConfig,
-  includeFreeResources: boolean
-): { commands: string[]; freeResourceIndexes?: FreeResourceCommandIndexes } {
+  cfg: SlurmConnectConfig
+): { commands: string[]; freeResourceIndexes: FreeResourceCommandIndexes } {
   const baseCommands = [
     cfg.partitionInfoCommand,
     'sinfo -h -N -o "%P|%n|%c|%m|%G"',
@@ -3340,9 +3339,6 @@ function buildClusterInfoCommandSet(
     'scontrol show partition -o'
   ].filter(Boolean);
   const commands = baseCommands.slice();
-  if (!includeFreeResources) {
-    return { commands };
-  }
   const nodeIndex = commands.length;
   commands.push(FREE_RESOURCE_NODE_INFO_COMMAND);
   const jobIndex = commands.length;
@@ -5642,7 +5638,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         return;
       }
       const ageLabel = formatAgeLabel(ageMs);
-      setFreeResourceWarning('Free resource data is ' + ageLabel + ' old. Click "Get cluster info" to refresh.');
+      setFreeResourceWarning('Free-resource data is ' + ageLabel + ' old. Click "Get cluster info" to refresh.');
     }
 
     function parseIntInput(value, allowZero) {
@@ -6620,7 +6616,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
       const meta = document.getElementById('partitionMeta');
       if (meta) meta.textContent = '';
-      setStatus('Cluster info cleared. Enter values manually or click \"Get cluster info\".', false);
+      setStatus(
+        'Cluster info cleared. Click "Get cluster info" to reload partitions, modules, sessions, and free-resource data.',
+        false
+      );
     }
 
     function clearResourceFields() {
@@ -6730,6 +6729,25 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
       const filtered = partitions.filter((partition) => partitionHasFreeResources(partition));
       return { partitions: filtered, filtered: true };
+    }
+
+    function buildClusterInfoSummary(info) {
+      if (!info || !Array.isArray(info.partitions) || info.partitions.length === 0) {
+        return { text: '', hasFreeData: false };
+      }
+      const totalCount = info.partitions.length;
+      const hasFreeData = info.partitions.some((partition) => hasFreeResourceData(partition));
+      if (!hasFreeData) {
+        return {
+          text: 'Cluster info loaded: ' + totalCount + ' partitions; free-resource data unavailable.',
+          hasFreeData: false
+        };
+      }
+      const freeCount = info.partitions.filter((partition) => partitionHasFreeResources(partition)).length;
+      return {
+        text: 'Cluster info loaded: ' + totalCount + ' partitions; ' + freeCount + ' have free resources.',
+        hasFreeData: true
+      };
     }
 
     function updatePartitionDetails() {
@@ -6906,8 +6924,13 @@ function getWebviewHtml(webview: vscode.Webview): string {
       updatePartitionDetails();
       const shouldAnnounce = options.announce !== false;
       if (shouldAnnounce) {
-        const suffix = resolved.filtered ? ' (free resources only).' : '.';
-        setStatus('Loaded ' + resolved.partitions.length + ' partitions' + suffix, false);
+        const summary = buildClusterInfoSummary(info);
+        if (summary.text) {
+          const hint = summary.hasFreeData
+            ? ' Toggle "Show only free resources" to filter suggestions.'
+            : '';
+          setStatus(summary.text + hint, false);
+        }
       }
     }
 
@@ -7019,7 +7042,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
           applyClusterInfo(message.clusterInfo);
           if (message.clusterInfoCachedAt) {
             const cachedAt = new Date(message.clusterInfoCachedAt).toLocaleString();
-            setStatus('Cluster info last retrieved: (' + cachedAt + ').', false);
+            const summary = buildClusterInfoSummary(message.clusterInfo);
+            const summaryText = summary.text
+              ? ' ' + summary.text + (summary.hasFreeData ? ' Toggle "Show only free resources" to filter suggestions.' : '')
+              : '';
+            setStatus('Cluster info last retrieved: (' + cachedAt + ').' + summaryText, false);
           }
         } else {
           clusterInfo = null;
@@ -7029,7 +7056,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
           if (meta) meta.textContent = '';
           setModuleOptions([]);
           setResourceDisabled(false);
-          setStatus('Enter values manually or click "Get cluster info" to populate suggestions.', false);
+          setStatus(
+            'Click "Get cluster info" to load partitions, modules, sessions, and free-resource data (single SSH call).',
+            false
+          );
           updateResourceWarning();
         }
         applyMessageState(message);

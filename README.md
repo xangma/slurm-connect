@@ -43,6 +43,7 @@ Bad nodes (down/drain/maint) are treated as unavailable, and pending jobs are ig
 - **CPUs per task** to the largest free CPU block on a single node.
 - **GPU type/count** to free GPU/MIG slices currently available.
 
+Get cluster info always collects the free-resource inputs in the single SSH call; the toggle just switches whether the UI filters suggestions.
 Toggle in the UI or via `slurmConnect.filterFreeResources`.
 
 ### Profiles

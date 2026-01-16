@@ -10,6 +10,8 @@ All notable changes to this project are documented in this file based on git tag
 - Persistent session state is now namespaced by username under `sessionStateDir/sessions/<user>` to avoid collisions on shared filesystems (legacy layout still supported).
 - The extension prompts to disable `remote.SSH.useExecServer` when persistent sessions are enabled to improve reconnect reliability.
 - Documented that window reloads stop debug sessions; use attach workflows to reconnect in persistent allocations.
+- Get cluster info always collects free-resource data in the single SSH call; the toggle only filters UI suggestions.
+- Updated the cluster info hint text to reflect free-resource data collection and filtering behavior.
 ### Fixed
 - SSH config Include block is now pinned to the top of the SSH config so the Slurm Connect hosts are read before other host entries.
 - Module load commands now shell-escape module names with special characters to avoid RemoteCommand parsing errors.
