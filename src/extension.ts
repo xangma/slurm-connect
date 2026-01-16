@@ -86,6 +86,18 @@ interface SessionSummary {
   timeLimit?: string;
 }
 
+interface ResolvedSshHostInfo {
+  host: string;
+  hostname?: string;
+  user?: string;
+  identityFile?: string;
+  port?: string;
+  certificateFile?: string;
+  hasProxyCommand: boolean;
+  hasProxyJump: boolean;
+  hasExplicitHost: boolean;
+}
+
 let outputChannel: vscode.OutputChannel | undefined;
 let logFilePath: string | undefined;
 let extensionStoragePath: string | undefined;
@@ -99,6 +111,7 @@ let activeTempSshConfigPath: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let clusterInfoRequestInFlight = false;
 let warnedLegacySshConfigOverride = false;
+let sshHostsRequestInFlight = false;
 const SETTINGS_SECTION = 'slurmConnect';
 const LEGACY_SETTINGS_SECTION = 'sciamaSlurm';
 const PROFILE_STORE_KEY = 'slurmConnect.profiles';
@@ -819,6 +832,39 @@ function postToWebview(message: unknown): void {
   void activeWebview.postMessage(message);
 }
 
+async function loadSshHostsForWebview(overrides?: Partial<SlurmConnectConfig>): Promise<void> {
+  if (!activeWebview || sshHostsRequestInFlight) {
+    return;
+  }
+  sshHostsRequestInFlight = true;
+  try {
+    const cfg = getConfigWithOverrides(overrides);
+    const configPath = await resolveSshHostsConfigPath(cfg);
+    if (!configPath) {
+      postToWebview({
+        command: 'sshHosts',
+        hosts: [],
+        error: 'SSH config not found.'
+      });
+      return;
+    }
+    const hosts = await collectSshConfigHosts(configPath);
+    postToWebview({
+      command: 'sshHosts',
+      hosts,
+      source: configPath
+    });
+  } catch (error) {
+    postToWebview({
+      command: 'sshHosts',
+      hosts: [],
+      error: formatError(error)
+    });
+  } finally {
+    sshHostsRequestInFlight = false;
+  }
+}
+
 async function openSlurmConnectView(): Promise<void> {
   try {
     await vscode.commands.executeCommand('workbench.view.extension.slurmConnect');
@@ -1132,6 +1178,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             remoteActive: vscode.env.remoteName === 'ssh-remote',
             saveTarget: resolvePreferredSaveTarget()
           });
+          void loadSshHostsForWebview(buildOverridesFromUi(values));
           break;
         }
         case 'connect': {
@@ -1158,6 +1205,39 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             : vscode.ConfigurationTarget.Global;
           const uiValues = message.values as UiValues;
           await updateConfigFromUi(uiValues, target);
+          break;
+        }
+        case 'resolveSshHost': {
+          const host = typeof message.host === 'string' ? message.host.trim() : '';
+          if (!host) {
+            break;
+          }
+          const uiValues = message.values as UiValues | undefined;
+          const overrides = uiValues ? buildOverridesFromUi(uiValues) : undefined;
+          try {
+            const cfg = getConfigWithOverrides(overrides);
+            const resolved = await resolveSshHostFromConfig(host, cfg);
+            webview.postMessage({
+              command: 'sshHostResolved',
+              ...resolved
+            });
+          } catch (error) {
+            webview.postMessage({
+              command: 'sshHostResolved',
+              host,
+              error: formatError(error)
+            });
+          }
+          break;
+        }
+        case 'refreshAgentStatus': {
+          const identityFile = typeof message.identityFile === 'string' ? message.identityFile : '';
+          const agentStatus = await buildAgentStatusMessage(identityFile);
+          webview.postMessage({
+            command: 'agentStatus',
+            agentStatus: agentStatus.text,
+            agentStatusError: agentStatus.isError
+          });
           break;
         }
         case 'disconnect': {
@@ -2736,8 +2816,7 @@ async function buildAgentStatusMessage(identityPathRaw: string): Promise<{ text:
       ? 'SSH agent running (no keys loaded)'
       : 'SSH agent unavailable';
   if (!identityPathRaw) {
-    const isError = agentInfo.status !== 'available';
-    return { text: `${agentBase}.`, isError };
+    return { text: `${agentBase}. No identity file set (using SSH agent/config).`, isError: false };
   }
   const identityPath = expandHome(identityPathRaw);
   const identityExists = await fileExists(identityPath);
@@ -2872,7 +2951,7 @@ async function maybePromptForSshAuth(
       ? agentStatus === 'unavailable'
         ? `SSH authentication failed while querying the cluster. SSH agent is unavailable, enter the passphrase for ${identityPath} in the terminal.`
         : `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent or enter its passphrase in a terminal.`
-      : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set your identity file in the Slurm Connect view.';
+      : 'SSH authentication failed while querying the cluster. Ensure your SSH config/agent can authenticate, or set an identity file in the Slurm Connect view.';
   const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
   const defaultMode: SshAuthMode = canAddToAgent ? 'agent' : 'terminal';
   const mode: SshAuthMode = choice === 'Enter Passphrase in Terminal'
@@ -2913,16 +2992,6 @@ async function maybePromptForSshAuth(
 async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost: string): Promise<boolean> {
   const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
   if (!identityPath) {
-    const choice = await vscode.window.showWarningMessage(
-      'SSH identity file is not set. Configure it in the Slurm Connect view.',
-      { modal: true },
-      'Open Slurm Connect',
-      'Dismiss'
-    );
-    if (choice === 'Open Slurm Connect') {
-      await openSlurmConnectView();
-      return false;
-    }
     return true;
   }
   const identityExists = await fileExists(identityPath);
@@ -4123,6 +4192,369 @@ function parseSshConfigIncludePaths(content: string): string[] {
   return results;
 }
 
+function isSshHostPattern(value: string): boolean {
+  return value.startsWith('!') || /[*?\[]/.test(value);
+}
+
+function parseSshConfigHosts(content: string): string[] {
+  const results: string[] = [];
+  const lines = content.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+    const match = /^Host\s+(.+)$/i.exec(trimmed);
+    if (!match) {
+      continue;
+    }
+    const tokens = splitSshConfigArgs(match[1]);
+    for (const token of tokens) {
+      if (!token || isSshHostPattern(token)) {
+        continue;
+      }
+      results.push(token);
+    }
+  }
+  return uniqueList(results);
+}
+
+function hasGlobPattern(value: string): boolean {
+  return /[*?\[]/.test(value);
+}
+
+function globSegmentToRegex(segment: string): RegExp {
+  const escaped = segment.replace(/[.+^${}()|\\]/g, '\\$&');
+  const withWildcards = escaped.replace(/\\\*/g, '.*').replace(/\\\?/g, '.');
+  return new RegExp(`^${withWildcards}$`);
+}
+
+async function expandGlobPattern(pattern: string): Promise<string[]> {
+  const resolved = path.resolve(pattern);
+  const root = path.parse(resolved).root;
+  const relative = resolved.slice(root.length);
+  const segments = relative.split(path.sep).filter(Boolean);
+  let candidates = [root];
+  for (const segment of segments) {
+    if (!hasGlobPattern(segment)) {
+      candidates = candidates.map((base) => path.join(base, segment));
+      continue;
+    }
+    const regex = globSegmentToRegex(segment);
+    const next: string[] = [];
+    for (const base of candidates) {
+      let entries: Array<{ name: string }> = [];
+      try {
+        entries = await fs.readdir(base, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (regex.test(entry.name)) {
+          next.push(path.join(base, entry.name));
+        }
+      }
+    }
+    candidates = next;
+  }
+  const results: string[] = [];
+  for (const candidate of candidates) {
+    try {
+      const stat = await fs.stat(candidate);
+      if (stat.isFile()) {
+        results.push(candidate);
+      }
+    } catch {
+      // Ignore missing files.
+    }
+  }
+  return results;
+}
+
+async function expandSshIncludeTarget(value: string, baseDir: string): Promise<string[]> {
+  const expanded = expandHome(value);
+  const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(baseDir, expanded);
+  if (hasGlobPattern(resolved)) {
+    return await expandGlobPattern(resolved);
+  }
+  return (await fileExists(resolved)) ? [resolved] : [];
+}
+
+async function collectSshConfigHosts(configPath: string | undefined, seen = new Set<string>()): Promise<string[]> {
+  if (!configPath) {
+    return [];
+  }
+  const resolved = normalizeSshPath(configPath);
+  if (seen.has(resolved)) {
+    return [];
+  }
+  seen.add(resolved);
+  let content = '';
+  try {
+    content = await fs.readFile(resolved, 'utf8');
+  } catch {
+    return [];
+  }
+  const hosts = parseSshConfigHosts(content);
+  const includeTargets = parseSshConfigIncludePaths(content);
+  if (includeTargets.length === 0) {
+    return hosts;
+  }
+  const baseDir = path.dirname(resolved);
+  for (const target of includeTargets) {
+    const expandedPaths = await expandSshIncludeTarget(target, baseDir);
+    for (const includePath of expandedPaths) {
+      const nested = await collectSshConfigHosts(includePath, seen);
+      hosts.push(...nested);
+    }
+  }
+  return uniqueList(hosts);
+}
+
+interface ExplicitSshHostConfig {
+  user?: string;
+  identityFiles: string[];
+  hasExplicitHost: boolean;
+}
+
+function normalizeHostValue(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isExplicitHostToken(token: string): boolean {
+  return !isSshHostPattern(token);
+}
+
+function matchesExplicitHostToken(host: string, token: string): boolean {
+  return normalizeHostValue(host) === normalizeHostValue(token);
+}
+
+function isHostExplicitMatch(host: string, tokens: string[]): boolean {
+  let explicitMatch = false;
+  for (const raw of tokens) {
+    if (!raw) {
+      continue;
+    }
+    if (raw.startsWith('!')) {
+      const negated = raw.slice(1);
+      if (isExplicitHostToken(negated) && matchesExplicitHostToken(host, negated)) {
+        return false;
+      }
+      continue;
+    }
+    if (isExplicitHostToken(raw) && matchesExplicitHostToken(host, raw)) {
+      explicitMatch = true;
+    }
+  }
+  return explicitMatch;
+}
+
+function parseSshConfigKeyValue(line: string): { key: string; values: string[] } | undefined {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) {
+    return undefined;
+  }
+  const match = /^(\S+)\s+(.+)$/.exec(trimmed);
+  if (!match) {
+    return undefined;
+  }
+  const key = match[1].toLowerCase();
+  const values = splitSshConfigArgs(match[2]);
+  return { key, values };
+}
+
+async function collectExplicitHostConfig(
+  configPath: string | undefined,
+  host: string,
+  seen = new Set<string>()
+): Promise<ExplicitSshHostConfig> {
+  const explicit: ExplicitSshHostConfig = { identityFiles: [], hasExplicitHost: false };
+  if (!configPath) {
+    return explicit;
+  }
+  const resolved = normalizeSshPath(configPath);
+  if (seen.has(resolved)) {
+    return explicit;
+  }
+  seen.add(resolved);
+  let content = '';
+  try {
+    content = await fs.readFile(resolved, 'utf8');
+  } catch {
+    return explicit;
+  }
+  const lines = content.split(/\r?\n/);
+  let inExplicitHost = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+    const includeTargets = extractIncludeTargets(line);
+    if (includeTargets.length > 0) {
+      if (!inExplicitHost) {
+        continue;
+      }
+      const baseDir = path.dirname(resolved);
+      for (const target of includeTargets) {
+        const expandedPaths = await expandSshIncludeTarget(target, baseDir);
+        for (const includePath of expandedPaths) {
+          const nested = await collectExplicitHostConfig(includePath, host, seen);
+          if (!explicit.user && nested.user) {
+            explicit.user = nested.user;
+          }
+          if (nested.identityFiles.length > 0) {
+            explicit.identityFiles.push(...nested.identityFiles);
+          }
+          if (nested.hasExplicitHost) {
+            explicit.hasExplicitHost = true;
+          }
+        }
+      }
+      continue;
+    }
+    const hostMatch = /^Host\s+(.+)$/i.exec(trimmed);
+    if (hostMatch) {
+      const tokens = splitSshConfigArgs(hostMatch[1]);
+      inExplicitHost = isHostExplicitMatch(host, tokens);
+      if (inExplicitHost) {
+        explicit.hasExplicitHost = true;
+      }
+      continue;
+    }
+    if (/^Match\b/i.test(trimmed)) {
+      inExplicitHost = false;
+      continue;
+    }
+    if (!inExplicitHost) {
+      continue;
+    }
+    const parsed = parseSshConfigKeyValue(trimmed);
+    if (!parsed) {
+      continue;
+    }
+    if (parsed.key === 'user') {
+      const value = parsed.values[0];
+      if (value && !explicit.user) {
+        explicit.user = value;
+      }
+      continue;
+    }
+    if (parsed.key === 'identityfile') {
+      for (const value of parsed.values) {
+        if (!value) {
+          continue;
+        }
+        if (value.toLowerCase() === 'none') {
+          continue;
+        }
+        explicit.identityFiles.push(value);
+      }
+      continue;
+    }
+  }
+  explicit.identityFiles = uniqueList(explicit.identityFiles);
+  return explicit;
+}
+
+async function resolveSshHostsConfigPath(cfg: SlurmConnectConfig): Promise<string | undefined> {
+  const override = (cfg.sshQueryConfigPath || '').trim();
+  const basePath = override ? normalizeSshPath(override) : normalizeSshPath(defaultSshConfigPath());
+  return (await fileExists(basePath)) ? basePath : undefined;
+}
+
+function parseSshConfigOutput(output: string): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const line of lines) {
+    const parts = line.split(/\s+/);
+    if (parts.length < 2) {
+      continue;
+    }
+    const key = parts.shift();
+    if (!key) {
+      continue;
+    }
+    const value = parts.join(' ').trim();
+    if (!value) {
+      continue;
+    }
+    const lowerKey = key.toLowerCase();
+    if (!result[lowerKey]) {
+      result[lowerKey] = [];
+    }
+    result[lowerKey].push(value);
+  }
+  return result;
+}
+
+function pickFirstValue(values?: string[]): string | undefined {
+  if (!values || values.length === 0) {
+    return undefined;
+  }
+  const trimmed = values.map((value) => value.trim()).filter(Boolean);
+  return trimmed.length > 0 ? trimmed[0] : undefined;
+}
+
+async function pickFirstExistingPath(values?: string[]): Promise<string | undefined> {
+  if (!values || values.length === 0) {
+    return undefined;
+  }
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const expanded = expandHome(trimmed);
+    if (await fileExists(expanded)) {
+      return trimmed;
+    }
+  }
+  return pickFirstValue(values);
+}
+
+async function resolveSshHostFromConfig(
+  host: string,
+  cfg: SlurmConnectConfig
+): Promise<ResolvedSshHostInfo> {
+  const configPath = await resolveSshHostsConfigPath(cfg);
+  const args: string[] = [];
+  if (configPath) {
+    args.push('-F', configPath);
+  }
+  args.push('-G', host);
+  try {
+    const { stdout } = await execFileAsync('ssh', args);
+    const parsed = parseSshConfigOutput(stdout);
+    const hostname = pickFirstValue(parsed.hostname);
+    const port = pickFirstValue(parsed.port);
+    const explicit = await collectExplicitHostConfig(configPath, host);
+    const user = explicit.user;
+    const identityFile = explicit.identityFiles.length > 0
+      ? await pickFirstExistingPath(explicit.identityFiles)
+      : undefined;
+    const certificateFile = await pickFirstExistingPath(parsed.certificatefile);
+    const proxyCommand = pickFirstValue(parsed.proxycommand);
+    const proxyJump = pickFirstValue(parsed.proxyjump);
+    const hasProxyCommand = Boolean(proxyCommand && proxyCommand.toLowerCase() !== 'none');
+    const hasProxyJump = Boolean(proxyJump && proxyJump.toLowerCase() !== 'none');
+    return {
+      host,
+      hostname,
+      user,
+      port,
+      identityFile,
+      certificateFile,
+      hasProxyCommand,
+      hasProxyJump,
+      hasExplicitHost: explicit.hasExplicitHost
+    };
+  } catch (error) {
+    const summary = pickSshErrorSummary(normalizeSshErrorText(error));
+    throw new Error(summary || 'Failed to resolve SSH host.');
+  }
+}
+
 function replaceIncludeLineWithBlock(content: string, includePath: string, block: string): string {
   const lineEnding = detectLineEnding(content);
   const lines = content.split(/\r?\n/);
@@ -5200,8 +5632,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
       transform: translateY(-50%);
       pointer-events: none;
     }
+    .combo-picker.no-arrow::after { display: none; }
     .combo-picker.no-options::after { display: none; }
     .combo-picker input { padding-right: 22px; }
+    .combo-picker.no-arrow input { padding-right: 6px; }
     .dropdown-menu {
       position: absolute;
       top: calc(100% + 2px);
@@ -5222,6 +5656,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
     .dropdown-option:hover {
       background: var(--vscode-list-hoverBackground, var(--vscode-button-hoverBackground));
+    }
+    .dropdown-option.active {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-button-hoverBackground));
+      color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
     }
     .dropdown-option.module-header {
       cursor: default;
@@ -5282,10 +5720,14 @@ function getWebviewHtml(webview: vscode.Webview): string {
   <details class="section" id="connectionSection" open>
     <summary>Connection settings</summary>
     <label for="loginHosts">Login host</label>
-    <input id="loginHosts" type="text" placeholder="hostname1.com" />
+    <div class="combo-picker no-arrow" id="loginHostPicker">
+      <input id="loginHosts" type="text" placeholder="hostname1.com" />
+      <div id="loginHostMenu" class="dropdown-menu"></div>
+    </div>
+    <div id="sshHostHint" class="hint"></div>
     <label for="user">SSH user</label>
     <input id="user" type="text" />
-    <label for="identityFile">Identity file</label>
+    <label for="identityFile">Identity file (optional)</label>
     <input id="identityFile" type="text" />
     <div id="agentStatus" class="hint"></div>
     <div class="checkbox">
@@ -5496,6 +5938,25 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let selectedSessionKey = '';
     let selectedModules = [];
     let customModuleCommand = '';
+    let sshHosts = [];
+    let sshHostSource = '';
+    let lastResolvedSshHost = '';
+    let sshHostMenuIndex = -1;
+    let sshHostMenuItems = [];
+    let pendingSshResolveHost = '';
+    let pendingSshResolveForce = false;
+    let suppressSshHostChangeResolve = false;
+    const autoFilledValues = {
+      loginHosts: '',
+      user: '',
+      identityFile: ''
+    };
+    const sshHostField = {
+      input: 'loginHosts',
+      menu: 'loginHostMenu',
+      picker: 'loginHostPicker',
+      options: []
+    };
     let autoSaveTimer = 0;
     let suppressAutoSave = true;
 
@@ -5546,6 +6007,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
     };
 
+
     function setStatus(text, isError) {
       const el = document.getElementById('clusterStatus');
       if (!el) return;
@@ -5576,6 +6038,13 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     function setAgentStatus(text, isError) {
       const el = document.getElementById('agentStatus');
+      if (!el) return;
+      el.textContent = text || '';
+      el.style.color = isError ? '#b00020' : '#555';
+    }
+
+    function setSshHostHint(text, isError) {
+      const el = document.getElementById('sshHostHint');
       if (!el) return;
       el.textContent = text || '';
       el.style.color = isError ? '#b00020' : '#555';
@@ -5997,6 +6466,201 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
     }
 
+    function setSshHostOptions(hosts, source, error) {
+      const list = Array.isArray(hosts) ? hosts.map((host) => String(host).trim()).filter(Boolean) : [];
+      sshHosts = list;
+      sshHostSource = typeof source === 'string' ? source : '';
+      lastResolvedSshHost = '';
+      sshHostField.options = normalizeOptions(list.map((host) => ({ value: host, label: host })));
+      const picker = document.getElementById(sshHostField.picker);
+      if (picker) {
+        if (sshHostField.options.length === 0) {
+          picker.classList.add('no-options');
+        } else {
+          picker.classList.remove('no-options');
+        }
+      }
+      const menu = document.getElementById(sshHostField.menu);
+      if (menu && menu.classList.contains('visible')) {
+        updateSshHostMenuFromInput();
+      }
+
+      if (error) {
+        const normalized = String(error);
+        const missing = normalized.toLowerCase().includes('ssh config not found');
+        const hint = missing
+          ? 'SSH config not found. Enter a login host manually.'
+          : 'SSH config hosts not loaded: ' + error;
+        setSshHostHint(hint, !missing);
+        return;
+      }
+      if (sshHostField.options.length === 0) {
+        const sourceLabel = sshHostSource ? ' in ' + sshHostSource : '';
+        setSshHostHint('No SSH hosts found' + sourceLabel + '. Enter a login host manually.', false);
+        return;
+      }
+      const sourceLabel = sshHostSource ? ' from ' + sshHostSource : '';
+      setSshHostHint(
+        'Loaded ' + sshHostField.options.length + ' SSH host(s)' + sourceLabel + '. Start typing to see matches.',
+        false
+      );
+      maybeResolveTypedHost();
+    }
+
+    function filterSshHostOptions(filterText) {
+      const text = String(filterText || '').trim().toLowerCase();
+      if (!text) {
+        return sshHostField.options.slice();
+      }
+      return sshHostField.options.filter((opt) =>
+        opt.label.toLowerCase().includes(text) || opt.value.toLowerCase().includes(text)
+      );
+    }
+
+    function renderSshHostMenu(options) {
+      const menu = document.getElementById(sshHostField.menu);
+      if (!menu) return;
+      menu.innerHTML = '';
+      const items = Array.isArray(options) ? options : [];
+      sshHostMenuItems = items;
+      if (sshHostMenuIndex >= items.length) {
+        sshHostMenuIndex = -1;
+      }
+      if (items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'dropdown-option';
+        empty.textContent = sshHostField.options.length ? 'No matches' : 'No SSH hosts';
+        menu.appendChild(empty);
+        return;
+      }
+      items.forEach((opt, index) => {
+        const option = document.createElement('div');
+        option.className = index === sshHostMenuIndex ? 'dropdown-option active' : 'dropdown-option';
+        option.textContent = opt.label;
+        option.addEventListener('mousedown', (event) => {
+          event.preventDefault();
+          chooseSshHostOption(opt.value, true);
+        });
+        menu.appendChild(option);
+      });
+    }
+
+    function showSshHostMenu(showAll, closeOthers = true) {
+      if (sshHostField.options.length === 0) {
+        return;
+      }
+      const menu = document.getElementById(sshHostField.menu);
+      const input = document.getElementById(sshHostField.input);
+      if (!menu || !input) return;
+      if (closeOthers) {
+        closeAllMenus();
+      }
+      const options = showAll ? sshHostField.options : filterSshHostOptions(input.value);
+      renderSshHostMenu(options);
+      menu.classList.add('visible');
+    }
+
+    function hideSshHostMenu() {
+      const menu = document.getElementById(sshHostField.menu);
+      if (menu) {
+        menu.classList.remove('visible');
+      }
+      sshHostMenuIndex = -1;
+      sshHostMenuItems = [];
+    }
+
+    function updateSshHostMenuFromInput() {
+      sshHostMenuIndex = -1;
+      ensureSshHostMenuVisible();
+    }
+
+    function ensureSshHostMenuVisible() {
+      const input = document.getElementById(sshHostField.input);
+      if (!input) return;
+      const text = String(input.value || '').trim();
+      if (!text) {
+        hideSshHostMenu();
+        return;
+      }
+      const matches = filterSshHostOptions(text);
+      if (matches.length === 0) {
+        hideSshHostMenu();
+        return;
+      }
+      const menu = document.getElementById(sshHostField.menu);
+      if (!menu) return;
+      closeAllMenus();
+      renderSshHostMenu(matches);
+      menu.classList.add('visible');
+    }
+
+    function moveSshHostMenuSelection(delta) {
+      const menu = document.getElementById(sshHostField.menu);
+      if (!menu || !menu.classList.contains('visible')) {
+        ensureSshHostMenuVisible();
+      }
+      if (sshHostMenuItems.length === 0) {
+        return;
+      }
+      if (sshHostMenuIndex < 0) {
+        sshHostMenuIndex = delta > 0 ? 0 : sshHostMenuItems.length - 1;
+      } else {
+        const next = sshHostMenuIndex + delta;
+        if (next < 0) {
+          sshHostMenuIndex = sshHostMenuItems.length - 1;
+        } else if (next >= sshHostMenuItems.length) {
+          sshHostMenuIndex = 0;
+        } else {
+          sshHostMenuIndex = next;
+        }
+      }
+      renderSshHostMenu(sshHostMenuItems);
+    }
+
+    function chooseSshHostOption(value, forceOverwrite) {
+      const input = document.getElementById(sshHostField.input);
+      if (input) {
+        suppressSshHostChangeResolve = true;
+        input.value = value;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        suppressSshHostChangeResolve = false;
+      }
+      hideSshHostMenu();
+      resolveSshHostSelection(value, { forceOverwrite });
+    }
+
+    function resolveSshHostSelection(host, options) {
+      const trimmed = String(host || '').trim();
+      if (!trimmed || trimmed === lastResolvedSshHost) {
+        return;
+      }
+      const forceOverwrite = Boolean(options && options.forceOverwrite);
+      lastResolvedSshHost = trimmed;
+      pendingSshResolveHost = trimmed;
+      pendingSshResolveForce = forceOverwrite;
+      vscode.postMessage({
+        command: 'resolveSshHost',
+        host: trimmed,
+        values: gather()
+      });
+    }
+
+    function getSingleLoginHostValue() {
+      const raw = String(getValue('loginHosts') || '').trim();
+      const tokens = raw.split(/[\s,]+/).filter(Boolean);
+      return tokens.length === 1 ? tokens[0] : '';
+    }
+
+    function maybeResolveTypedHost() {
+      const host = getSingleLoginHostValue();
+      if (!host || sshHosts.length === 0) {
+        return;
+      }
+      if (sshHosts.includes(host)) {
+        resolveSshHostSelection(host);
+      }
+    }
+
     function setFieldOptions(fieldKey, options, selectedValue) {
       const field = resourceFields[fieldKey];
       if (!field) return;
@@ -6097,6 +6761,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     function closeAllMenus() {
       hideModuleMenu();
+      hideSshHostMenu();
       Object.keys(resourceFields).forEach((key) => hideFieldMenu(key));
     }
 
@@ -7008,6 +7673,113 @@ function getWebviewHtml(webview: vscode.Webview): string {
       };
     }
 
+    function applyResolvedSshHost(message) {
+      const host = String(message.host || '').trim();
+      if (message.error) {
+        const label = host ? '"' + host + '"' : 'host';
+        setSshHostHint('Failed to resolve SSH ' + label + ': ' + message.error, true);
+        return;
+      }
+
+      const currentHost = getSingleLoginHostValue();
+      if (currentHost && host && currentHost !== host) {
+        return;
+      }
+
+      const forceOverwrite = pendingSshResolveForce && pendingSshResolveHost === host;
+      if (pendingSshResolveHost === host) {
+        pendingSshResolveHost = '';
+        pendingSshResolveForce = false;
+      }
+
+      let changed = false;
+      let needsAgentRefresh = false;
+      const loginValue = String(getValue('loginHosts') || '').trim();
+      const loginTokens = loginValue.split(/[\s,]+/).filter(Boolean);
+      const isSingleLogin = loginTokens.length === 1 ? loginTokens[0] : '';
+      const canOverwrite = (fieldKey, currentValue) => {
+        if (forceOverwrite) {
+          return true;
+        }
+        if (!currentValue) {
+          return true;
+        }
+        const previousAuto = autoFilledValues[fieldKey] || '';
+        return currentValue === previousAuto;
+      };
+      const canOverwriteLoginHost =
+        forceOverwrite || !loginValue || loginValue === autoFilledValues.loginHosts || isSingleLogin === host;
+      const resolvedHost = String(message.hostname || '').trim();
+      if (resolvedHost && canOverwriteLoginHost) {
+        setValue('loginHosts', resolvedHost);
+        lastValues.loginHosts = resolvedHost;
+        autoFilledValues.loginHosts = resolvedHost;
+        changed = true;
+      }
+
+      const resolvedUser = String(message.user || '').trim();
+      const currentUser = String(getValue('user') || '').trim();
+      if (resolvedUser) {
+        if (canOverwrite('user', currentUser)) {
+          setValue('user', resolvedUser);
+          lastValues.user = resolvedUser;
+          autoFilledValues.user = resolvedUser;
+          changed = true;
+        }
+      } else if (forceOverwrite && message.hasExplicitHost) {
+        setValue('user', '');
+        lastValues.user = '';
+        autoFilledValues.user = '';
+        changed = true;
+      }
+
+      const resolvedIdentity = String(message.identityFile || '').trim();
+      const currentIdentity = String(getValue('identityFile') || '').trim();
+      if (resolvedIdentity) {
+        if (canOverwrite('identityFile', currentIdentity)) {
+          setValue('identityFile', resolvedIdentity);
+          lastValues.identityFile = resolvedIdentity;
+          autoFilledValues.identityFile = resolvedIdentity;
+          changed = true;
+          needsAgentRefresh = true;
+        }
+      } else if (forceOverwrite && message.hasExplicitHost) {
+        setValue('identityFile', '');
+        lastValues.identityFile = '';
+        autoFilledValues.identityFile = '';
+        changed = true;
+        needsAgentRefresh = true;
+      }
+
+      const warnings = [];
+      if (message.hasProxyJump || message.hasProxyCommand) {
+        warnings.push('Host uses ProxyJump/ProxyCommand; not imported.');
+      }
+      const hints = [];
+      if (host) {
+        hints.push('Resolved from SSH host "' + host + '".');
+      }
+      if (resolvedHost && resolvedHost !== host) {
+        hints.push('Using HostName ' + resolvedHost + '.');
+      }
+      if (warnings.length > 0) {
+        hints.push(warnings.join(' '));
+      }
+      if (hints.length > 0) {
+        setSshHostHint(hints.join(' '), warnings.length > 0);
+      }
+
+      if (changed) {
+        scheduleAutoSave();
+      }
+      if (needsAgentRefresh) {
+        vscode.postMessage({
+          command: 'refreshAgentStatus',
+          identityFile: resolvedIdentity
+        });
+      }
+    }
+
     function applyMessageState(message) {
       if (message.profiles) {
         updateProfileList(message.profiles, message.activeProfile);
@@ -7074,6 +7846,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
         setResourceDisabled(false);
         setSessionOptions(Array.isArray(message.sessions) ? message.sessions : []);
         applyMessageState(message);
+      } else if (message.command === 'sshHosts') {
+        setSshHostOptions(message.hosts, message.source, message.error);
+      } else if (message.command === 'sshHostResolved') {
+        applyResolvedSshHost(message);
+      } else if (message.command === 'agentStatus') {
+        applyMessageState(message);
       } else if (message.command === 'profiles') {
         applyMessageState(message);
       } else if (message.command === 'connectionState') {
@@ -7120,6 +7898,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         return false;
       }
       if (modulePicker && modulePicker.contains(target)) {
+        return true;
+      }
+      const loginHostPicker = document.getElementById(sshHostField.picker);
+      if (loginHostPicker && loginHostPicker.contains(target)) {
         return true;
       }
       return Object.values(resourceFields).some((field) => {
@@ -7172,6 +7954,62 @@ function getWebviewHtml(webview: vscode.Webview): string {
         event.preventDefault();
       });
     }
+
+    const loginHostInput = document.getElementById(sshHostField.input);
+    const loginHostMenu = document.getElementById(sshHostField.menu);
+    if (loginHostInput) {
+      loginHostInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          hideSshHostMenu();
+          return;
+        }
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          moveSshHostMenuSelection(1);
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          moveSshHostMenuSelection(-1);
+          return;
+        }
+        if (event.key === 'Enter') {
+          const menuVisible = loginHostMenu && loginHostMenu.classList.contains('visible');
+          if (menuVisible && sshHostMenuItems.length > 0 && sshHostMenuIndex >= 0) {
+            event.preventDefault();
+            const selected = sshHostMenuItems[sshHostMenuIndex];
+            if (selected) {
+              chooseSshHostOption(selected.value, true);
+              return;
+            }
+          }
+          hideSshHostMenu();
+          maybeResolveTypedHost();
+        }
+      });
+      loginHostInput.addEventListener('input', () => {
+        lastResolvedSshHost = '';
+        updateSshHostMenuFromInput();
+      });
+      loginHostInput.addEventListener('blur', () => {
+        setTimeout(() => {
+          hideSshHostMenu();
+        }, 150);
+        maybeResolveTypedHost();
+      });
+      loginHostInput.addEventListener('change', () => {
+        if (suppressSshHostChangeResolve) {
+          return;
+        }
+        maybeResolveTypedHost();
+      });
+    }
+    if (loginHostMenu) {
+      loginHostMenu.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+      });
+    }
+
     Object.keys(resourceFields).forEach((fieldKey) => {
       const field = resourceFields[fieldKey];
       const input = document.getElementById(field.input);

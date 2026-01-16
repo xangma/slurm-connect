@@ -4,20 +4,27 @@ This extension helps users allocate Slurm resources on a cluster and connect VS 
 
 ## Requirements
 - VS Code with **Remote - SSH** installed.
-- SSH keys configured for the cluster (agent forwarding recommended).
+- SSH authentication configured for the cluster (SSH config or agent; agent forwarding recommended).
 - Python 3.9+ available on the login nodes.
 - [`vscode-shell-proxy.py`](https://github.com/xangma/vscode-shell-proxy/blob/main/vscode-shell-proxy.py) available somewhere on the login nodes.
-- ssh-agent running with your key added (recommended for encrypted keys).
+- ssh-agent running with your key added (recommended for encrypted keys and non-interactive SSH).
 
 ## Quick start (users)
 1. Install the extension.
 2. Open the **Slurm Connect** view from the activity bar.
-3. Enter login host, username, and identity file.
+3. Select a login host (or pick from SSH config), username if needed, and an optional identity file.
 4. Click **Get cluster info**, choose resources, then **Connect**.
 
 The extension will query the login host, write a Slurm Connect SSH include file, ensure your SSH config contains a small Slurm Connect Include block (with a note), and connect. It does not replace your SSH config; it only adds the managed block.
 
 ## Usage details
+
+### SSH config hosts (optional)
+The **Login host** field can read your SSH config and list explicit `Host` entries (non-wildcard). Selecting one resolves
+the host via `ssh -G` and auto-fills the login host (resolved HostName), **User**, and **Identity file** when those fields are blank.
+ProxyJump/ProxyCommand settings are intentionally not imported; if your host relies on them, add them manually.
+
+The picker reads from `slurmConnect.sshQueryConfigPath` when set; otherwise it uses `~/.ssh/config`.
 
 ### Get cluster info
 The **Get cluster info** button queries your login host to discover available Slurm partitions and their limits
@@ -63,6 +70,7 @@ What is ssh-agent?
 - If the key is **not** in your agent, the extension will prompt you to either enter a passphrase in the terminal or add it.
 - When you choose to add it, the extension opens a terminal, runs `ssh-add`, and waits for the key to appear in your agent.
 - If the SSH agent is unavailable, you will be prompted to enter your passphrase in a terminal for cluster info and connect.
+- If no identity file is set, the extension relies on your SSH config and agent; it only prompts after an authentication failure.
 
 If you prefer to do this manually:
 ```bash

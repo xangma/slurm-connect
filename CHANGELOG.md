@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file based on git tag
 ### Added
 - Persistent session mode for Slurm allocations, with configurable session keys, idle timeouts, and state directory settings.
 - Existing session selector in the cluster info UI, allowing connections to reuse a running allocation.
+- SSH config host picker that can resolve a selected host and auto-fill login host/user/identity fields.
 ### Changed
 - Default session mode is now persistent with a 10-minute idle timeout (set to 0 to disable).
 - Persistent session state is now namespaced by username under `sessionStateDir/sessions/<user>` to avoid collisions on shared filesystems (legacy layout still supported).
@@ -12,6 +13,7 @@ All notable changes to this project are documented in this file based on git tag
 - Documented that window reloads stop debug sessions; use attach workflows to reconnect in persistent allocations.
 - Get cluster info always collects free-resource data in the single SSH call; the toggle only filters UI suggestions.
 - Updated the cluster info hint text to reflect free-resource data collection and filtering behavior.
+- SSH identity file is now optional; authentication warnings appear after failures instead of on connect.
 ### Fixed
 - SSH config Include block is now pinned to the top of the SSH config so the Slurm Connect hosts are read before other host entries.
 - Module load commands now shell-escape module names with special characters to avoid RemoteCommand parsing errors.

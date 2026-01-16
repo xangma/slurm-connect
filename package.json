@@ -96,8 +96,8 @@
         },
         "slurmConnect.identityFile": {
           "type": "string",
-          "default": "~/.ssh/id_rsa",
-          "description": "SSH identity file to include in generated host entries and used for resource queries."
+          "default": "",
+          "description": "Optional SSH identity file to include in generated host entries and used for resource queries."
         },
         "slurmConnect.forwardAgent": {
           "type": "boolean",
