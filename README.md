@@ -19,6 +19,16 @@ The extension will query the login host, write a Slurm Connect SSH include file,
 
 ## Usage details
 
+### UI tips
+- The sticky action bar keeps **Connect**, connection status, and the cluster info timestamp visible while you scroll.
+- The Profiles section shows a summary row with saved resource defaults and derived totals before you load a profile.
+- Other saved settings (non-default fields) are listed under the resource summary so you can audit what will be applied.
+- Inline validation hints appear under resource fields (nodes, memory, wall time).
+- The **Identity file** field includes a Browse button to insert local paths quickly.
+- The **Remote folder** field expects a path on the cluster (enter manually).
+- Module selection supports chips, clear-all, and pasting multiple module names (space/newline separated), including `module load ...` lines.
+- Advanced settings include a **Reset advanced to defaults** button to restore command/SSH settings.
+
 ### SSH config hosts (optional)
 The **Login host** field can read your SSH config and list explicit `Host` entries (non-wildcard). Selecting one resolves
 the host via `ssh -G` and auto-fills the login host (resolved HostName), **User**, and **Identity file** when those fields are blank.

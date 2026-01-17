@@ -2,6 +2,24 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
+### Added
+- Sticky action bar with Connect/status and cluster info timestamp.
+- Profile summary row with derived totals and inline validation hints.
+- Profile override list to show non-default saved fields.
+- Identity file browse button.
+- Module chips with clear-all and paste support.
+- Module paste now accepts `module load ...` lines.
+- Advanced settings reset button to restore defaults.
+### Changed
+- Clear cluster info is now a secondary action and is disabled while fetching.
+- Remote folder field no longer shows a local browse button (remote-only path).
+- SSH include status text is now shorter in the action bar.
+- SSH host and agent info hints now appear only when relevant (errors or focused field).
+- Cluster info success hints are no longer shown by default.
+- Profile summary and overrides are now grouped into a single card.
+- Profile details now avoid duplicating the single login host in the overrides list.
+### Fixed
+- Webview module parsing now escapes regex sequences correctly to avoid load errors.
 
 ## 0.4.3 - 2026-01-17
 ### Changed

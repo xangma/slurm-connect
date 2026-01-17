@@ -818,6 +818,27 @@ interface ProfileSummary {
 
 type ProfileStore = Record<string, ProfileEntry>;
 
+interface ProfileOverrideDetail {
+  label: string;
+  value: string;
+}
+
+interface ProfileResourceSummary {
+  host?: string;
+  partition?: string;
+  nodes?: number;
+  tasksPerNode?: number;
+  cpusPerTask?: number;
+  memoryMb?: number;
+  gpuType?: string;
+  gpuCount?: number;
+  time?: string;
+  totalCpu?: number;
+  totalMemoryMb?: number;
+  totalGpu?: number;
+  overrides?: ProfileOverrideDetail[];
+}
+
 interface PendingRestoreState {
   tempConfigPath: string;
   previousConfigPath?: string;
@@ -1018,6 +1039,183 @@ function getProfileValues(name: string): UiValues | undefined {
   return store[name]?.values;
 }
 
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeList(values: string[] | undefined): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values.map((entry) => entry.trim()).filter(Boolean);
+}
+
+function listsEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOverrideDetail[] {
+  const overrides: ProfileOverrideDetail[] = [];
+  const add = (label: string, value: string): void => {
+    const normalized = normalizeWhitespace(value);
+    if (normalized) {
+      overrides.push({ label, value: normalized });
+    }
+  };
+  const diffString = (value: string, fallback: string): boolean => {
+    const normalized = normalizeWhitespace(value);
+    if (!normalized) {
+      return false;
+    }
+    return normalized !== normalizeWhitespace(fallback);
+  };
+  const diffBool = (value: boolean, fallback: boolean): boolean => value !== fallback;
+
+  const loginHostsValue = normalizeWhitespace(values.loginHosts);
+  const loginHostTokens = loginHostsValue.split(/[,\s]+/).filter(Boolean);
+  if (loginHostTokens.length > 1 && diffString(values.loginHosts, defaults.loginHosts)) {
+    add('Login hosts', values.loginHosts);
+  }
+  if (diffString(values.user, defaults.user)) add('User', values.user);
+  if (diffString(values.identityFile, defaults.identityFile)) add('Identity file', values.identityFile);
+  if (diffString(values.remoteWorkspacePath, defaults.remoteWorkspacePath)) {
+    add('Remote folder', values.remoteWorkspacePath);
+  }
+  if (diffBool(values.openInNewWindow, defaults.openInNewWindow)) {
+    add('Open in new window', values.openInNewWindow ? 'Yes' : 'No');
+  }
+  if (diffBool(values.filterFreeResources, defaults.filterFreeResources)) {
+    add('Free-resource filter', values.filterFreeResources ? 'On' : 'Off');
+  }
+
+  const selections = normalizeList(values.moduleSelections);
+  const defaultSelections = normalizeList(defaults.moduleSelections);
+  const custom = normalizeWhitespace(values.moduleCustomCommand || '');
+  const defaultCustom = normalizeWhitespace(defaults.moduleCustomCommand || '');
+  const moduleLoad = normalizeWhitespace(values.moduleLoad || '');
+  const defaultModuleLoad = normalizeWhitespace(defaults.moduleLoad || '');
+  if (selections.length > 0 && !listsEqual(selections, defaultSelections)) {
+    add('Modules', selections.join(', '));
+  } else if (custom && custom !== defaultCustom) {
+    add('Module command', custom);
+  } else if (moduleLoad && moduleLoad !== defaultModuleLoad) {
+    add('Module load', moduleLoad);
+  }
+
+  if (diffString(values.proxyCommand, defaults.proxyCommand)) add('Proxy command', values.proxyCommand);
+  if (diffString(values.proxyArgs, defaults.proxyArgs)) add('Proxy args', values.proxyArgs);
+  if (diffString(values.extraSallocArgs, defaults.extraSallocArgs)) add('Extra salloc args', values.extraSallocArgs);
+  if (diffBool(values.promptForExtraSallocArgs, defaults.promptForExtraSallocArgs)) {
+    add('Prompt for extra args', values.promptForExtraSallocArgs ? 'Yes' : 'No');
+  }
+
+  if (diffString(values.sessionMode, defaults.sessionMode)) add('Session mode', values.sessionMode);
+  if (diffString(values.sessionKey, defaults.sessionKey)) add('Session key', values.sessionKey);
+  if (diffString(values.sessionIdleTimeoutSeconds, defaults.sessionIdleTimeoutSeconds)) {
+    add('Session idle timeout', values.sessionIdleTimeoutSeconds + 's');
+  }
+  if (diffString(values.sessionStateDir, defaults.sessionStateDir)) {
+    add('Session state dir', values.sessionStateDir);
+  }
+
+  if (diffString(values.loginHostsCommand, defaults.loginHostsCommand)) {
+    add('Login hosts command', values.loginHostsCommand);
+  }
+  if (diffString(values.loginHostsQueryHost, defaults.loginHostsQueryHost)) {
+    add('Login hosts query host', values.loginHostsQueryHost);
+  }
+  if (diffString(values.partitionInfoCommand, defaults.partitionInfoCommand)) {
+    add('Partition info command', values.partitionInfoCommand);
+  }
+  if (diffString(values.partitionCommand, defaults.partitionCommand)) {
+    add('Partition list command', values.partitionCommand);
+  }
+  if (diffString(values.qosCommand, defaults.qosCommand)) add('QoS command', values.qosCommand);
+  if (diffString(values.accountCommand, defaults.accountCommand)) add('Account command', values.accountCommand);
+
+  if (diffString(values.sshHostPrefix, defaults.sshHostPrefix)) add('SSH host prefix', values.sshHostPrefix);
+  if (diffString(values.temporarySshConfigPath, defaults.temporarySshConfigPath)) {
+    add('Slurm Connect include path', values.temporarySshConfigPath);
+  }
+  if (diffString(values.sshQueryConfigPath, defaults.sshQueryConfigPath)) {
+    add('SSH query config', values.sshQueryConfigPath);
+  }
+  if (diffBool(values.useSshIncludeBlock, defaults.useSshIncludeBlock)) {
+    add('SSH include block', values.useSshIncludeBlock ? 'Enabled' : 'Disabled');
+  }
+  if (diffBool(values.restoreSshConfigAfterConnect, defaults.restoreSshConfigAfterConnect)) {
+    add('Restore SSH config', values.restoreSshConfigAfterConnect ? 'Enabled' : 'Disabled');
+  }
+  if (diffBool(values.forwardAgent, defaults.forwardAgent)) {
+    add('Forward agent', values.forwardAgent ? 'Enabled' : 'Disabled');
+  }
+  if (diffBool(values.requestTTY, defaults.requestTTY)) {
+    add('Request TTY', values.requestTTY ? 'Enabled' : 'Disabled');
+  }
+
+  return overrides;
+}
+
+function buildProfileResourceSummary(values: UiValues, defaults: UiValues): ProfileResourceSummary {
+  const host = firstLoginHostFromInput(values.loginHosts);
+  const partition = values.defaultPartition.trim() || undefined;
+  const nodesRaw = values.defaultNodes.trim();
+  const tasksRaw = values.defaultTasksPerNode.trim();
+  const cpusRaw = values.defaultCpusPerTask.trim();
+  const memoryRaw = values.defaultMemoryMb.trim();
+  const gpuCountRaw = values.defaultGpuCount.trim();
+  const gpuType = values.defaultGpuType.trim() || undefined;
+  const time = values.defaultTime.trim() || undefined;
+
+  const nodes = nodesRaw ? parsePositiveNumberInput(nodesRaw) || undefined : undefined;
+  const tasksPerNode = tasksRaw ? parsePositiveNumberInput(tasksRaw) || undefined : undefined;
+  const cpusPerTask = cpusRaw ? parsePositiveNumberInput(cpusRaw) || undefined : undefined;
+  const memoryMb = memoryRaw ? parseNonNegativeNumberInput(memoryRaw) || undefined : undefined;
+  const gpuCount = gpuCountRaw ? parseNonNegativeNumberInput(gpuCountRaw) : undefined;
+
+  const totalCpu =
+    nodes && (tasksPerNode || cpusPerTask)
+      ? nodes * (tasksPerNode || 1) * (cpusPerTask || 1)
+      : undefined;
+  const totalMemoryMb = nodes && memoryMb ? nodes * memoryMb : undefined;
+  const totalGpu = nodes && gpuCount !== undefined ? nodes * gpuCount : undefined;
+
+  return {
+    host,
+    partition,
+    nodes,
+    tasksPerNode,
+    cpusPerTask,
+    memoryMb,
+    gpuType,
+    gpuCount,
+    time,
+    totalCpu,
+    totalMemoryMb,
+    totalGpu,
+    overrides: buildProfileOverrides(values, defaults)
+  };
+}
+
+function buildProfileSummaryMap(
+  store: ProfileStore,
+  defaults: UiValues
+): Record<string, ProfileResourceSummary> {
+  const summaries: Record<string, ProfileResourceSummary> = {};
+  Object.entries(store).forEach(([name, entry]) => {
+    summaries[name] = buildProfileResourceSummary(entry.values, defaults);
+  });
+  return summaries;
+}
+
 function getPendingRestore(): PendingRestoreState | undefined {
   if (!extensionGlobalState) {
     return undefined;
@@ -1103,6 +1301,58 @@ function getConfigFromSettings(): SlurmConnectConfig {
   };
 }
 
+function getConfigDefaultsFromSettings(): SlurmConnectConfig {
+  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
+  const getDefault = <T>(key: string, fallback: T): T => {
+    const inspected = cfg.inspect<T>(key);
+    if (inspected && inspected.defaultValue !== undefined) {
+      return inspected.defaultValue as T;
+    }
+    return fallback;
+  };
+  const user = String(getDefault<string>('user', '') || '').trim();
+  return {
+    loginHosts: getDefault<string[]>('loginHosts', []),
+    loginHostsCommand: String(getDefault<string>('loginHostsCommand', '') || '').trim(),
+    loginHostsQueryHost: String(getDefault<string>('loginHostsQueryHost', '') || '').trim(),
+    partitionCommand: String(getDefault<string>('partitionCommand', '') || '').trim(),
+    partitionInfoCommand: String(getDefault<string>('partitionInfoCommand', '') || '').trim(),
+    filterFreeResources: Boolean(getDefault<boolean>('filterFreeResources', true)),
+    qosCommand: String(getDefault<string>('qosCommand', '') || '').trim(),
+    accountCommand: String(getDefault<string>('accountCommand', '') || '').trim(),
+    user,
+    identityFile: String(getDefault<string>('identityFile', '') || '').trim(),
+    forwardAgent: Boolean(getDefault<boolean>('forwardAgent', true)),
+    requestTTY: Boolean(getDefault<boolean>('requestTTY', true)),
+    moduleLoad: String(getDefault<string>('moduleLoad', '') || '').trim(),
+    proxyCommand: String(getDefault<string>('proxyCommand', '') || '').trim(),
+    proxyArgs: getDefault<string[]>('proxyArgs', []),
+    extraSallocArgs: getDefault<string[]>('extraSallocArgs', []),
+    promptForExtraSallocArgs: Boolean(getDefault<boolean>('promptForExtraSallocArgs', false)),
+    sessionMode: normalizeSessionMode(String(getDefault<string>('sessionMode', 'persistent') || 'persistent')),
+    sessionKey: String(getDefault<string>('sessionKey', '') || '').trim(),
+    sessionIdleTimeoutSeconds: normalizeNonNegativeInteger(getDefault<number>('sessionIdleTimeoutSeconds', 600)),
+    sessionStateDir: String(getDefault<string>('sessionStateDir', '') || '').trim(),
+    defaultPartition: String(getDefault<string>('defaultPartition', '') || '').trim(),
+    defaultNodes: Number(getDefault<number>('defaultNodes', 1)),
+    defaultTasksPerNode: Number(getDefault<number>('defaultTasksPerNode', 1)),
+    defaultCpusPerTask: Number(getDefault<number>('defaultCpusPerTask', 1)),
+    defaultTime: String(getDefault<string>('defaultTime', '') || '').trim(),
+    defaultMemoryMb: Number(getDefault<number>('defaultMemoryMb', 0)),
+    defaultGpuType: String(getDefault<string>('defaultGpuType', '') || '').trim(),
+    defaultGpuCount: Number(getDefault<number>('defaultGpuCount', 0)),
+    sshHostPrefix: String(getDefault<string>('sshHostPrefix', '') || '').trim(),
+    openInNewWindow: Boolean(getDefault<boolean>('openInNewWindow', false)),
+    remoteWorkspacePath: String(getDefault<string>('remoteWorkspacePath', '') || '').trim(),
+    temporarySshConfigPath: String(getDefault<string>('temporarySshConfigPath', '') || '').trim(),
+    useSshIncludeBlock: Boolean(getDefault<boolean>('useSshIncludeBlock', true)),
+    restoreSshConfigAfterConnect: Boolean(getDefault<boolean>('restoreSshConfigAfterConnect', true)),
+    additionalSshOptions: getDefault<Record<string, string>>('additionalSshOptions', {}),
+    sshQueryConfigPath: String(getDefault<string>('sshQueryConfigPath', '') || '').trim(),
+    sshConnectTimeoutSeconds: Number(getDefault<number>('sshConnectTimeoutSeconds', 15))
+  };
+}
+
 function getConfig(): SlurmConnectConfig {
   const base = getConfigFromSettings();
   const cachedUi = getMergedClusterUiCache();
@@ -1163,10 +1413,12 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           webview.postMessage({
             command: 'load',
             values,
+            defaults: getUiDefaultsFromConfig(),
             clusterInfo: cached?.info,
             clusterInfoCachedAt: cached?.fetchedAt,
             sessions: [],
             profiles: getProfileSummaries(getProfileStore()),
+            profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
             activeProfile,
             connectionState,
             agentStatus: agentStatus.text,
@@ -1239,6 +1491,22 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           });
           break;
         }
+        case 'pickIdentityFile': {
+          const result = await vscode.window.showOpenDialog({
+            title: 'Select identity file',
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: false
+          });
+          if (result && result[0]) {
+            webview.postMessage({
+              command: 'pickedPath',
+              field: 'identityFile',
+              value: result[0].fsPath
+            });
+          }
+          break;
+        }
         case 'disconnect': {
           setConnectionState('disconnecting');
           const disconnected = await disconnectFromHost(lastConnectionAlias);
@@ -1261,6 +1529,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(getProfileStore()),
+              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Profile save cancelled.'
             });
@@ -1271,6 +1540,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(getProfileStore()),
+              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Enter a profile name before saving.',
               profileError: true
@@ -1293,6 +1563,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           webview.postMessage({
             command: 'profiles',
             profiles: getProfileSummaries(store),
+            profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
             activeProfile: name,
             profileStatus: existing ? `Profile "${name}" updated.` : `Profile "${name}" saved.`
           });
@@ -1305,6 +1576,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(getProfileStore()),
+              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Select a profile to load.',
               profileError: true
@@ -1317,6 +1589,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(store),
+              profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
               activeProfile: getActiveProfileName(),
               profileStatus: `Profile "${name}" not found.`,
               profileError: true
@@ -1333,6 +1606,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             clusterInfo: cached?.info,
             clusterInfoCachedAt: cached?.fetchedAt,
             profiles: getProfileSummaries(store),
+            profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
             activeProfile: name,
             connectionState,
             remoteActive: vscode.env.remoteName === 'ssh-remote',
@@ -1349,6 +1623,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(store),
+              profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Select a profile to delete.',
               profileError: true
@@ -1364,6 +1639,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(store),
+              profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Profile deletion cancelled.'
             });
@@ -1381,6 +1657,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           webview.postMessage({
             command: 'profiles',
             profiles: getProfileSummaries(store),
+            profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
             activeProfile,
             profileStatus: `Profile "${name}" deleted.`
           });
@@ -5201,6 +5478,10 @@ function getUiValuesFromStorage(): UiValues {
   return getUiValuesFromConfig(getConfigFromSettings(), getMergedClusterUiCache());
 }
 
+function getUiDefaultsFromConfig(): UiValues {
+  return getUiValuesFromConfig(getConfigDefaultsFromSettings());
+}
+
 function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache): UiValues {
   const config = vscode.workspace.getConfiguration(SETTINGS_SECTION);
   const hasConfigValue = (key: string): boolean => {
@@ -5519,7 +5800,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     :root { color-scheme: light dark; }
     body {
       font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
-      padding: 12px;
+      padding: 12px 12px 96px;
       color: var(--vscode-foreground);
       background: var(--vscode-editor-background);
     }
@@ -5586,17 +5867,151 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
     .buttons { display: flex; gap: 8px; }
     .buttons button { flex: 1; }
+    .cluster-actions { align-items: center; }
+    .cluster-actions button { flex: 0 0 auto; }
     .hidden { display: none; }
     .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
+    .hint:empty { display: none; }
+    .field-hint { margin-top: 2px; }
     .warning {
       color: var(--vscode-editorWarning-foreground, #b58900);
     }
+    .summary-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .summary-item {
+      min-width: 120px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .summary-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--vscode-descriptionForeground);
+    }
+    .summary-value { font-size: 12px; font-weight: 600; }
+    .summary-totals { margin-top: 6px; font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .profile-details {
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 6px;
+      padding: 8px;
+      background: var(--vscode-input-background);
+    }
+    .profile-section-title {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 6px;
+    }
+    .profile-divider {
+      height: 1px;
+      background: var(--vscode-input-border);
+      margin: 8px 0;
+    }
+    .profile-overrides { margin-top: 8px; }
+    .override-summary {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+    }
+    .override-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .override-row {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 8px;
+      font-size: 11px;
+    }
+    .override-key { color: var(--vscode-descriptionForeground); }
+    .override-value { color: var(--vscode-foreground); word-break: break-word; }
+    .action-bar {
+      position: sticky;
+      bottom: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--vscode-panel-border, var(--vscode-input-border));
+      background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    }
+    .action-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .action-options { display: flex; align-items: center; gap: 6px; }
+    .action-options label { margin: 0; font-size: 11px; }
+    .action-status { display: flex; flex-direction: column; gap: 2px; }
+    .input-with-button { display: flex; gap: 6px; align-items: center; }
+    .input-with-button input { flex: 1; }
+    .input-with-button button { width: auto; min-width: 48px; }
+    .input-unit { position: relative; }
+    .input-unit input { padding-right: 78px; }
+    .combo-picker.with-unit { position: relative; }
+    .combo-picker.with-unit input { padding-right: 56px; }
+    .combo-picker.with-unit::after { right: 34px; }
+    .unit-label {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      pointer-events: none;
+    }
+    .button-secondary {
+      background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+      color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+      border-color: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    }
+    .button-secondary:hover {
+      background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
+    }
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--vscode-descriptionForeground);
+      border-right-color: transparent;
+      border-radius: 50%;
+      display: inline-block;
+      animation: spin 0.8s linear infinite;
+    }
+    .spinner.hidden { display: none; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .module-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .module-list {
+      margin-top: 6px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .module-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 999px;
+      background: var(--vscode-input-background);
+      font-size: 11px;
+    }
+    .module-chip button { width: auto; min-width: 20px; padding: 0 6px; }
     details summary { cursor: pointer; margin-bottom: 6px; color: var(--vscode-foreground); }
     .module-row { align-items: center; }
     .row > .module-actions { flex: 0 0 auto; }
     .row > .combo-picker { flex: 1; }
     .module-actions button { width: auto; min-width: 32px; }
-    .module-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
     .combo-picker { position: relative; }
     .combo-picker.disabled {
       opacity: 0.6;
@@ -5657,16 +6072,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .dropdown-option.module-header:hover {
       background: transparent;
     }
-    .module-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding: 4px 6px;
-      border: 1px solid var(--vscode-input-border);
-      border-radius: 4px;
-      background: var(--vscode-input-background);
-    }
     .module-item button { width: auto; min-width: 28px; padding: 2px 6px; }
     #moduleSection.disabled {
       opacity: 0.6;
@@ -5711,17 +6116,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <label for="user">SSH user</label>
     <input id="user" type="text" />
     <label for="identityFile">Identity file (optional)</label>
-    <input id="identityFile" type="text" />
-    <div id="agentStatus" class="hint"></div>
-    <div class="checkbox">
-      <input id="openInNewWindow" type="checkbox" />
-      <label for="openInNewWindow">Open in new window</label>
+    <div class="input-with-button">
+      <input id="identityFile" type="text" />
+      <button id="pickIdentityFile" type="button">Browse</button>
     </div>
+    <div id="agentStatus" class="hint"></div>
     <label for="remoteWorkspacePath">Remote folder to open (optional)</label>
     <input id="remoteWorkspacePath" type="text" placeholder="/home/user/project" />
-    <div class="buttons" style="margin-top: 8px;">
-      <button id="getClusterInfo">Get cluster info</button>
-      <button id="clearClusterInfo">Clear cluster info</button>
+    <div class="buttons cluster-actions" style="margin-top: 8px;">
+      <button id="getClusterInfo" type="button">Get cluster info</button>
+      <button id="clearClusterInfo" type="button" class="button-secondary" title="Clear cluster info">Clear</button>
+      <span id="clusterInfoSpinner" class="spinner hidden" aria-hidden="true"></span>
     </div>
     <div id="clusterStatus" class="hint"></div>
     <div id="sessionSelector" class="hidden" style="margin-top: 8px;">
@@ -5753,10 +6158,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
           <input id="defaultNodesInput" type="number" min="1" />
           <div id="defaultNodesMenu" class="dropdown-menu"></div>
         </div>
+        <div id="defaultNodesHint" class="hint field-hint"></div>
       </div>
       <div>
         <label for="defaultTasksPerNode">Tasks per node</label>
         <input id="defaultTasksPerNode" type="number" min="1" />
+        <div id="defaultTasksPerNodeHint" class="hint field-hint"></div>
       </div>
     </div>
     <div class="row">
@@ -5766,13 +6173,16 @@ function getWebviewHtml(webview: vscode.Webview): string {
           <input id="defaultCpusPerTaskInput" type="number" min="1" />
           <div id="defaultCpusPerTaskMenu" class="dropdown-menu"></div>
         </div>
+        <div id="defaultCpusPerTaskHint" class="hint field-hint"></div>
       </div>
       <div>
         <label for="defaultMemoryMbInput">Memory per node</label>
-        <div class="combo-picker" id="defaultMemoryMbPicker">
+        <div class="combo-picker with-unit" id="defaultMemoryMbPicker">
           <input id="defaultMemoryMbInput" type="number" min="0" placeholder="MB (optional)" />
+          <span class="unit-label">MB</span>
           <div id="defaultMemoryMbMenu" class="dropdown-menu"></div>
         </div>
+        <div id="defaultMemoryMbHint" class="hint field-hint"></div>
       </div>
     </div>
     <div class="row">
@@ -5782,6 +6192,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           <input id="defaultGpuTypeInput" type="text" placeholder="Any" />
           <div id="defaultGpuTypeMenu" class="dropdown-menu"></div>
         </div>
+        <div id="defaultGpuTypeHint" class="hint field-hint"></div>
       </div>
       <div>
         <label for="defaultGpuCountInput">GPU count</label>
@@ -5789,17 +6200,25 @@ function getWebviewHtml(webview: vscode.Webview): string {
           <input id="defaultGpuCountInput" type="number" min="0" />
           <div id="defaultGpuCountMenu" class="dropdown-menu"></div>
         </div>
+        <div id="defaultGpuCountHint" class="hint field-hint"></div>
       </div>
     </div>
     <label for="defaultTime">Wall time</label>
-    <input id="defaultTime" type="text" placeholder="HH:MM:SS" />
+    <div class="input-unit">
+      <input id="defaultTime" type="text" placeholder="HH:MM:SS" />
+      <span class="unit-label">HH:MM:SS</span>
+    </div>
+    <div id="defaultTimeHint" class="hint field-hint"></div>
     <div class="buttons" style="margin-top: 8px;">
       <button id="fillPartitionDefaults" type="button">Use partition defaults</button>
       <button id="clearResources" type="button">Clear resources</button>
     </div>
 
     <div id="moduleSection">
-      <label for="moduleInput">Modules</label>
+      <div class="module-toolbar">
+        <label for="moduleInput">Modules</label>
+        <button id="moduleClearAll" type="button" class="button-secondary">Clear all</button>
+      </div>
       <div class="row module-row">
         <div class="combo-picker" id="modulePicker">
           <input id="moduleInput" type="text" placeholder="Type module(s) or pick from the list" />
@@ -5819,6 +6238,45 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <summary>Profiles</summary>
     <label for="profileSelect">Saved profiles</label>
     <select id="profileSelect"></select>
+    <div id="profileDetails" class="profile-details" style="margin-top: 8px;">
+      <div class="profile-section-title">Resources</div>
+      <div id="profileSummary" class="summary-row">
+        <div class="summary-item">
+          <span class="summary-label">Host</span>
+          <span id="profileSummaryHost" class="summary-value">—</span>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">Partition</span>
+          <span id="profileSummaryPartition" class="summary-value">—</span>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">Nodes</span>
+          <span id="profileSummaryNodes" class="summary-value">—</span>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">CPUs</span>
+          <span id="profileSummaryCpus" class="summary-value">—</span>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">GPUs</span>
+          <span id="profileSummaryGpus" class="summary-value">—</span>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">Time</span>
+          <span id="profileSummaryTime" class="summary-value">—</span>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">Memory</span>
+          <span id="profileSummaryMemory" class="summary-value">—</span>
+        </div>
+      </div>
+      <div id="profileSummaryTotals" class="summary-totals"></div>
+      <div id="profileOverrides" class="profile-overrides hidden">
+        <div class="profile-divider"></div>
+        <div id="profileOverridesSummary" class="override-summary">Other saved settings</div>
+        <div id="profileOverrideList" class="override-list"></div>
+      </div>
+    </div>
     <div class="buttons" style="margin-top: 8px;">
       <button id="profileLoad">Load</button>
       <button id="profileSave">Save profile</button>
@@ -5891,6 +6349,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <option value="workspace">Workspace settings</option>
     </select>
     <div class="buttons" style="margin-top: 8px;">
+      <button id="resetAdvancedDefaults" type="button" class="button-secondary">Reset advanced to defaults</button>
+    </div>
+    <div class="buttons" style="margin-top: 8px;">
       <button id="refresh">Reload saved values</button>
       <button id="openSettings">Open Settings</button>
     </div>
@@ -5900,12 +6361,19 @@ function getWebviewHtml(webview: vscode.Webview): string {
     </div>
   </details>
 
-  <div class="section">
-    <div class="buttons" style="margin-top: 8px;">
+  <div class="action-bar">
+    <div class="action-main">
       <button id="connectToggle">Connect</button>
+      <div class="action-options checkbox">
+        <input id="openInNewWindow" type="checkbox" />
+        <label for="openInNewWindow">Open in new window</label>
+      </div>
+      <div class="action-status">
+        <div id="connectStatus" class="hint"></div>
+        <div id="clusterUpdatedAt" class="hint"></div>
+      </div>
     </div>
-    <div id="connectStatus" class="hint"></div>
-  <div id="sshIncludeStatus" class="hint"></div>
+    <div id="sshIncludeStatus" class="hint"></div>
   </div>
 
   <script nonce="${nonce}">
@@ -5918,12 +6386,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let availableModules = [];
     let moduleDisplayMap = new Map();
     let availableSessions = [];
+    let profileSummaries = {};
     let selectedSessionKey = '';
     let selectedModules = [];
     let customModuleCommand = '';
+    let uiDefaults = null;
     let sshHosts = [];
     let sshHostSource = '';
     let lastResolvedSshHost = '';
+    let sshHostHintText = '';
+    let sshHostHintIsError = false;
+    let showSshHostHint = false;
     let sshHostMenuIndex = -1;
     let sshHostMenuItems = [];
     let pendingSshResolveHost = '';
@@ -6010,6 +6483,38 @@ function getWebviewHtml(webview: vscode.Webview): string {
       el.textContent = text || '';
     }
 
+    function setResourceSummaryWarning(text) {
+      const el = document.getElementById('resourceSummaryWarning');
+      if (!el) return;
+      el.textContent = text || '';
+    }
+
+    function setFieldHint(id, text) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text || '';
+    }
+
+    function updateClusterUpdatedAt() {
+      const el = document.getElementById('clusterUpdatedAt');
+      if (!el) return;
+      if (!clusterInfoFetchedAt) {
+        el.textContent = '';
+        return;
+      }
+      const stamp = new Date(clusterInfoFetchedAt);
+      el.textContent = 'Cluster info: ' + stamp.toLocaleString();
+    }
+
+    function setClusterInfoLoading(loading) {
+      const getButton = document.getElementById('getClusterInfo');
+      const clearButton = document.getElementById('clearClusterInfo');
+      const spinner = document.getElementById('clusterInfoSpinner');
+      if (getButton) getButton.disabled = loading;
+      if (clearButton) clearButton.disabled = loading;
+      if (spinner) spinner.classList.toggle('hidden', !loading);
+    }
+
     initSectionState();
 
     function setProfileStatus(text, isError) {
@@ -6022,15 +6527,26 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function setAgentStatus(text, isError) {
       const el = document.getElementById('agentStatus');
       if (!el) return;
-      el.textContent = text || '';
-      el.style.color = isError ? '#b00020' : '#555';
+      if (!isError || !text) {
+        el.textContent = '';
+        return;
+      }
+      el.textContent = text;
+      el.style.color = '#b00020';
     }
 
     function setSshHostHint(text, isError) {
+      sshHostHintText = text || '';
+      sshHostHintIsError = Boolean(isError);
+      renderSshHostHint();
+    }
+
+    function renderSshHostHint() {
       const el = document.getElementById('sshHostHint');
       if (!el) return;
-      el.textContent = text || '';
-      el.style.color = isError ? '#b00020' : '#555';
+      const shouldShow = sshHostHintIsError || showSshHostHint;
+      el.textContent = shouldShow ? sshHostHintText : '';
+      el.style.color = sshHostHintIsError ? '#b00020' : '#555';
     }
 
     function updateSshIncludeHints() {
@@ -6038,20 +6554,56 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const text = useInclude
         ? 'Connections add a small Slurm Connect Include block to your SSH config and update the Slurm Connect include file.'
         : 'Include block disabled; Slurm Connect will temporarily override Remote.SSH: Config File on connect.';
+      const statusText = useInclude
+        ? 'SSH Include: enabled'
+        : 'SSH Include: disabled (using Remote.SSH override)';
       const settingHint = document.getElementById('sshIncludeSettingHint');
       if (settingHint) settingHint.textContent = text;
       const statusHint = document.getElementById('sshIncludeStatus');
-      if (statusHint) statusHint.textContent = text;
+      if (statusHint) statusHint.textContent = statusText;
+    }
+
+    function resetAdvancedToDefaults() {
+      if (!uiDefaults) {
+        return;
+      }
+      const defaults = uiDefaults;
+      const set = (id, value) => setValue(id, value ?? '');
+      set('loginHostsCommand', defaults.loginHostsCommand);
+      set('loginHostsQueryHost', defaults.loginHostsQueryHost);
+      set('partitionInfoCommand', defaults.partitionInfoCommand);
+      set('partitionCommand', defaults.partitionCommand);
+      set('qosCommand', defaults.qosCommand);
+      set('accountCommand', defaults.accountCommand);
+      set('proxyCommand', defaults.proxyCommand);
+      set('proxyArgs', defaults.proxyArgs);
+      set('extraSallocArgs', defaults.extraSallocArgs);
+      set('promptForExtraSallocArgs', defaults.promptForExtraSallocArgs);
+      set('sessionMode', defaults.sessionMode);
+      set('sessionKey', defaults.sessionKey);
+      set('sessionIdleTimeoutSeconds', defaults.sessionIdleTimeoutSeconds);
+      set('sessionStateDir', defaults.sessionStateDir);
+      set('sshHostPrefix', defaults.sshHostPrefix);
+      set('temporarySshConfigPath', defaults.temporarySshConfigPath);
+      set('useSshIncludeBlock', defaults.useSshIncludeBlock);
+      set('restoreSshConfigAfterConnect', defaults.restoreSshConfigAfterConnect);
+      set('sshQueryConfigPath', defaults.sshQueryConfigPath);
+      set('forwardAgent', defaults.forwardAgent);
+      set('requestTTY', defaults.requestTTY);
+      updateSshIncludeHints();
+      scheduleAutoSave();
     }
 
     function setClusterInfoFetchedAt(value) {
       if (!value) {
         clusterInfoFetchedAt = null;
+        updateClusterUpdatedAt();
         return;
       }
       const parsed = value instanceof Date ? value : new Date(value);
       const time = parsed.getTime();
       clusterInfoFetchedAt = Number.isFinite(time) ? time : null;
+      updateClusterUpdatedAt();
     }
 
     function formatAgeLabel(ageMs) {
@@ -6176,12 +6728,29 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function updateResourceWarning() {
       const warnings = [];
       const timeValue = getValue('defaultTime');
+      let timeHint = '';
+      let nodesHint = '';
+      let tasksHint = '';
+      let cpusHint = '';
+      let memoryHint = '';
+      let gpuTypeHint = '';
+      let gpuCountHint = '';
       if (!isValidTimeInput(timeValue)) {
         warnings.push('Wall time must be HH:MM:SS or D-HH:MM:SS.');
+        timeHint = 'Use HH:MM:SS or D-HH:MM:SS.';
       }
 
       if (!clusterInfo || !clusterInfo.partitions || clusterInfo.partitions.length === 0) {
         setResourceWarning(warnings.join(' | '));
+        setResourceSummaryWarning(warnings.join(' | '));
+        setFieldHint('defaultTimeHint', timeHint);
+        setFieldHint('defaultNodesHint', nodesHint);
+        setFieldHint('defaultTasksPerNodeHint', tasksHint);
+        setFieldHint('defaultCpusPerTaskHint', cpusHint);
+        setFieldHint('defaultMemoryMbHint', memoryHint);
+        setFieldHint('defaultGpuTypeHint', gpuTypeHint);
+        setFieldHint('defaultGpuCountHint', gpuCountHint);
+        updateResourceSummary();
         return;
       }
 
@@ -6191,6 +6760,15 @@ function getWebviewHtml(webview: vscode.Webview): string {
           warnings.push('Selected partition not found in cluster info; refresh to validate limits.');
         }
         setResourceWarning(warnings.join(' | '));
+        setResourceSummaryWarning(warnings.join(' | '));
+        setFieldHint('defaultTimeHint', timeHint);
+        setFieldHint('defaultNodesHint', nodesHint);
+        setFieldHint('defaultTasksPerNodeHint', tasksHint);
+        setFieldHint('defaultCpusPerTaskHint', cpusHint);
+        setFieldHint('defaultMemoryMbHint', memoryHint);
+        setFieldHint('defaultGpuTypeHint', gpuTypeHint);
+        setFieldHint('defaultGpuCountHint', gpuCountHint);
+        updateResourceSummary();
         return;
       }
 
@@ -6204,6 +6782,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const cpusPerNode = partition.cpus || 0;
       if (cpusPerTask && cpusPerNode && cpusPerTask > cpusPerNode) {
         warnings.push('CPUs per task (' + cpusPerTask + ') exceeds CPUs per node (' + cpusPerNode + ').');
+        if (!cpusHint) {
+          cpusHint = 'Max CPUs per node: ' + cpusPerNode + '.';
+        }
       } else if (tasksPerNode && cpusPerTask && cpusPerNode && tasksPerNode * cpusPerTask > cpusPerNode) {
         warnings.push(
           'Tasks per node x CPUs per task (' +
@@ -6212,18 +6793,30 @@ function getWebviewHtml(webview: vscode.Webview): string {
             cpusPerNode +
             ').'
         );
+        if (!tasksHint) {
+          tasksHint = 'Tasks × CPUs per task exceeds CPUs per node.';
+        }
       } else if (tasksPerNode && cpusPerNode && tasksPerNode > cpusPerNode) {
         warnings.push('Tasks per node (' + tasksPerNode + ') exceeds CPUs per node (' + cpusPerNode + ').');
+        if (!tasksHint) {
+          tasksHint = 'Max tasks per node: ' + cpusPerNode + '.';
+        }
       }
 
       if (nodes && partition.nodes && nodes > partition.nodes) {
         warnings.push('Nodes (' + nodes + ') exceeds partition total nodes (' + partition.nodes + ').');
+        if (!nodesHint) {
+          nodesHint = 'Max nodes: ' + partition.nodes + '.';
+        }
       }
 
       if (memoryMb && partition.memMb && memoryMb > partition.memMb) {
         warnings.push(
           'Memory per node (' + memoryMb + ' MB) exceeds partition max (' + partition.memMb + ' MB).'
         );
+        if (!memoryHint) {
+          memoryHint = 'Max memory per node: ' + formatMem(partition.memMb) + '.';
+        }
       }
 
       if (gpuType) {
@@ -6231,6 +6824,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         const normalized = buildNormalizedKeyMap(Object.keys(typeMap));
         if (!normalized[normalizeGpuKey(gpuType)]) {
           warnings.push('GPU type "' + gpuType + '" is not available in this partition.');
+          gpuTypeHint = 'GPU type not available in this partition.';
         }
       }
 
@@ -6244,9 +6838,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
             warnings.push(
               'GPU count (' + gpuCount + ') exceeds partition max for ' + gpuType + ' (' + maxForType + ').'
             );
+            gpuCountHint = 'Max ' + gpuType + ' per node: ' + maxForType + '.';
           }
         } else if (partition.gpuMax && gpuCount > partition.gpuMax) {
           warnings.push('GPU count (' + gpuCount + ') exceeds partition max (' + partition.gpuMax + ').');
+          gpuCountHint = 'Max GPUs per node: ' + partition.gpuMax + '.';
         }
       }
 
@@ -6262,6 +6858,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
         }
         if (nodes && typeof partition.freeNodes === 'number' && nodes > partition.freeNodes) {
           warnings.push('Nodes (' + nodes + ') exceeds currently free nodes (' + partition.freeNodes + ').');
+          if (!nodesHint) {
+            nodesHint = 'Free nodes: ' + partition.freeNodes + '.';
+          }
         }
         const requestedCpus =
           tasksPerNode && cpusPerTask
@@ -6274,6 +6873,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
         if (requestedCpus && typeof partition.freeCpusPerNode === 'number') {
           if (partition.freeCpusPerNode === 0) {
             warnings.push('No free CPUs currently reported for this partition.');
+            if (!cpusHint) {
+              cpusHint = 'No free CPUs currently reported.';
+            }
           } else if (requestedCpus > partition.freeCpusPerNode) {
             warnings.push(
               'CPUs per node requested (' +
@@ -6282,6 +6884,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
                 partition.freeCpusPerNode +
                 ').'
             );
+            if (!cpusHint) {
+              cpusHint = 'Free CPUs per node: ' + partition.freeCpusPerNode + '.';
+            }
           }
         }
 
@@ -6293,30 +6898,54 @@ function getWebviewHtml(webview: vscode.Webview): string {
             const maxForType = matchedKey ? freeTypeMap[matchedKey] : 0;
             if (matchedKey && maxForType === 0) {
               warnings.push('No free ' + gpuType + ' GPUs currently reported for this partition.');
+              if (!gpuCountHint) {
+                gpuCountHint = 'No free ' + gpuType + ' GPUs currently reported.';
+              }
             } else if (maxForType && gpuCount > maxForType) {
               warnings.push(
                 'GPU count (' + gpuCount + ') exceeds currently free ' + gpuType + ' GPUs (' + maxForType + ').'
               );
+              if (!gpuCountHint) {
+                gpuCountHint = 'Free ' + gpuType + ' GPUs: ' + maxForType + '.';
+              }
             } else if (!matchedKey) {
               const partitionTypes = partition.gpuTypes || {};
               const partitionKeys = buildNormalizedKeyMap(Object.keys(partitionTypes));
               if (partitionKeys[normalizeGpuKey(gpuType)]) {
                 warnings.push('No free ' + gpuType + ' GPUs currently reported for this partition.');
+                if (!gpuCountHint) {
+                  gpuCountHint = 'No free ' + gpuType + ' GPUs currently reported.';
+                }
               }
             }
           } else if (typeof partition.freeGpuMax === 'number') {
             if (partition.freeGpuMax === 0) {
               warnings.push('No free GPUs currently reported for this partition.');
+              if (!gpuCountHint) {
+                gpuCountHint = 'No free GPUs currently reported.';
+              }
             } else if (gpuCount > partition.freeGpuMax) {
               warnings.push(
                 'GPU count (' + gpuCount + ') exceeds currently free GPUs (' + partition.freeGpuMax + ').'
               );
+              if (!gpuCountHint) {
+                gpuCountHint = 'Free GPUs: ' + partition.freeGpuMax + '.';
+              }
             }
           }
         }
       }
 
       setResourceWarning(warnings.length ? warnings.join(' | ') : '');
+      setResourceSummaryWarning(warnings.length ? warnings.join(' | ') : '');
+      setFieldHint('defaultTimeHint', timeHint);
+      setFieldHint('defaultNodesHint', nodesHint);
+      setFieldHint('defaultTasksPerNodeHint', tasksHint);
+      setFieldHint('defaultCpusPerTaskHint', cpusHint);
+      setFieldHint('defaultMemoryMbHint', memoryHint);
+      setFieldHint('defaultGpuTypeHint', gpuTypeHint);
+      setFieldHint('defaultGpuCountHint', gpuCountHint);
+      updateResourceSummary();
     }
 
     function initSectionState() {
@@ -6409,6 +7038,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         option.textContent = 'No profiles saved';
         select.appendChild(option);
         select.value = '';
+        updateProfileSummary('');
         return;
       }
       items.forEach((profile) => {
@@ -6422,6 +7052,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       } else {
         select.value = items[0].name;
       }
+      updateProfileSummary(select.value);
     }
 
     function getSelectedProfileName() {
@@ -6438,6 +7069,182 @@ function getWebviewHtml(webview: vscode.Webview): string {
         return fixed + ' GB';
       }
       return mb + ' MB';
+    }
+
+    function resolveFirstLoginHost() {
+      const raw = String(getValue('loginHosts') || '').trim();
+      if (!raw) return '';
+      const tokens = raw.split(/[\\s,]+/).filter(Boolean);
+      return tokens.length > 0 ? tokens[0] : '';
+    }
+
+    function updateResourceSummary() {
+      const host = getSingleLoginHostValue() || resolveFirstLoginHost();
+      const partition = String(getValue('defaultPartition') || '').trim();
+      const nodes = parseIntInput(getValue('defaultNodes'), false);
+      const tasksPerNode = parseIntInput(getValue('defaultTasksPerNode'), false);
+      const cpusPerTask = parseIntInput(getValue('defaultCpusPerTask'), false);
+      const memoryMb = parseIntInput(getValue('defaultMemoryMb'), true);
+      const gpuCount = parseIntInput(getValue('defaultGpuCount'), true);
+      const gpuType = String(getValue('defaultGpuType') || '').trim();
+      const timeValue = String(getValue('defaultTime') || '').trim();
+
+      const setSummaryValue = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value || '—';
+      };
+
+      setSummaryValue('summaryHost', host || '—');
+      setSummaryValue('summaryPartition', partition || '—');
+      setSummaryValue('summaryNodes', nodes ? String(nodes) : '—');
+
+      let cpuLabel = '—';
+      if (cpusPerTask && tasksPerNode) {
+        cpuLabel = cpusPerTask + ' × ' + tasksPerNode + ' / node';
+      } else if (cpusPerTask) {
+        cpuLabel = cpusPerTask + ' / task';
+      } else if (tasksPerNode) {
+        cpuLabel = tasksPerNode + ' tasks / node';
+      }
+      setSummaryValue('summaryCpus', cpuLabel);
+
+      let gpuLabel = '—';
+      if (gpuCount !== undefined) {
+        if (gpuCount === 0 && !gpuType) {
+          gpuLabel = '0';
+        } else if (gpuCount === 0 && gpuType) {
+          gpuLabel = '0 ' + gpuType;
+        } else if (gpuCount > 0) {
+          gpuLabel = gpuCount + ' ' + (gpuType || 'GPU') + ' / node';
+        }
+      } else if (gpuType) {
+        gpuLabel = gpuType;
+      }
+      setSummaryValue('summaryGpus', gpuLabel);
+
+      const memLabel = memoryMb && memoryMb > 0 ? formatMem(memoryMb) + ' / node' : '—';
+      setSummaryValue('summaryMemory', memLabel);
+      setSummaryValue('summaryTime', timeValue || '—');
+
+      let totalCpu;
+      if (nodes && (tasksPerNode || cpusPerTask)) {
+        totalCpu = nodes * (tasksPerNode || 1) * (cpusPerTask || 1);
+      }
+      let totalMem;
+      if (nodes && memoryMb && memoryMb > 0) {
+        totalMem = nodes * memoryMb;
+      }
+      let totalGpu;
+      if (nodes && gpuCount !== undefined) {
+        totalGpu = nodes * gpuCount;
+      }
+      const totals = [];
+      totals.push('Total CPU: ' + (totalCpu !== undefined ? totalCpu : '—'));
+      totals.push('Total RAM: ' + (totalMem !== undefined ? formatMem(totalMem) : '—'));
+      if (totalGpu !== undefined) {
+        totals.push('Total GPU: ' + totalGpu + (gpuType ? ' ' + gpuType : ''));
+      } else {
+        totals.push('Total GPU: —');
+      }
+      const totalsEl = document.getElementById('resourceTotals');
+      if (totalsEl) {
+        totalsEl.textContent = totals.join(' • ');
+      }
+    }
+
+    function updateProfileSummary(name) {
+      const summary = name ? profileSummaries[name] : undefined;
+      const setSummaryValue = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value || '—';
+      };
+      const overridesDetails = document.getElementById('profileOverrides');
+      const overridesSummary = document.getElementById('profileOverridesSummary');
+      const overridesList = document.getElementById('profileOverrideList');
+      if (!summary) {
+        setSummaryValue('profileSummaryHost', '—');
+        setSummaryValue('profileSummaryPartition', '—');
+        setSummaryValue('profileSummaryNodes', '—');
+        setSummaryValue('profileSummaryCpus', '—');
+        setSummaryValue('profileSummaryGpus', '—');
+        setSummaryValue('profileSummaryTime', '—');
+        setSummaryValue('profileSummaryMemory', '—');
+        const totalsEl = document.getElementById('profileSummaryTotals');
+        if (totalsEl) totalsEl.textContent = '';
+        if (overridesList) overridesList.innerHTML = '';
+        if (overridesDetails) overridesDetails.classList.add('hidden');
+        return;
+      }
+
+      setSummaryValue('profileSummaryHost', summary.host || '—');
+      setSummaryValue('profileSummaryPartition', summary.partition || '—');
+      setSummaryValue('profileSummaryNodes', summary.nodes !== undefined ? String(summary.nodes) : '—');
+
+      let cpuLabel = '—';
+      if (summary.cpusPerTask && summary.tasksPerNode) {
+        cpuLabel = summary.cpusPerTask + ' × ' + summary.tasksPerNode + ' / node';
+      } else if (summary.cpusPerTask) {
+        cpuLabel = summary.cpusPerTask + ' / task';
+      } else if (summary.tasksPerNode) {
+        cpuLabel = summary.tasksPerNode + ' tasks / node';
+      }
+      setSummaryValue('profileSummaryCpus', cpuLabel);
+
+      let gpuLabel = '—';
+      if (summary.gpuCount !== undefined) {
+        if (summary.gpuCount === 0 && !summary.gpuType) {
+          gpuLabel = '0';
+        } else if (summary.gpuCount === 0 && summary.gpuType) {
+          gpuLabel = '0 ' + summary.gpuType;
+        } else if (summary.gpuCount > 0) {
+          gpuLabel = summary.gpuCount + ' ' + (summary.gpuType || 'GPU') + ' / node';
+        }
+      } else if (summary.gpuType) {
+        gpuLabel = summary.gpuType;
+      }
+      setSummaryValue('profileSummaryGpus', gpuLabel);
+
+      const memLabel =
+        summary.memoryMb && summary.memoryMb > 0 ? formatMem(summary.memoryMb) + ' / node' : '—';
+      setSummaryValue('profileSummaryMemory', memLabel);
+      setSummaryValue('profileSummaryTime', summary.time || '—');
+
+      const totals = [];
+      totals.push('Total CPU: ' + (summary.totalCpu !== undefined ? summary.totalCpu : '—'));
+      totals.push('Total RAM: ' + (summary.totalMemoryMb !== undefined ? formatMem(summary.totalMemoryMb) : '—'));
+      if (summary.totalGpu !== undefined) {
+        totals.push('Total GPU: ' + summary.totalGpu + (summary.gpuType ? ' ' + summary.gpuType : ''));
+      } else {
+        totals.push('Total GPU: —');
+      }
+      const totalsEl = document.getElementById('profileSummaryTotals');
+      if (totalsEl) totalsEl.textContent = totals.join(' • ');
+
+      if (overridesList) {
+        overridesList.innerHTML = '';
+      }
+      const overrides = Array.isArray(summary.overrides) ? summary.overrides : [];
+      if (overridesDetails && overridesList && overridesSummary) {
+        if (overrides.length === 0) {
+          overridesDetails.classList.add('hidden');
+        } else {
+          overridesDetails.classList.remove('hidden');
+          overridesSummary.textContent = 'Other saved settings (' + overrides.length + ')';
+          overrides.forEach((entry) => {
+            const row = document.createElement('div');
+            row.className = 'override-row';
+            const key = document.createElement('span');
+            key.className = 'override-key';
+            key.textContent = entry.label;
+            const value = document.createElement('span');
+            value.className = 'override-value';
+            value.textContent = entry.value;
+            row.appendChild(key);
+            row.appendChild(value);
+            overridesList.appendChild(row);
+          });
+        }
+      }
     }
 
     function normalizeOptions(options) {
@@ -6630,7 +7437,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     function getSingleLoginHostValue() {
       const raw = String(getValue('loginHosts') || '').trim();
-      const tokens = raw.split(/[\s,]+/).filter(Boolean);
+      const tokens = raw.split(/[\\s,]+/).filter(Boolean);
       return tokens.length === 1 ? tokens[0] : '';
     }
 
@@ -6775,11 +7582,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (!trimmed) {
         return '';
       }
-      const defaultMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*(?:default|d)\s*[>)]\s*)$/i);
+      const defaultMatch = trimmed.match(/^(.*?)(?:\\s*[<(]\\s*(?:default|d)\\s*[>)]\\s*)$/i);
       if (defaultMatch) {
         return defaultMatch[1].trim();
       }
-      const shortTagMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*[a-zA-Z]{1,3}\s*[>)]\s*)$/);
+      const shortTagMatch = trimmed.match(/^(.*?)(?:\\s*[<(]\\s*[a-zA-Z]{1,3}\\s*[>)]\\s*)$/);
       if (shortTagMatch) {
         return shortTagMatch[1].trim();
       }
@@ -6787,7 +7594,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function isDefaultTagged(value) {
-      return /[<(]\s*(?:default|d)\s*[>)]\s*$/i.test(String(value || '').trim());
+      return /[<(]\\s*(?:default|d)\\s*[>)]\\s*$/i.test(String(value || '').trim());
     }
 
     function getModuleDisplayLabel(value) {
@@ -6800,7 +7607,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function normalizeModuleName(value) {
-      return stripModuleTag(value).replace(/\s+/g, '');
+      return stripModuleTag(value).replace(/\\s+/g, '');
     }
 
     function coalesceModuleTokens(tokens) {
@@ -6841,13 +7648,34 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function parseModuleList(input) {
-      const tokens = String(input || '')
-        .split(/[\s,]+/)
+      const normalized = normalizeModuleInput(input);
+      const tokens = normalized
+        .split(/[\\s,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
       return coalesceModuleTokens(tokens)
         .map((entry) => stripModuleTag(entry))
         .filter((entry) => entry.length > 0 && !isModuleHeaderEntry(entry));
+    }
+
+    function normalizeModuleInput(input) {
+      const text = String(input || '');
+      const lines = text.split(/\\r?\\n/);
+      const parts = [];
+      lines.forEach((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        const moduleMatch = trimmed.match(/^module\\s+load\\s+(.+)$/i);
+        const mlMatch = trimmed.match(/^ml\\s+(.+)$/i);
+        if (moduleMatch) {
+          parts.push(moduleMatch[1]);
+        } else if (mlMatch) {
+          parts.push(mlMatch[1]);
+        } else {
+          parts.push(trimmed);
+        }
+      });
+      return parts.join(' ');
     }
 
     function updateModuleHint() {
@@ -6859,10 +7687,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
       const moduleCount = getSelectableModuleCount();
       if (!moduleCount) {
-        hint.textContent = 'No module list available. Type module names below.';
+        hint.textContent = 'No module list available. Type or paste module names below.';
         return;
       }
-      hint.textContent = moduleCount + ' modules available. Click the field or type to filter.';
+      hint.textContent = '';
     }
 
     function syncModuleLoadValue() {
@@ -6877,21 +7705,25 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (!container) return;
       container.innerHTML = '';
       selectedModules.forEach((moduleName) => {
-        const row = document.createElement('div');
-        row.className = 'module-item';
+        const chip = document.createElement('div');
+        chip.className = 'module-chip';
         const label = document.createElement('span');
         label.textContent = getModuleDisplayLabel(moduleName);
-        row.appendChild(label);
+        chip.appendChild(label);
         const remove = document.createElement('button');
         remove.type = 'button';
-        remove.textContent = '-';
+        remove.textContent = '×';
         remove.addEventListener('click', () => {
           selectedModules = selectedModules.filter((entry) => entry !== moduleName);
           renderModuleList();
         });
-        row.appendChild(remove);
-        container.appendChild(row);
+        chip.appendChild(remove);
+        container.appendChild(chip);
       });
+      const clearAll = document.getElementById('moduleClearAll');
+      if (clearAll) {
+        clearAll.disabled = selectedModules.length === 0 && !customModuleCommand;
+      }
       syncModuleLoadValue();
       updateModuleHint();
       scheduleAutoSave();
@@ -6905,8 +7737,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
         renderModuleList();
         return;
       }
-      const moduleMatch = trimmed.match(/^module\s+load\s+(.+)$/i);
-      const mlMatch = trimmed.match(/^ml\s+(.+)$/i);
+      const moduleMatch = trimmed.match(/^module\\s+load\\s+(.+)$/i);
+      const mlMatch = trimmed.match(/^ml\\s+(.+)$/i);
       const match = moduleMatch || mlMatch;
       if (match) {
         selectedModules = parseModuleList(match[1]);
@@ -7064,9 +7896,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
     }
 
-    function addModulesFromInput() {
+    function addModulesFromInput(raw) {
       const input = document.getElementById('moduleInput');
-      const entries = parseModuleList(input ? input.value : '');
+      const text = typeof raw === 'string' ? raw : input ? input.value : '';
+      const entries = parseModuleList(text);
       if (entries.length === 0) {
         return;
       }
@@ -7084,7 +7917,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         customModuleCommand = '';
         renderModuleList();
       }
-      if (input) input.value = '';
+      if (input && typeof raw !== 'string') input.value = '';
     }
 
     function setFieldDisabled(fieldKey, disabled) {
@@ -7159,6 +7992,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         });
       }
       updateSessionLockState();
+      updateResourceSummary();
     }
 
     function updateSessionLockState() {
@@ -7264,10 +8098,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
       const meta = document.getElementById('partitionMeta');
       if (meta) meta.textContent = '';
-      setStatus(
-        'Cluster info cleared. Click "Get cluster info" to reload partitions, modules, sessions, and free-resource data.',
-        false
-      );
+      updateResourceSummary();
+      setResourceSummaryWarning('');
     }
 
     function clearResourceFields() {
@@ -7572,13 +8404,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       updatePartitionDetails();
       const shouldAnnounce = options.announce !== false;
       if (shouldAnnounce) {
-        const summary = buildClusterInfoSummary(info);
-        if (summary.text) {
-          const hint = summary.hasFreeData
-            ? ' Toggle "Show only free resources" to filter suggestions.'
-            : '';
-          setStatus(summary.text + hint, false);
-        }
+        // Intentionally avoid extra success hints; action bar shows timestamp.
       }
     }
 
@@ -7678,7 +8504,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       let changed = false;
       let needsAgentRefresh = false;
       const loginValue = String(getValue('loginHosts') || '').trim();
-      const loginTokens = loginValue.split(/[\s,]+/).filter(Boolean);
+      const loginTokens = loginValue.split(/[\\s,]+/).filter(Boolean);
       const isSingleLogin = loginTokens.length === 1 ? loginTokens[0] : '';
       const canOverwrite = (fieldKey, currentValue) => {
         if (forceOverwrite) {
@@ -7754,6 +8580,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
       if (changed) {
         scheduleAutoSave();
+        updateResourceSummary();
       }
       if (needsAgentRefresh) {
         vscode.postMessage({
@@ -7781,9 +8608,16 @@ function getWebviewHtml(webview: vscode.Webview): string {
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (message.command === 'load') {
+        setClusterInfoLoading(false);
         suppressAutoSave = true;
         const values = message.values || {};
         lastValues = values;
+        if (message.defaults) {
+          uiDefaults = message.defaults;
+        }
+        if (message.profileSummaries) {
+          profileSummaries = message.profileSummaries;
+        }
         Object.keys(values).forEach((key) => setValue(key, values[key]));
         const saveTarget = document.getElementById('saveTarget');
         if (saveTarget && message.saveTarget) {
@@ -7796,12 +8630,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           setClusterInfoFetchedAt(message.clusterInfoCachedAt);
           applyClusterInfo(message.clusterInfo);
           if (message.clusterInfoCachedAt) {
-            const cachedAt = new Date(message.clusterInfoCachedAt).toLocaleString();
-            const summary = buildClusterInfoSummary(message.clusterInfo);
-            const summaryText = summary.text
-              ? ' ' + summary.text + (summary.hasFreeData ? ' Toggle "Show only free resources" to filter suggestions.' : '')
-              : '';
-            setStatus('Cluster info last retrieved: (' + cachedAt + ').' + summaryText, false);
+            // Keep action bar timestamp only; avoid extra hint text here.
           }
         } else {
           clusterInfo = null;
@@ -7811,20 +8640,19 @@ function getWebviewHtml(webview: vscode.Webview): string {
           if (meta) meta.textContent = '';
           setModuleOptions([]);
           setResourceDisabled(false);
-          setStatus(
-            'Click "Get cluster info" to load partitions, modules, sessions, and free-resource data (single SSH call).',
-            false
-          );
           updateResourceWarning();
         }
         applyMessageState(message);
+        updateProfileSummary(getSelectedProfileName());
         suppressAutoSave = false;
       } else if (message.command === 'clusterInfo') {
+        setClusterInfoLoading(false);
         setClusterInfoFetchedAt(message.fetchedAt || new Date());
         applyClusterInfo(message.info);
         setSessionOptions(Array.isArray(message.sessions) ? message.sessions : []);
         applyMessageState(message);
       } else if (message.command === 'clusterInfoError') {
+        setClusterInfoLoading(false);
         setStatus(message.message || 'Failed to load cluster info.', true);
         setResourceDisabled(false);
         setSessionOptions(Array.isArray(message.sessions) ? message.sessions : []);
@@ -7835,15 +8663,39 @@ function getWebviewHtml(webview: vscode.Webview): string {
         applyResolvedSshHost(message);
       } else if (message.command === 'agentStatus') {
         applyMessageState(message);
+      } else if (message.command === 'pickedPath') {
+        const field = String(message.field || '').trim();
+        if (field) {
+          setValue(field, message.value || '');
+          lastValues[field] = message.value || '';
+          scheduleAutoSave();
+          if (field === 'identityFile') {
+            vscode.postMessage({
+              command: 'refreshAgentStatus',
+              identityFile: message.value || ''
+            });
+          }
+        }
       } else if (message.command === 'profiles') {
+        if (message.profileSummaries) {
+          profileSummaries = message.profileSummaries;
+        }
         applyMessageState(message);
+        updateProfileSummary(getSelectedProfileName());
       } else if (message.command === 'connectionState') {
         setConnectState(message.state || 'idle');
       }
     });
 
+    const pickIdentityButton = document.getElementById('pickIdentityFile');
+    if (pickIdentityButton) {
+      pickIdentityButton.addEventListener('click', () => {
+        vscode.postMessage({ command: 'pickIdentityFile' });
+      });
+    }
+
     document.getElementById('getClusterInfo').addEventListener('click', () => {
-      setStatus('Fetching cluster info...', false);
+      setClusterInfoLoading(true);
       vscode.postMessage({
         command: 'getClusterInfo',
         values: gather()
@@ -7851,6 +8703,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     });
 
     document.getElementById('clearClusterInfo').addEventListener('click', () => {
+      setClusterInfoLoading(false);
       clearClusterInfoUi();
     });
 
@@ -7863,6 +8716,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     });
 
     const moduleAddButton = document.getElementById('moduleAdd');
+    const moduleClearButton = document.getElementById('moduleClearAll');
     const moduleInput = document.getElementById('moduleInput');
     const moduleMenu = document.getElementById('moduleMenu');
     const modulePicker = document.getElementById('modulePicker');
@@ -7897,6 +8751,13 @@ function getWebviewHtml(webview: vscode.Webview): string {
         addModulesFromInput();
       });
     }
+    if (moduleClearButton) {
+      moduleClearButton.addEventListener('click', () => {
+        selectedModules = [];
+        customModuleCommand = '';
+        renderModuleList();
+      });
+    }
     if (moduleInput) {
       moduleInput.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
@@ -7911,6 +8772,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
           event.preventDefault();
           addModulesFromInput();
         }
+      });
+      moduleInput.addEventListener('paste', (event) => {
+        const text = event.clipboardData ? event.clipboardData.getData('text') : '';
+        if (!text) return;
+        event.preventDefault();
+        addModulesFromInput(text);
       });
       moduleInput.addEventListener('click', () => {
         if (shouldIgnoreInputClick('moduleInput')) {
@@ -7941,6 +8808,14 @@ function getWebviewHtml(webview: vscode.Webview): string {
     const loginHostInput = document.getElementById(sshHostField.input);
     const loginHostMenu = document.getElementById(sshHostField.menu);
     if (loginHostInput) {
+      loginHostInput.addEventListener('focus', () => {
+        showSshHostHint = true;
+        renderSshHostHint();
+      });
+      loginHostInput.addEventListener('blur', () => {
+        showSshHostHint = false;
+        renderSshHostHint();
+      });
       loginHostInput.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
           hideSshHostMenu();
@@ -7973,6 +8848,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       loginHostInput.addEventListener('input', () => {
         lastResolvedSshHost = '';
         updateSshHostMenuFromInput();
+        updateResourceSummary();
       });
       loginHostInput.addEventListener('blur', () => {
         setTimeout(() => {
@@ -7985,6 +8861,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           return;
         }
         maybeResolveTypedHost();
+        updateResourceSummary();
       });
     }
     if (loginHostMenu) {
@@ -8099,7 +8976,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     document.getElementById('profileSelect').addEventListener('change', () => {
-      // no-op, selection already reflects current profile
+      updateProfileSummary(getSelectedProfileName());
     });
 
     document.getElementById('profileSave').addEventListener('click', () => {
@@ -8155,6 +9032,13 @@ function getWebviewHtml(webview: vscode.Webview): string {
     document.getElementById('refresh').addEventListener('click', () => {
       vscode.postMessage({ command: 'ready' });
     });
+
+    const resetAdvancedButton = document.getElementById('resetAdvancedDefaults');
+    if (resetAdvancedButton) {
+      resetAdvancedButton.addEventListener('click', () => {
+        resetAdvancedToDefaults();
+      });
+    }
     document.getElementById('openSettings').addEventListener('click', () => {
       vscode.postMessage({ command: 'openSettings' });
     });
