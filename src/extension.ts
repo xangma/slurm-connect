@@ -9,7 +9,6 @@ import {
   buildHostEntry,
   buildSlurmConnectIncludeBlock,
   buildSlurmConnectIncludeContent,
-  buildTemporarySshConfigContent,
   expandHome,
   formatSshConfigValue,
   SLURM_CONNECT_INCLUDE_END,
@@ -59,8 +58,6 @@ interface SlurmConnectConfig {
   openInNewWindow: boolean;
   remoteWorkspacePath: string;
   temporarySshConfigPath: string;
-  useSshIncludeBlock: boolean;
-  restoreSshConfigAfterConnect: boolean;
   additionalSshOptions: Record<string, string>;
   sshQueryConfigPath: string;
   sshConnectTimeoutSeconds: number;
@@ -107,22 +104,17 @@ let extensionWorkspaceState: vscode.Memento | undefined;
 let activeWebview: vscode.Webview | undefined;
 let connectionState: ConnectionState = 'idle';
 let lastConnectionAlias: string | undefined;
-let previousRemoteSshConfigPath: string | undefined;
-let activeTempSshConfigPath: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let clusterInfoRequestInFlight = false;
-let warnedLegacySshConfigOverride = false;
 let sshHostsRequestInFlight = false;
 const SETTINGS_SECTION = 'slurmConnect';
 const LEGACY_SETTINGS_SECTION = 'sciamaSlurm';
 const PROFILE_STORE_KEY = 'slurmConnect.profiles';
 const ACTIVE_PROFILE_KEY = 'slurmConnect.activeProfile';
-const PENDING_RESTORE_KEY = 'slurmConnect.pendingRestore';
 const CLUSTER_INFO_CACHE_KEY = 'slurmConnect.clusterInfoCache';
 const CLUSTER_UI_CACHE_KEY = 'slurmConnect.clusterUiCache';
 const LEGACY_PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
 const LEGACY_ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
-const LEGACY_PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
 const LEGACY_CLUSTER_INFO_CACHE_KEY = 'sciamaSlurm.clusterInfoCache';
 const DEFAULT_SESSION_STATE_DIR = '~/.slurm-connect';
 const CONFIG_KEYS = [
@@ -159,7 +151,6 @@ const CONFIG_KEYS = [
   'openInNewWindow',
   'remoteWorkspacePath',
   'temporarySshConfigPath',
-  'restoreSshConfigAfterConnect',
   'additionalSshOptions',
   'sshQueryConfigPath',
   'sshConnectTimeoutSeconds'
@@ -208,7 +199,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   context.subscriptions.push(disposable);
 
-  void maybeRestorePendingOnStartup();
+  void migrateStaleRemoteSshConfigIfNeeded();
 
   const viewProvider = new SlurmConnectViewProvider(context);
   context.subscriptions.push(
@@ -227,7 +218,6 @@ async function migrateLegacyState(): Promise<void> {
   const migrations: Array<[string, string]> = [
     [LEGACY_PROFILE_STORE_KEY, PROFILE_STORE_KEY],
     [LEGACY_ACTIVE_PROFILE_KEY, ACTIVE_PROFILE_KEY],
-    [LEGACY_PENDING_RESTORE_KEY, PENDING_RESTORE_KEY],
     [LEGACY_CLUSTER_INFO_CACHE_KEY, CLUSTER_INFO_CACHE_KEY]
   ];
   for (const [legacyKey, newKey] of migrations) {
@@ -765,8 +755,6 @@ interface UiValues {
   forwardAgent: boolean;
   requestTTY: boolean;
   temporarySshConfigPath: string;
-  useSshIncludeBlock: boolean;
-  restoreSshConfigAfterConnect: boolean;
   sshQueryConfigPath: string;
   openInNewWindow: boolean;
   remoteWorkspacePath: string;
@@ -837,14 +825,6 @@ interface ProfileResourceSummary {
   totalMemoryMb?: number;
   totalGpu?: number;
   overrides?: ProfileOverrideDetail[];
-}
-
-interface PendingRestoreState {
-  tempConfigPath: string;
-  previousConfigPath?: string;
-  alias: string;
-  openInNewWindow: boolean;
-  createdAt: string;
 }
 
 function postToWebview(message: unknown): void {
@@ -1148,12 +1128,6 @@ function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOve
   if (diffString(values.sshQueryConfigPath, defaults.sshQueryConfigPath)) {
     add('SSH query config', values.sshQueryConfigPath);
   }
-  if (diffBool(values.useSshIncludeBlock, defaults.useSshIncludeBlock)) {
-    add('SSH include block', values.useSshIncludeBlock ? 'Enabled' : 'Disabled');
-  }
-  if (diffBool(values.restoreSshConfigAfterConnect, defaults.restoreSshConfigAfterConnect)) {
-    add('Restore SSH config', values.restoreSshConfigAfterConnect ? 'Enabled' : 'Disabled');
-  }
   if (diffBool(values.forwardAgent, defaults.forwardAgent)) {
     add('Forward agent', values.forwardAgent ? 'Enabled' : 'Disabled');
   }
@@ -1216,46 +1190,6 @@ function buildProfileSummaryMap(
   return summaries;
 }
 
-function getPendingRestore(): PendingRestoreState | undefined {
-  if (!extensionGlobalState) {
-    return undefined;
-  }
-  return extensionGlobalState.get<PendingRestoreState>(PENDING_RESTORE_KEY);
-}
-
-async function setPendingRestore(state?: PendingRestoreState): Promise<void> {
-  if (!extensionGlobalState) {
-    return;
-  }
-  await extensionGlobalState.update(PENDING_RESTORE_KEY, state);
-}
-
-async function clearPendingRestore(): Promise<void> {
-  await setPendingRestore(undefined);
-}
-
-async function maybeRestorePendingOnStartup(): Promise<void> {
-  const pending = getPendingRestore();
-  if (!pending) {
-    await migrateStaleRemoteSshConfigIfNeeded();
-    return;
-  }
-  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  const current = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
-  if (!current || current !== pending.tempConfigPath) {
-    await clearPendingRestore();
-    await migrateStaleRemoteSshConfigIfNeeded();
-    return;
-  }
-
-  if (pending.openInNewWindow) {
-    await waitForRemoteConnectionOrTimeout(30_000, 500);
-  } else {
-    await delay(500);
-  }
-  await migrateStaleRemoteSshConfigIfNeeded();
-}
-
 function getConfigFromSettings(): SlurmConnectConfig {
   const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
   const user = (cfg.get<string>('user') || '').trim();
@@ -1293,8 +1227,6 @@ function getConfigFromSettings(): SlurmConnectConfig {
     openInNewWindow: cfg.get<boolean>('openInNewWindow', false),
     remoteWorkspacePath: (cfg.get<string>('remoteWorkspacePath') || '').trim(),
     temporarySshConfigPath: (cfg.get<string>('temporarySshConfigPath') || '').trim(),
-    useSshIncludeBlock: cfg.get<boolean>('useSshIncludeBlock', true),
-    restoreSshConfigAfterConnect: cfg.get<boolean>('restoreSshConfigAfterConnect', true),
     additionalSshOptions: cfg.get<Record<string, string>>('additionalSshOptions', {}),
     sshQueryConfigPath: (cfg.get<string>('sshQueryConfigPath') || '').trim(),
     sshConnectTimeoutSeconds: cfg.get<number>('sshConnectTimeoutSeconds', 15)
@@ -1345,8 +1277,6 @@ function getConfigDefaultsFromSettings(): SlurmConnectConfig {
     openInNewWindow: Boolean(getDefault<boolean>('openInNewWindow', false)),
     remoteWorkspacePath: String(getDefault<string>('remoteWorkspacePath', '') || '').trim(),
     temporarySshConfigPath: String(getDefault<string>('temporarySshConfigPath', '') || '').trim(),
-    useSshIncludeBlock: Boolean(getDefault<boolean>('useSshIncludeBlock', true)),
-    restoreSshConfigAfterConnect: Boolean(getDefault<boolean>('restoreSshConfigAfterConnect', true)),
     additionalSshOptions: getDefault<Record<string, string>>('additionalSshOptions', {}),
     sshQueryConfigPath: String(getDefault<string>('sshQueryConfigPath', '') || '').trim(),
     sshConnectTimeoutSeconds: Number(getDefault<number>('sshConnectTimeoutSeconds', 15))
@@ -1510,9 +1440,6 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
         case 'disconnect': {
           setConnectionState('disconnecting');
           const disconnected = await disconnectFromHost(lastConnectionAlias);
-          if (disconnected) {
-            await restoreRemoteSshConfigIfNeeded();
-          }
           setConnectionState(disconnected ? 'idle' : 'connected');
           break;
         }
@@ -1686,27 +1613,6 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
     });
   }
 }
-
-async function maybeWarnLegacySshConfigOverride(cfg: SlurmConnectConfig): Promise<boolean> {
-  if (cfg.useSshIncludeBlock) {
-    return true;
-  }
-  if (warnedLegacySshConfigOverride) {
-    return true;
-  }
-  const choice = await vscode.window.showWarningMessage(
-    'Slurm Connect will temporarily set Remote.SSH: Config File on connect because SSH include blocks are disabled.',
-    { modal: true },
-    'Continue',
-    'Cancel'
-  );
-  if (choice !== 'Continue') {
-    return false;
-  }
-  warnedLegacySshConfigOverride = true;
-  return true;
-}
-
 
 async function connectCommand(
   overrides?: Partial<SlurmConnectConfig>,
@@ -1887,9 +1793,6 @@ async function connectCommand(
   log.appendLine('Generated SSH host entry:');
   log.appendLine(hostEntry);
 
-  let tempConfigPath: string | undefined;
-  let usedLegacyConfig = false;
-
   await ensureRemoteSshSettings(cfg.sessionMode);
   await migrateStaleRemoteSshConfigIfNeeded();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
@@ -1903,53 +1806,19 @@ async function connectCommand(
     }
   }
 
-  if (cfg.useSshIncludeBlock) {
-    try {
-      const includePath = resolveSlurmConnectIncludePath(cfg);
-      if (normalizeSshPath(includePath) === normalizeSshPath(baseConfigPath)) {
-        throw new Error('Slurm Connect include file path must not be the same as the SSH config path.');
-      }
-      await writeSlurmConnectIncludeFile(hostEntry, includePath);
-      const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
-      log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
-    } catch (error) {
-      usedLegacyConfig = true;
-      log.appendLine(`Failed to install SSH Include: ${formatError(error)}`);
-      log.appendLine('Falling back to temporary Remote.SSH configFile override.');
+  try {
+    const includePath = resolveSlurmConnectIncludePath(cfg);
+    if (normalizeSshPath(includePath) === normalizeSshPath(baseConfigPath)) {
+      throw new Error('Slurm Connect include file path must not be the same as the SSH config path.');
     }
-  } else {
-    const proceed = await maybeWarnLegacySshConfigOverride(cfg);
-    if (!proceed) {
-      return false;
-    }
-    usedLegacyConfig = true;
-  }
-
-  if (usedLegacyConfig) {
-    const fallbackRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
-    const baseRemoteConfig = resolveBaseRemoteConfig(fallbackRemoteConfig);
-    const includePaths = resolveSshConfigIncludes(baseRemoteConfig);
-    previousRemoteSshConfigPath = baseRemoteConfig;
-    if (includePaths.length > 0) {
-      log.appendLine(`Temporary SSH config includes: ${includePaths.join(', ')}`);
-    }
-
-    try {
-      tempConfigPath = await writeTemporarySshConfig(hostEntry, includePaths);
-    } catch (error) {
-      void vscode.window.showErrorMessage(`Failed to write temporary SSH config: ${formatError(error)}`);
-      return false;
-    }
-
-    activeTempSshConfigPath = tempConfigPath;
-    await remoteCfg.update('configFile', tempConfigPath, vscode.ConfigurationTarget.Global);
-    await setPendingRestore({
-      tempConfigPath,
-      previousConfigPath: baseRemoteConfig || undefined,
-      alias: alias.trim(),
-      openInNewWindow: cfg.openInNewWindow,
-      createdAt: new Date().toISOString()
-    });
+    await writeSlurmConnectIncludeFile(hostEntry, includePath);
+    const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
+    log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
+  } catch (error) {
+    const message = `Failed to install SSH Include block: ${formatError(error)}`;
+    log.appendLine(message);
+    void vscode.window.showErrorMessage(message);
+    return false;
   }
   await delay(300);
   await refreshRemoteSshHosts();
@@ -1969,21 +1838,12 @@ async function connectCommand(
         getOutputChannel().show(true);
       }
     });
-    if (usedLegacyConfig) {
-      await restoreRemoteSshConfigIfNeeded();
-    }
     return didConnect;
   }
   if (cfg.openInNewWindow) {
-    if (usedLegacyConfig) {
-      log.appendLine('Deferring SSH config restore until the remote window is ready.');
-    }
     return didConnect;
   }
   await waitForRemoteConnectionOrTimeout(30_000, 500);
-  if (usedLegacyConfig) {
-    await restoreRemoteSshConfigIfNeeded();
-  }
 
   return didConnect;
 }
@@ -4959,73 +4819,12 @@ async function writeSlurmConnectIncludeFile(entry: string, includePath: string):
   return includePath;
 }
 
-async function writeTemporarySshConfig(entry: string, includePaths: string[]): Promise<string> {
-  const basePath = path.join(extensionStoragePath || os.tmpdir(), 'slurm-connect-ssh-config');
-  const dir = path.dirname(basePath);
-  await fs.mkdir(dir, { recursive: true });
-  const resolvedBase = path.resolve(basePath);
-  const includes = uniqueList(includePaths)
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .map((value) => expandHome(value))
-    .filter((value) => value && path.resolve(value) !== resolvedBase);
-  const content = buildTemporarySshConfigContent(entry, includes);
-  await fs.writeFile(basePath, content, 'utf8');
-  return basePath;
-}
-
 function normalizeRemoteConfigPath(value: unknown): string | undefined {
   if (typeof value !== 'string') {
     return undefined;
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function resolveBaseRemoteConfig(currentConfig?: string): string | undefined {
-  if (currentConfig && activeTempSshConfigPath && currentConfig === activeTempSshConfigPath && previousRemoteSshConfigPath) {
-    return previousRemoteSshConfigPath;
-  }
-  return currentConfig;
-}
-
-function resolveSshConfigIncludes(baseConfig?: string): string[] {
-  const includes: string[] = [];
-  if (baseConfig) {
-    includes.push(baseConfig);
-  }
-  includes.push('~/.ssh/config');
-  return uniqueList(includes);
-}
-
-async function restoreRemoteSshConfigIfNeeded(): Promise<boolean> {
-  const cfg = getConfig();
-  if (!cfg.restoreSshConfigAfterConnect) {
-    await clearPendingRestore();
-    return false;
-  }
-  const pending = getPendingRestore();
-  const tempPath = activeTempSshConfigPath || pending?.tempConfigPath;
-  if (!tempPath) {
-    await clearPendingRestore();
-    return false;
-  }
-  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  const current = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
-  if (current && current !== tempPath) {
-    if (pending && current === normalizeRemoteConfigPath(pending.previousConfigPath)) {
-      await clearPendingRestore();
-    }
-    return false;
-  }
-  const restored = previousRemoteSshConfigPath ?? pending?.previousConfigPath;
-  await remoteCfg.update('configFile', restored, vscode.ConfigurationTarget.Global);
-  const log = getOutputChannel();
-  log.appendLine(`Restored Remote.SSH configFile ${restored ? `to ${restored}` : 'to default'}.`);
-  previousRemoteSshConfigPath = undefined;
-  activeTempSshConfigPath = undefined;
-  await clearPendingRestore();
-  return true;
 }
 
 async function isSlurmConnectTempConfigFile(configPath: string): Promise<boolean> {
@@ -5054,24 +4853,18 @@ async function guessPreviousConfigFromTempConfig(configPath: string): Promise<st
 }
 
 async function migrateStaleRemoteSshConfigIfNeeded(): Promise<void> {
-  await restoreRemoteSshConfigIfNeeded();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const current = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
   if (!current) {
-    await clearPendingRestore();
     return;
   }
   if (!(await isSlurmConnectTempConfigFile(current))) {
     return;
   }
-  const pending = getPendingRestore();
-  const restored = pending?.previousConfigPath || await guessPreviousConfigFromTempConfig(current);
+  const restored = await guessPreviousConfigFromTempConfig(current);
   await remoteCfg.update('configFile', restored, vscode.ConfigurationTarget.Global);
   const log = getOutputChannel();
   log.appendLine(`Detected stale Slurm Connect temporary SSH config. Restored Remote.SSH configFile ${restored ? `to ${restored}` : 'to default'}.`);
-  previousRemoteSshConfigPath = undefined;
-  activeTempSshConfigPath = undefined;
-  await clearPendingRestore();
 }
 
 function resolveWindowsUserSettingsPath(): string | undefined {
@@ -5552,8 +5345,6 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     openInNewWindow: cfg.openInNewWindow,
     remoteWorkspacePath: cfg.remoteWorkspacePath || '',
     temporarySshConfigPath: cfg.temporarySshConfigPath || '',
-    useSshIncludeBlock: cfg.useSshIncludeBlock,
-    restoreSshConfigAfterConnect: cfg.restoreSshConfigAfterConnect,
     sshQueryConfigPath: cfg.sshQueryConfigPath || ''
   };
 }
@@ -5574,8 +5365,6 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
     ['openInNewWindow', Boolean(values.openInNewWindow)],
     ['remoteWorkspacePath', values.remoteWorkspacePath.trim()],
     ['temporarySshConfigPath', values.temporarySshConfigPath.trim()],
-    ['useSshIncludeBlock', Boolean(values.useSshIncludeBlock)],
-    ['restoreSshConfigAfterConnect', Boolean(values.restoreSshConfigAfterConnect)],
     ['sshQueryConfigPath', values.sshQueryConfigPath.trim()]
   ];
 
@@ -5775,8 +5564,6 @@ function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
     openInNewWindow: Boolean(values.openInNewWindow),
     remoteWorkspacePath: values.remoteWorkspacePath.trim(),
     temporarySshConfigPath: values.temporarySshConfigPath.trim(),
-    useSshIncludeBlock: Boolean(values.useSshIncludeBlock),
-    restoreSshConfigAfterConnect: Boolean(values.restoreSshConfigAfterConnect),
     sshQueryConfigPath: values.sshQueryConfigPath.trim()
   };
 }
@@ -6044,7 +5831,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-input-border);
       border-radius: 4px;
-      z-index: 5;
+      z-index: 20;
       display: none;
     }
     .dropdown-menu.visible { display: block; }
@@ -6324,15 +6111,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="sshHostPrefix" type="text" />
     <label for="temporarySshConfigPath">Slurm Connect include file path</label>
     <input id="temporarySshConfigPath" type="text" />
-    <div class="checkbox">
-      <input id="useSshIncludeBlock" type="checkbox" />
-      <label for="useSshIncludeBlock">Install SSH Include block (recommended)</label>
-    </div>
-    <div id="sshIncludeSettingHint" class="hint"></div>
-    <div class="checkbox">
-      <input id="restoreSshConfigAfterConnect" type="checkbox" />
-      <label for="restoreSshConfigAfterConnect">Restore Remote.SSH config after legacy fallback</label>
-    </div>
     <label for="sshQueryConfigPath">SSH query config path</label>
     <input id="sshQueryConfigPath" type="text" />
     <div class="checkbox">
@@ -6373,7 +6151,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
         <div id="clusterUpdatedAt" class="hint"></div>
       </div>
     </div>
-    <div id="sshIncludeStatus" class="hint"></div>
   </div>
 
   <script nonce="${nonce}">
@@ -6549,20 +6326,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
       el.style.color = sshHostHintIsError ? '#b00020' : '#555';
     }
 
-    function updateSshIncludeHints() {
-      const useInclude = Boolean(getValue('useSshIncludeBlock'));
-      const text = useInclude
-        ? 'Connections add a small Slurm Connect Include block to your SSH config and update the Slurm Connect include file.'
-        : 'Include block disabled; Slurm Connect will temporarily override Remote.SSH: Config File on connect.';
-      const statusText = useInclude
-        ? 'SSH Include: enabled'
-        : 'SSH Include: disabled (using Remote.SSH override)';
-      const settingHint = document.getElementById('sshIncludeSettingHint');
-      if (settingHint) settingHint.textContent = text;
-      const statusHint = document.getElementById('sshIncludeStatus');
-      if (statusHint) statusHint.textContent = statusText;
-    }
-
     function resetAdvancedToDefaults() {
       if (!uiDefaults) {
         return;
@@ -6585,12 +6348,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       set('sessionStateDir', defaults.sessionStateDir);
       set('sshHostPrefix', defaults.sshHostPrefix);
       set('temporarySshConfigPath', defaults.temporarySshConfigPath);
-      set('useSshIncludeBlock', defaults.useSshIncludeBlock);
-      set('restoreSshConfigAfterConnect', defaults.restoreSshConfigAfterConnect);
       set('sshQueryConfigPath', defaults.sshQueryConfigPath);
       set('forwardAgent', defaults.forwardAgent);
       set('requestTTY', defaults.requestTTY);
-      updateSshIncludeHints();
       scheduleAutoSave();
     }
 
@@ -8472,8 +8232,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
         defaultGpuCount: getValue('defaultGpuCount'),
         sshHostPrefix: getValue('sshHostPrefix'),
         temporarySshConfigPath: getValue('temporarySshConfigPath'),
-        useSshIncludeBlock: getValue('useSshIncludeBlock'),
-        restoreSshConfigAfterConnect: getValue('restoreSshConfigAfterConnect'),
         sshQueryConfigPath: getValue('sshQueryConfigPath'),
         forwardAgent: getValue('forwardAgent'),
         requestTTY: getValue('requestTTY'),
@@ -8625,7 +8383,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
         }
         applyModuleState(values);
         setSessionOptions(Array.isArray(message.sessions) ? message.sessions : []);
-        updateSshIncludeHints();
         if (message.clusterInfo) {
           setClusterInfoFetchedAt(message.clusterInfoCachedAt);
           applyClusterInfo(message.clusterInfo);
@@ -8967,13 +8724,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
     setInterval(() => {
       updateFreeResourceWarning();
     }, 60000);
-
-    const includeToggle = document.getElementById('useSshIncludeBlock');
-    if (includeToggle) {
-      includeToggle.addEventListener('change', () => {
-        updateSshIncludeHints();
-      });
-    }
 
     document.getElementById('profileSelect').addEventListener('change', () => {
       updateProfileSummary(getSelectedProfileName());

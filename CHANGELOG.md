@@ -18,6 +18,9 @@ All notable changes to this project are documented in this file based on git tag
 - Cluster info success hints are no longer shown by default.
 - Profile summary and overrides are now grouped into a single card.
 - Profile details now avoid duplicating the single login host in the overrides list.
+- Legacy Remote.SSH configFile override is removed; the managed Include block is now always used.
+- Removed the SSH Include status hint from the action bar.
+- Dropdown menus now render above the sticky action bar.
 ### Fixed
 - Webview module parsing now escapes regex sequences correctly to avoid load errors.
 

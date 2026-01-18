@@ -218,16 +218,6 @@
           "default": "~/.ssh/slurm-connect.conf",
           "description": "Path for the Slurm Connect SSH include file. The extension installs a small Include block (with a note) in your SSH config that points here."
         },
-        "slurmConnect.useSshIncludeBlock": {
-          "type": "boolean",
-          "default": true,
-          "description": "Install a managed Slurm Connect Include block in your SSH config (recommended). Disable to use the legacy temporary Remote.SSH configFile override."
-        },
-        "slurmConnect.restoreSshConfigAfterConnect": {
-          "type": "boolean",
-          "default": true,
-          "description": "Restore Remote.SSH configFile after connecting when using the legacy temporary config fallback."
-        },
         "slurmConnect.additionalSshOptions": {
           "type": "object",
           "default": {},
