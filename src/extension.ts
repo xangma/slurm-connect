@@ -82,6 +82,10 @@ interface SessionSummary {
   nodes?: number;
   cpus?: number;
   timeLimit?: string;
+  clients?: number;
+  lastSeenEpoch?: number;
+  idleRemainingSeconds?: number;
+  idleTimeoutSeconds?: number;
 }
 
 interface ResolvedSshHostInfo {
@@ -1838,7 +1842,13 @@ async function connectCommand(
   lastConnectionAlias = alias.trim();
 
   const sessionKey = resolveSessionKey(cfg, alias.trim());
-  const remoteCommand = buildRemoteCommand(cfg, [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs], sessionKey);
+  const clientId = vscode.env.sessionId || '';
+  const remoteCommand = buildRemoteCommand(
+    cfg,
+    [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs],
+    sessionKey,
+    clientId
+  );
   if (!remoteCommand) {
     void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
     return false;
@@ -2134,7 +2144,8 @@ async function fetchExistingSessions(loginHost: string, cfg: SlurmConnectConfig)
   const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
   const command = buildSessionQueryCommand(stateDir);
   const output = await runSshCommand(loginHost, cfg, command);
-  return parseSessionListOutput(output);
+  const sessions = parseSessionListOutput(output);
+  return applySessionIdleInfo(sessions);
 }
 
 async function fetchClusterInfoWithSessions(
@@ -2149,14 +2160,14 @@ async function fetchClusterInfoWithSessions(
   const output = await runSshCommand(loginHost, cfg, combinedCommand);
   const { commandOutputs, modulesOutput, sessionsOutput } = parseCombinedClusterInfoOutput(output, commands.length);
   const info = buildClusterInfoFromOutputs(commandOutputs, modulesOutput, freeResourceIndexes);
-  const sessions = parseSessionListOutput(sessionsOutput);
+  const sessions = applySessionIdleInfo(parseSessionListOutput(sessionsOutput));
   return { info, sessions };
 }
 
 function buildSessionQueryCommand(stateDir: string): string {
   const dirLiteral = JSON.stringify(stateDir);
   const script = [
-    'import json, os, subprocess, sys, re',
+    'import json, os, subprocess, sys, re, time',
     `state_dir = os.path.expanduser(${dirLiteral})`,
     'sessions_dir = os.path.join(state_dir, "sessions")',
     'if not os.path.isdir(sessions_dir):',
@@ -2251,12 +2262,51 @@ function buildSessionQueryCommand(stateDir: string): string {
     '        continue',
     '    seen_job_ids.add(job_id)',
     '    detail = job_details.get(job_id, {})',
+    '    clients_dir = os.path.join(session_dir, "clients")',
+    '    client_ids = set()',
+    '    now = time.time()',
+    '    try:',
+    '        raw_stale = data.get("stale_seconds")',
+    '        stale_seconds = int(raw_stale) if raw_stale is not None else 90',
+    '    except Exception:',
+    '        stale_seconds = 90',
+    '    try:',
+    '        if os.path.isdir(clients_dir):',
+    '            for name in os.listdir(clients_dir):',
+    '                path = os.path.join(clients_dir, name)',
+    '                if not os.path.isfile(path):',
+    '                    continue',
+    '                if stale_seconds > 0:',
+    '                    try:',
+    '                        age = now - os.path.getmtime(path)',
+    '                        if age > stale_seconds:',
+    '                            continue',
+    '                    except Exception:',
+    '                        pass',
+    '                client_key = name',
+    '                if name.startswith("client-"):',
+    '                    prefix = name.split(".", 1)[0]',
+    '                    client_key = prefix[7:] if len(prefix) > 7 else name',
+    '                client_ids.add(client_key)',
+    '    except Exception:',
+    '        client_ids = set()',
+    '    last_seen = ""',
+    '    last_seen_path = os.path.join(session_dir, "last_seen")',
+    '    if os.path.isfile(last_seen_path):',
+    '        try:',
+    '            with open(last_seen_path, "r") as handle:',
+    '                last_seen = handle.read().strip()',
+    '        except Exception:',
+    '            last_seen = ""',
     '    sessions.append({',
     '        "sessionKey": str(data.get("session_key") or entry),',
     '        "jobId": job_id,',
     '        "state": info.get("state", ""),',
     '        "jobName": (info.get("jobName") or data.get("job_name") or ""),',
     '        "createdAt": str(data.get("created_at") or ""),',
+    '        "clients": len(client_ids),',
+    '        "lastSeen": last_seen,',
+    '        "idleTimeoutSeconds": data.get("idle_timeout_seconds", ""),',
     '        "partition": detail.get("partition", ""),',
     '        "nodes": detail.get("nodes", ""),',
     '        "cpus": detail.get("cpus", ""),',
@@ -2295,6 +2345,9 @@ function parseSessionListOutput(output: string): SessionSummary[] {
       const timeLimit = typeof entry.timeLimit === 'string' ? entry.timeLimit.trim() : '';
       const nodes = Number(entry.nodes);
       const cpus = Number(entry.cpus);
+      const clientsValue = Number(entry.clients);
+      const lastSeenValue = Number(entry.lastSeen);
+      const idleTimeoutValue = Number(entry.idleTimeoutSeconds);
       results.push({
         sessionKey,
         jobId,
@@ -2304,13 +2357,34 @@ function parseSessionListOutput(output: string): SessionSummary[] {
         partition: partition || undefined,
         nodes: Number.isFinite(nodes) && nodes > 0 ? nodes : undefined,
         cpus: Number.isFinite(cpus) && cpus > 0 ? cpus : undefined,
-        timeLimit: timeLimit || undefined
+        timeLimit: timeLimit || undefined,
+        clients: Number.isFinite(clientsValue) && clientsValue >= 0 ? clientsValue : undefined,
+        lastSeenEpoch: Number.isFinite(lastSeenValue) && lastSeenValue > 0 ? lastSeenValue : undefined,
+        idleTimeoutSeconds:
+          Number.isFinite(idleTimeoutValue) && idleTimeoutValue > 0 ? idleTimeoutValue : undefined
       });
     }
     return results;
   } catch {
     return [];
   }
+}
+
+function applySessionIdleInfo(sessions: SessionSummary[]): SessionSummary[] {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return sessions.map((session) => {
+    const next: SessionSummary = { ...session };
+    const timeout = typeof session.idleTimeoutSeconds === 'number' ? session.idleTimeoutSeconds : 0;
+    if (timeout > 0) {
+      const clients = typeof session.clients === 'number' ? session.clients : 0;
+      const lastSeen = session.lastSeenEpoch;
+      if (clients === 0 && typeof lastSeen === 'number' && Number.isFinite(lastSeen)) {
+        const idleSeconds = Math.max(0, nowSeconds - lastSeen);
+        next.idleRemainingSeconds = Math.max(0, timeout - idleSeconds);
+      }
+    }
+    return next;
+  });
 }
 
 async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webview): Promise<void> {
@@ -4267,7 +4341,7 @@ async function cancelPersistentSessionJob(
   }
 }
 
-function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string): string[] {
+function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string, clientId?: string): string[] {
   const args = cfg.proxyArgs.filter(Boolean);
   if (cfg.sessionMode !== 'persistent') {
     return args;
@@ -4276,6 +4350,9 @@ function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string): string[] 
   const sessionArgs = ['--session-mode=persistent'];
   if (key) {
     sessionArgs.push(`--session-key=${key}`);
+  }
+  if (clientId && clientId.trim().length > 0) {
+    sessionArgs.push(`--session-client-id=${clientId.trim()}`);
   }
   if (cfg.sessionIdleTimeoutSeconds > 0) {
     sessionArgs.push(`--session-idle-timeout=${Math.floor(cfg.sessionIdleTimeoutSeconds)}`);
@@ -4356,12 +4433,17 @@ function escapeModuleLoadCommand(command: string): string {
   return result.join(' ');
 }
 
-function buildRemoteCommand(cfg: SlurmConnectConfig, sallocArgs: string[], sessionKey?: string): string {
+function buildRemoteCommand(
+  cfg: SlurmConnectConfig,
+  sallocArgs: string[],
+  sessionKey?: string,
+  clientId?: string
+): string {
   const proxyTokens = splitShellArgs(cfg.proxyCommand);
   if (proxyTokens.length === 0) {
     return '';
   }
-  const proxyArgs = buildProxyArgs(cfg, sessionKey);
+  const proxyArgs = buildProxyArgs(cfg, sessionKey, clientId);
   const sallocFlags = sallocArgs.map((arg) => `--salloc-arg=${arg}`);
   const fullProxyCommand = joinShellCommand([...proxyTokens, ...proxyArgs, ...sallocFlags]);
   const moduleLoad = cfg.moduleLoad ? escapeModuleLoadCommand(cfg.moduleLoad) : '';
@@ -7942,10 +8024,29 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function formatSessionLabel(session) {
       const name = session.jobName ? String(session.jobName).trim() : '';
       const state = session.state ? String(session.state).trim() : '';
+      const clients = Number.isFinite(Number(session.clients)) ? Number(session.clients) : null;
+      const idleTimeout = Number(session.idleTimeoutSeconds);
+      const remaining = Number(session.idleRemainingSeconds);
       const pieces = [];
       if (name) pieces.push(name);
       pieces.push('job ' + session.jobId);
       if (state) pieces.push(state);
+      if (clients !== null) pieces.push('clients ' + clients);
+      if (Number.isFinite(idleTimeout)) {
+        if (idleTimeout > 0) {
+          if (clients === 0) {
+            if (Number.isFinite(remaining)) {
+              pieces.push('idle in ' + formatDurationSeconds(remaining));
+            } else {
+              pieces.push('idle timeout ' + formatDurationSeconds(idleTimeout));
+            }
+          } else {
+            pieces.push('idle after disconnect ' + formatDurationSeconds(idleTimeout));
+          }
+        } else {
+          pieces.push('idle timeout never');
+        }
+      }
       return session.sessionKey + ' (' + pieces.join(', ') + ')';
     }
 
@@ -7961,9 +8062,44 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (session.nodes) parts.push('Nodes: ' + session.nodes);
       if (session.cpus) parts.push('CPUs: ' + session.cpus);
       if (session.timeLimit) parts.push('Time limit: ' + session.timeLimit);
+      if (Number.isFinite(Number(session.clients))) {
+        const clients = Number(session.clients);
+        parts.push('Clients: ' + clients);
+      }
+      const idleTimeout = Number(session.idleTimeoutSeconds);
+      const remaining = Number(session.idleRemainingSeconds);
+      if (Number.isFinite(idleTimeout)) {
+        if (idleTimeout > 0) {
+          if (Number.isFinite(Number(session.clients)) && Number(session.clients) === 0) {
+            if (Number.isFinite(remaining)) {
+              parts.push('Idle cancel in: ' + formatDurationSeconds(remaining));
+            } else {
+              parts.push('Idle timeout: ' + formatDurationSeconds(idleTimeout));
+            }
+          } else {
+            parts.push('Idle timeout (after disconnect): ' + formatDurationSeconds(idleTimeout));
+          }
+        } else {
+          parts.push('Idle timeout: never');
+        }
+      }
       parts.push('Job: ' + session.jobId);
       if (session.state) parts.push('State: ' + session.state);
       return parts.join(' • ');
+    }
+
+    function formatDurationSeconds(value) {
+      const total = Math.max(0, Math.floor(Number(value) || 0));
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const seconds = total % 60;
+      if (hours > 0) {
+        return hours + 'h ' + minutes + 'm';
+      }
+      if (minutes > 0) {
+        return minutes + 'm ' + seconds + 's';
+      }
+      return seconds + 's';
     }
 
     function setSessionSelection(value) {

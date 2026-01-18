@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file based on git tag
 - Module paste now accepts `module load ...` lines.
 - Advanced settings reset button to restore defaults.
 - Cancel job (disconnects) button for persistent sessions.
+- Existing session picker now shows connected client counts and idle cancel timing (based on the session's saved timeout) when no clients are connected.
 ### Changed
 - Clear cluster info is now a secondary action and is disabled while fetching.
 - Remote folder field no longer shows a local browse button (remote-only path).
