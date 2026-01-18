@@ -2,7 +2,7 @@
   "name": "slurm-connect",
   "displayName": "Slurm Connect",
   "description": "Connect VS Code to Slurm allocations.",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "publisher": "xangma",
   "repository": "https://github.com/xangma/slurm-connect",
   "engines": {
