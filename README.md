@@ -1,13 +1,21 @@
 # Slurm Connect (VS Code extension)
 
-This extension helps users allocate Slurm resources on a cluster and connect VS Code Remote-SSH through a compute node. It discovers partitions (and optionally QoS/accounts), builds the `RemoteCommand` for a proxy script, writes a Slurm Connect SSH include file, installs a small Include block (with a note) in your SSH config, and optionally connects right away.
+This extension helps users allocate Slurm resources on a cluster and connect VS Code Remote-SSH through a compute node.
+
+Key features:
+- One-click discovery of partitions, QoS/accounts (optional), modules, and free-resource hints.
+- Persistent or ephemeral sessions, with reconnect to existing allocations.
+- Automatic SSH include management for Remote-SSH (no manual host entries).
+- Resource validation hints and profile support for repeatable runs.
+- Module picker with paste, chips, and clear-all.
+- Optional remote folder open + window targeting.
 
 ## Requirements
 - VS Code with **Remote - SSH** installed.
 - SSH authentication configured for the cluster (SSH config or agent; agent forwarding recommended).
 - Python 3.9+ available on the login nodes.
-- [`vscode-shell-proxy.py`](https://github.com/xangma/vscode-shell-proxy/blob/main/vscode-shell-proxy.py) available somewhere on the login nodes.
-- ssh-agent running with your key added (recommended for encrypted keys and non-interactive SSH).
+- [`vscode-shell-proxy.py`](https://github.com/xangma/vscode-shell-proxy/blob/main/vscode-shell-proxy.py) available somewhere on the login nodes (default path is `/usr/bin/vscode-shell-proxy.py`).
+- ssh-agent with your key loaded is recommended for encrypted keys, but not required.
 
 ## Quick start (users)
 1. Install the extension.
@@ -29,7 +37,7 @@ The extension will query the login host, write a Slurm Connect SSH include file,
 - Module selection supports chips, clear-all, and pasting multiple module names (space/newline separated), including `module load ...` lines.
 - Advanced settings include a **Reset advanced to defaults** button to restore command/SSH settings.
 - When connected to a persistent session, a **Cancel job (disconnects)** button appears to terminate the allocation (cancel is only available from an active remote session).
-- Existing sessions show connected client counts and, when idle, an estimated cancel timeout (from the session's saved timeout).
+- Existing sessions show connected client counts (per window) and, when idle, an estimated cancel timeout (from the session's saved timeout).
 
 ### SSH config hosts (optional)
 The **Login host** field can read your SSH config and list explicit `Host` entries (non-wildcard). Selecting one resolves
@@ -73,7 +81,7 @@ state and do not change your VS Code settings. Loading a profile fills the form 
 your last edits instead of reapplying the active profile.
 
 ### SSH authentication for cluster info
-Cluster info queries use non-interactive SSH (`BatchMode=yes`). If your key is encrypted, you can either use ssh-agent or enter the passphrase in a terminal when prompted.
+Cluster info queries use non-interactive SSH (`BatchMode=yes`). If your key is encrypted, you can either use ssh-agent or enter the passphrase in a terminal when prompted. ssh-agent is recommended but optional.
 
 What is ssh-agent?
 - `ssh-agent` is a background service that securely stores your SSH keys in memory after you unlock them once.
@@ -131,6 +139,8 @@ Settings:
 - `slurmConnect.sessionKey`: Optional identifier for reuse; defaults to the SSH alias.
 - `slurmConnect.sessionIdleTimeoutSeconds`: Seconds of idle time before cancelling (0 = never).
 - `slurmConnect.sessionStateDir`: Optional base directory for session state (default handled by the proxy).
+
+Note: The idle timeout is saved when the allocation is created; changing the setting later does not affect existing sessions.
 
 In persistent mode, the proxy submits an allocation via `sbatch`, reuses it on reconnect, and launches each
 VS Code connection as a job step (`srun --overlap`). When no session markers remain, the idle timer starts and
