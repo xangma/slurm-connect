@@ -5793,7 +5793,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     :root { color-scheme: light dark; }
     body {
       font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
-      padding: 12px 12px 96px;
+      padding: 12px 12px 12px;
       color: var(--vscode-foreground);
       background: var(--vscode-editor-background);
     }
@@ -5926,7 +5926,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .override-key { color: var(--vscode-descriptionForeground); }
     .override-value { color: var(--vscode-foreground); word-break: break-word; }
     .action-bar {
-      position: sticky;
+      position: fixed;
+      left: 0;
+      right: 0;
       bottom: 0;
       z-index: 10;
       display: flex;
@@ -5936,6 +5938,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       padding: 10px 12px;
       border-top: 1px solid var(--vscode-panel-border, var(--vscode-input-border));
       background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+      box-sizing: border-box;
     }
     .action-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
     .action-options { display: flex; align-items: center; gap: 6px; }
@@ -6972,13 +6975,22 @@ function getWebviewHtml(webview: vscode.Webview): string {
       button.disabled = disabled;
       status.textContent = statusText;
       if (openInNewWindowWrap) {
-        openInNewWindowWrap.classList.toggle('hidden', connectionState !== 'idle');
+        openInNewWindowWrap.style.display = connectionState === 'idle' ? 'flex' : 'none';
       }
       if (cancelOnlyButton) {
         const canCancelOnly = connectionState === 'connected' && connectedSessionMode === 'persistent';
         cancelOnlyButton.classList.toggle('hidden', !canCancelOnly);
         cancelOnlyButton.disabled = !canCancelOnly || disabled;
       }
+      updateActionBarSpacer();
+    }
+
+    function updateActionBarSpacer() {
+      const bar = document.querySelector('.action-bar');
+      if (!bar) return;
+      const height = Math.ceil(bar.getBoundingClientRect().height);
+      const spacer = Math.max(96, height + 24);
+      document.body.style.paddingBottom = spacer + 'px';
     }
 
 
@@ -8621,6 +8633,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         applyMessageState(message);
         updateProfileSummary(getSelectedProfileName());
         suppressAutoSave = false;
+        updateActionBarSpacer();
       } else if (message.command === 'clusterInfo') {
         setClusterInfoLoading(false);
         setClusterInfoFetchedAt(message.fetchedAt || new Date());
@@ -8662,6 +8675,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         connectedSessionMode = message.sessionMode || '';
         setConnectState(message.state || 'idle');
       }
+    });
+
+    window.addEventListener('resize', () => {
+      updateActionBarSpacer();
     });
 
     const pickIdentityButton = document.getElementById('pickIdentityFile');
