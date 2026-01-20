@@ -2,6 +2,39 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
+### Added
+- Pre-SSH auth command hook with an optional check command to support interactive 2FA flows before SSH queries and Remote-SSH connects.
+- Advanced setting field for additional SSH options (one per line) in the Slurm Connect view.
+- Auto-install bundled proxy script on connect (default on).
+- Bundled `vscode-proxy.py` implementation for the Remote-SSH Slurm stdio/TCP proxy.
+- Persistent session support in the bundled proxy (sbatch allocation reuse + idle cancel).
+### Changed
+- Default proxy command now points at the bundled proxy script under `~/.slurm-connect/vscode-proxy.py`.
+- Proxy command and proxy args are no longer shown in the UI (advanced overrides remain in settings.json).
+- Existing proxy command/args overrides are reset to defaults on upgrade.
+- Auto-install of the bundled proxy script now runs on connect instead of on Get cluster info.
+### Fixed
+- Profile summary rendering no longer crashes when older profiles omit newer fields.
+- Cluster info errors now clear after a successful refresh.
+- Bundled proxy now resolves `workgroup` via the login shell when it is not on PATH, and falls back to direct Slurm commands when `workgroup` is unavailable.
+- Bundled proxy now recreates persistent sessions when the saved job id is invalid.
+- Bundled proxy now skips `srun --pty` when no TTY is available to avoid Slurm warnings.
+- Bundled proxy now bootstraps XDG runtime dirs, improves localhost binding rewrites, and enables reuse_port for the local proxy.
+- Persistent sessions now wait for RUNNING, pin to a chosen node, and clean up stale client markers.
+- Bundled proxy now rewrites exec-server `listeningOn==...==` lines correctly and filters marker echoes to avoid handshake hangs.
+- Bundled proxy now detects `listeningOn` lines on stderr when stdout is redirected, preventing missing-port hangs.
+- Bundled proxy now uses the legacy listeningOn regex from the upstream script to match decorated port lines.
+- Bundled proxy stdin rewrite logic now matches the legacy proxy’s conservative patterns to avoid mangling Remote-SSH bootstrap scripts.
+- Bundled proxy now uses blocking stdin reads to align with Remote-SSH bootstrap timing and avoid duplicate subshell detection output.
+- Bundled proxy now writes persistent session job.json files in the legacy format (compact JSON + args/heartbeat fields).
+- Bundled proxy now places the session lock file under the namespaced session directory (sessions/$USER/<key>/lock) to match the legacy layout.
+- Bundled proxy no longer writes a default log file; logging is disabled unless --log-file is provided.
+- Slurm Connect logs now shorten the embedded proxy base64 payload in RemoteCommand (keeps first/last chars) to avoid huge logs.
+- Bundled proxy now bypasses Slurm allocation for exec-server bootstraps in ephemeral mode using a short-lived lock keyed by the session/alias to avoid interfering with Remote-SSH stdin.
+- Bundled proxy now respects loopback hosts in exec-server `listeningOn` output to avoid connect hangs.
+- Local Slurm Connect logs are now capped in size and truncated when they exceed 5 MB.
+### Docs
+- Split the README into shorter docs under `docs/` (usage, cluster info, SSH/auth, persistent sessions, settings reference).
 
 ## 0.4.4 - 2026-01-18
 ### Added

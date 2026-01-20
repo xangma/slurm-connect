@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as crypto from 'crypto';
 import * as jsonc from 'jsonc-parser';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -35,6 +36,9 @@ interface SlurmConnectConfig {
   accountCommand: string;
   user: string;
   identityFile: string;
+  preSshCommand: string;
+  preSshCheckCommand: string;
+  autoInstallProxyScriptOnClusterInfo: boolean;
   forwardAgent: boolean;
   requestTTY: boolean;
   moduleLoad: string;
@@ -103,6 +107,7 @@ interface ResolvedSshHostInfo {
 let outputChannel: vscode.OutputChannel | undefined;
 let logFilePath: string | undefined;
 let extensionStoragePath: string | undefined;
+let extensionRootPath: string | undefined;
 let extensionGlobalState: vscode.Memento | undefined;
 let extensionWorkspaceState: vscode.Memento | undefined;
 let activeWebview: vscode.Webview | undefined;
@@ -112,6 +117,11 @@ let lastConnectionSessionKey: string | undefined;
 let lastConnectionSessionMode: SessionMode | undefined;
 let lastConnectionLoginHost: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
+let preSshCommandInFlight: Promise<void> | undefined;
+let logWriteQueue: Promise<void> = Promise.resolve();
+
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+const LOG_TRUNCATE_KEEP_BYTES = 4 * 1024 * 1024;
 let clusterInfoRequestInFlight = false;
 let sshHostsRequestInFlight = false;
 const SETTINGS_SECTION = 'slurmConnect';
@@ -124,6 +134,8 @@ const LEGACY_PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
 const LEGACY_ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
 const LEGACY_CLUSTER_INFO_CACHE_KEY = 'sciamaSlurm.clusterInfoCache';
 const DEFAULT_SESSION_STATE_DIR = '~/.slurm-connect';
+const DEFAULT_PROXY_SCRIPT_INSTALL_PATH = '~/.slurm-connect/vscode-proxy.py';
+const PROXY_OVERRIDE_RESET_KEY = 'slurmConnect.proxyOverrideReset';
 const CONFIG_KEYS = [
   'loginHosts',
   'loginHostsCommand',
@@ -135,6 +147,9 @@ const CONFIG_KEYS = [
   'accountCommand',
   'user',
   'identityFile',
+  'preSshCommand',
+  'preSshCheckCommand',
+  'autoInstallProxyScriptOnClusterInfo',
   'forwardAgent',
   'requestTTY',
   'moduleLoad',
@@ -172,9 +187,9 @@ const CLUSTER_SETTING_KEYS = [
   'accountCommand',
   'user',
   'identityFile',
+  'preSshCommand',
+  'preSshCheckCommand',
   'moduleLoad',
-  'proxyCommand',
-  'proxyArgs',
   'extraSallocArgs',
   'sessionMode',
   'sessionKey',
@@ -194,12 +209,14 @@ type ClusterSettingKey = typeof CLUSTER_SETTING_KEYS[number];
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionStoragePath = context.globalStorageUri.fsPath;
+  extensionRootPath = context.extensionUri.fsPath;
   extensionGlobalState = context.globalState;
   extensionWorkspaceState = context.workspaceState;
   await migrateLegacyState();
   await migrateLegacySettings();
   await migrateLegacyModuleCommands();
   await migrateClusterSettingsToCache();
+  await resetProxyOverridesToDefaults();
   syncConnectionStateFromEnvironment();
   const disposable = vscode.commands.registerCommand('slurmConnect.connect', () => {
     void connectCommand();
@@ -429,6 +446,37 @@ function sanitizeModuleCache(cache?: ClusterUiCache): { next: ClusterUiCache; ch
   return { next, changed };
 }
 
+function stripProxyOverridesFromCache(cache?: ClusterUiCache): { next: ClusterUiCache; changed: boolean } {
+  if (!cache) {
+    return { next: {}, changed: false };
+  }
+  const next: ClusterUiCache = { ...cache };
+  let changed = false;
+  if (Object.prototype.hasOwnProperty.call(next, 'proxyCommand')) {
+    delete (next as Partial<UiValues>).proxyCommand;
+    changed = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(next, 'proxyArgs')) {
+    delete (next as Partial<UiValues>).proxyArgs;
+    changed = true;
+  }
+  return { next, changed };
+}
+
+function stripProxyOverridesFromProfile(values: UiValues): { next: UiValues; changed: boolean } {
+  const next = { ...values };
+  let changed = false;
+  if (Object.prototype.hasOwnProperty.call(next, 'proxyCommand')) {
+    delete (next as Partial<UiValues>).proxyCommand;
+    changed = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(next, 'proxyArgs')) {
+    delete (next as Partial<UiValues>).proxyArgs;
+    changed = true;
+  }
+  return { next: next as UiValues, changed };
+}
+
 function sanitizeProfileModuleCommands(values: UiValues): { next: UiValues; changed: boolean } {
   let changed = false;
   const next = { ...values };
@@ -498,10 +546,67 @@ async function migrateLegacyModuleCommands(): Promise<void> {
   }
 }
 
+async function resetProxyOverridesToDefaults(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
+  const folders = vscode.workspace.workspaceFolders || [];
+  const resetKeys = ['proxyCommand', 'proxyArgs'];
+  const resetConfig = async (
+    targetCfg: vscode.WorkspaceConfiguration,
+    target: vscode.ConfigurationTarget
+  ): Promise<void> => {
+    for (const key of resetKeys) {
+      try {
+        await targetCfg.update(key, undefined, target);
+      } catch {
+        // Ignore reset failures.
+      }
+    }
+  };
+
+  if (extensionGlobalState && !extensionGlobalState.get<boolean>(PROXY_OVERRIDE_RESET_KEY)) {
+    await resetConfig(cfg, vscode.ConfigurationTarget.Global);
+    const current = getClusterUiCache(extensionGlobalState);
+    const { next, changed } = stripProxyOverridesFromCache(current);
+    if (changed) {
+      await extensionGlobalState.update(CLUSTER_UI_CACHE_KEY, next);
+    }
+    const store = getProfileStore();
+    let storeChanged = false;
+    for (const [key, profile] of Object.entries(store)) {
+      const stripped = stripProxyOverridesFromProfile(profile.values);
+      if (stripped.changed) {
+        store[key] = {
+          ...profile,
+          values: stripped.next,
+          updatedAt: new Date().toISOString()
+        };
+        storeChanged = true;
+      }
+    }
+    if (storeChanged) {
+      await extensionGlobalState.update(PROFILE_STORE_KEY, store);
+    }
+    await extensionGlobalState.update(PROXY_OVERRIDE_RESET_KEY, true);
+  }
+
+  if (extensionWorkspaceState && !extensionWorkspaceState.get<boolean>(PROXY_OVERRIDE_RESET_KEY)) {
+    await resetConfig(cfg, vscode.ConfigurationTarget.Workspace);
+    for (const folder of folders) {
+      const folderCfg = vscode.workspace.getConfiguration(SETTINGS_SECTION, folder.uri);
+      await resetConfig(folderCfg, vscode.ConfigurationTarget.WorkspaceFolder);
+    }
+    const current = getClusterUiCache(extensionWorkspaceState);
+    const { next, changed } = stripProxyOverridesFromCache(current);
+    if (changed) {
+      await extensionWorkspaceState.update(CLUSTER_UI_CACHE_KEY, next);
+    }
+    await extensionWorkspaceState.update(PROXY_OVERRIDE_RESET_KEY, true);
+  }
+}
+
 function mapConfigValueToUi(key: ClusterSettingKey, value: unknown): string {
   switch (key) {
     case 'loginHosts':
-    case 'proxyArgs':
     case 'extraSallocArgs': {
       if (Array.isArray(value)) {
         return value.map((entry) => String(entry)).join('\n');
@@ -697,12 +802,48 @@ async function ensureLogFile(): Promise<string> {
   return filePath;
 }
 
+function enqueueLogWrite(task: () => Promise<void>): void {
+  logWriteQueue = logWriteQueue.then(task).catch(() => {
+    // Ignore logging failures to avoid breaking the main flow.
+  });
+}
+
+async function truncateLogFileIfNeeded(filePath: string): Promise<void> {
+  let stat: { size: number };
+  try {
+    stat = await fs.stat(filePath);
+  } catch {
+    return;
+  }
+  if (stat.size <= LOG_MAX_BYTES) {
+    return;
+  }
+  const keepBytes = Math.min(LOG_TRUNCATE_KEEP_BYTES, LOG_MAX_BYTES);
+  const start = Math.max(0, stat.size - keepBytes);
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(filePath, 'r');
+    const buffer = Buffer.alloc(keepBytes);
+    const { bytesRead } = await handle.read(buffer, 0, keepBytes, start);
+    const header = `--- Log truncated at ${new Date().toISOString()} (kept last ${bytesRead} bytes) ---\n`;
+    const payload = header + buffer.slice(0, bytesRead).toString('utf8');
+    await fs.writeFile(filePath, payload, 'utf8');
+  } catch {
+    // Ignore truncation failures.
+  } finally {
+    try {
+      await handle?.close();
+    } catch {
+      // Ignore close failures.
+    }
+  }
+}
+
 function appendLogFile(text: string): void {
-  void (async () => {
+  enqueueLogWrite(async () => {
     const filePath = await ensureLogFile();
     await fs.appendFile(filePath, text, 'utf8');
-  })().catch(() => {
-    // Ignore logging failures to avoid breaking the main flow.
+    await truncateLogFileIfNeeded(filePath);
   });
 }
 
@@ -739,6 +880,10 @@ interface UiValues {
   accountCommand: string;
   user: string;
   identityFile: string;
+  preSshCommand: string;
+  preSshCheckCommand: string;
+  autoInstallProxyScriptOnClusterInfo: boolean;
+  additionalSshOptions: string;
   moduleLoad: string;
   moduleSelections?: string[];
   moduleCustomCommand?: string;
@@ -779,11 +924,12 @@ const CLUSTER_UI_KEYS = new Set<keyof UiValues>([
   'accountCommand',
   'user',
   'identityFile',
+  'preSshCommand',
+  'preSshCheckCommand',
+  'additionalSshOptions',
   'moduleLoad',
   'moduleSelections',
   'moduleCustomCommand',
-  'proxyCommand',
-  'proxyArgs',
   'extraSallocArgs',
   'sessionMode',
   'sessionKey',
@@ -1040,7 +1186,10 @@ function getProfileValues(name: string): UiValues | undefined {
   return store[name]?.values;
 }
 
-function normalizeWhitespace(value: string): string {
+function normalizeWhitespace(value: string | undefined | null): string {
+  if (!value) {
+    return '';
+  }
   return value.replace(/\s+/g, ' ').trim();
 }
 
@@ -1087,6 +1236,18 @@ function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOve
   }
   if (diffString(values.user, defaults.user)) add('User', values.user);
   if (diffString(values.identityFile, defaults.identityFile)) add('Identity file', values.identityFile);
+  if (diffString(values.preSshCommand, defaults.preSshCommand)) {
+    add('Pre-SSH command', values.preSshCommand);
+  }
+  if (diffString(values.preSshCheckCommand, defaults.preSshCheckCommand)) {
+    add('Pre-SSH check command', values.preSshCheckCommand);
+  }
+  if (diffString(values.additionalSshOptions, defaults.additionalSshOptions)) {
+    add('Additional SSH options', values.additionalSshOptions);
+  }
+  if (diffBool(values.autoInstallProxyScriptOnClusterInfo, defaults.autoInstallProxyScriptOnClusterInfo)) {
+    add('Auto-install proxy on connect', values.autoInstallProxyScriptOnClusterInfo ? 'Yes' : 'No');
+  }
   if (diffString(values.remoteWorkspacePath, defaults.remoteWorkspacePath)) {
     add('Remote folder', values.remoteWorkspacePath);
   }
@@ -1111,8 +1272,6 @@ function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOve
     add('Module load', moduleLoad);
   }
 
-  if (diffString(values.proxyCommand, defaults.proxyCommand)) add('Proxy command', values.proxyCommand);
-  if (diffString(values.proxyArgs, defaults.proxyArgs)) add('Proxy args', values.proxyArgs);
   if (diffString(values.extraSallocArgs, defaults.extraSallocArgs)) add('Extra salloc args', values.extraSallocArgs);
   if (diffBool(values.promptForExtraSallocArgs, defaults.promptForExtraSallocArgs)) {
     add('Prompt for extra args', values.promptForExtraSallocArgs ? 'Yes' : 'No');
@@ -1225,6 +1384,9 @@ function getConfigFromSettings(): SlurmConnectConfig {
     accountCommand: (cfg.get<string>('accountCommand') || '').trim(),
     user,
     identityFile: (cfg.get<string>('identityFile') || '').trim(),
+    preSshCommand: (cfg.get<string>('preSshCommand') || '').trim(),
+    preSshCheckCommand: (cfg.get<string>('preSshCheckCommand') || '').trim(),
+    autoInstallProxyScriptOnClusterInfo: cfg.get<boolean>('autoInstallProxyScriptOnClusterInfo', true),
     forwardAgent: cfg.get<boolean>('forwardAgent', true),
     requestTTY: cfg.get<boolean>('requestTTY', true),
     moduleLoad: (cfg.get<string>('moduleLoad') || '').trim(),
@@ -1275,6 +1437,9 @@ function getConfigDefaultsFromSettings(): SlurmConnectConfig {
     accountCommand: String(getDefault<string>('accountCommand', '') || '').trim(),
     user,
     identityFile: String(getDefault<string>('identityFile', '') || '').trim(),
+    preSshCommand: String(getDefault<string>('preSshCommand', '') || '').trim(),
+    preSshCheckCommand: String(getDefault<string>('preSshCheckCommand', '') || '').trim(),
+    autoInstallProxyScriptOnClusterInfo: Boolean(getDefault<boolean>('autoInstallProxyScriptOnClusterInfo', true)),
     forwardAgent: Boolean(getDefault<boolean>('forwardAgent', true)),
     requestTTY: Boolean(getDefault<boolean>('requestTTY', true)),
     moduleLoad: String(getDefault<string>('moduleLoad', '') || '').trim(),
@@ -1843,11 +2008,13 @@ async function connectCommand(
 
   const sessionKey = resolveSessionKey(cfg, alias.trim());
   const clientId = vscode.env.sessionId || '';
+  const installSnippet = await getProxyInstallSnippet(cfg);
   const remoteCommand = buildRemoteCommand(
     cfg,
     [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs],
     sessionKey,
-    clientId
+    clientId,
+    installSnippet
   );
   if (!remoteCommand) {
     void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
@@ -1856,7 +2023,7 @@ async function connectCommand(
 
   const hostEntry = buildHostEntry(alias.trim(), loginHost, cfg, remoteCommand);
   log.appendLine('Generated SSH host entry:');
-  log.appendLine(hostEntry);
+  log.appendLine(redactRemoteCommandForLog(hostEntry));
 
   await ensureRemoteSshSettings(cfg.sessionMode);
   await migrateStaleRemoteSshConfigIfNeeded();
@@ -1887,6 +2054,15 @@ async function connectCommand(
   }
   await delay(300);
   await refreshRemoteSshHosts();
+
+  try {
+    await ensurePreSshCommand(cfg, `Remote-SSH connect to ${alias.trim()}`);
+  } catch (error) {
+    const message = `Pre-SSH command failed: ${formatError(error)}`;
+    log.appendLine(message);
+    void vscode.window.showErrorMessage(message);
+    return false;
+  }
 
   const connected = await connectToHost(
     alias.trim(),
@@ -2535,7 +2711,10 @@ const CLUSTER_MODULES_END = '__SC_MODULES_END__';
 const CLUSTER_SESSIONS_START = '__SC_SESSIONS_START__';
 const CLUSTER_SESSIONS_END = '__SC_SESSIONS_END__';
 
-function buildCombinedClusterInfoCommand(commands: string[], sessionsCommand?: string): string {
+function buildCombinedClusterInfoCommand(
+  commands: string[],
+  sessionsCommand?: string
+): string {
   const encodedCommands = commands.map((command) => Buffer.from(command, 'utf8').toString('base64'));
   const commandArray = encodedCommands.map((encoded) => `'${encoded}'`).join(' ');
   const script = [
@@ -2979,6 +3158,112 @@ async function runSshCommandInTerminal(
   return stdout.trim();
 }
 
+async function runPreSshCommandInTerminal(command: string): Promise<void> {
+  const { dirPath, statusPath } = await createTerminalSshRunFiles();
+  const isWindows = process.platform === 'win32';
+  const shellCommand = isWindows
+    ? (() => {
+        const psScript = [
+          "$ErrorActionPreference = 'Continue'",
+          `$statusPath = ${quotePowerShellString(statusPath)}`,
+          '$exitCode = 1',
+          'try {',
+          `  cmd /c ${quotePowerShellString(command)}`,
+          '  $exitCode = $LASTEXITCODE',
+          '} catch {',
+          '  $exitCode = 1',
+          '}',
+          '$exitCode | Out-File -FilePath $statusPath -Encoding ascii -NoNewline'
+        ].join('; ');
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+        return `powershell -NoProfile -EncodedCommand ${encoded}`;
+      })()
+    : `${command}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+
+  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect Auth' });
+  terminal.show(true);
+  terminal.sendText(shellCommand, true);
+  void vscode.window.showInformationMessage('Complete the pre-SSH authentication in the terminal.');
+
+  let exitCode = NaN;
+  try {
+    await waitForFile(statusPath, 500);
+    const statusText = await fs.readFile(statusPath, 'utf8');
+    exitCode = Number(statusText.trim());
+  } finally {
+    try {
+      await fs.rm(dirPath, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+
+  if (!Number.isFinite(exitCode) || exitCode !== 0) {
+    throw new Error('Pre-SSH command failed in the terminal. Check the terminal output for details.');
+  }
+  terminal.dispose();
+}
+
+async function runPreSshCheckCommand(command: string): Promise<boolean> {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const isWindows = process.platform === 'win32';
+  const shell = isWindows ? 'cmd' : 'sh';
+  const args = isWindows ? ['/c', trimmed] : ['-lc', trimmed];
+  try {
+    await execFileAsync(shell, args);
+    return true;
+  } catch (error) {
+    const log = getOutputChannel();
+    log.appendLine(`Pre-SSH check command failed: ${normalizeSshErrorText(error)}`);
+    return false;
+  }
+}
+
+async function ensurePreSshCommand(cfg: SlurmConnectConfig, reason: string): Promise<void> {
+  const command = (cfg.preSshCommand || '').trim();
+  if (!command) {
+    return;
+  }
+  if (preSshCommandInFlight) {
+    await preSshCommandInFlight;
+  }
+  const log = getOutputChannel();
+  preSshCommandInFlight = (async () => {
+    log.appendLine(`Running pre-SSH command (${reason}).`);
+    try {
+      const checkCommand = (cfg.preSshCheckCommand || '').trim();
+      if (checkCommand) {
+        log.appendLine('Running pre-SSH check command.');
+        const ready = await runPreSshCheckCommand(checkCommand);
+        if (ready) {
+          log.appendLine('Pre-SSH check succeeded; skipping pre-SSH command.');
+          return;
+        }
+        log.appendLine('Pre-SSH check did not pass; running pre-SSH command.');
+      }
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Waiting for pre-SSH authentication',
+          cancellable: false
+        },
+        async () => await runPreSshCommandInTerminal(command)
+      );
+    } catch (error) {
+      log.appendLine(`Pre-SSH command failed: ${formatError(error)}`);
+      throw new Error('Pre-SSH command failed. Check the terminal output for details.');
+    }
+  })();
+  try {
+    await preSshCommandInFlight;
+  } finally {
+    preSshCommandInFlight = undefined;
+  }
+}
+
 async function getPublicKeyFingerprint(identityPath: string): Promise<string | undefined> {
   if (!identityPath) {
     return undefined;
@@ -3323,6 +3608,7 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
 }
 
 async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
+  await ensurePreSshCommand(cfg, `SSH query to ${host}`);
   const args = buildSshArgs(host, cfg, command, { batchMode: true });
 
   try {
@@ -4343,10 +4629,13 @@ async function cancelPersistentSessionJob(
 
 function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string, clientId?: string): string[] {
   const args = cfg.proxyArgs.filter(Boolean);
+  const key = (sessionKey || cfg.sessionKey || '').trim();
   if (cfg.sessionMode !== 'persistent') {
+    if (key) {
+      args.push(`--session-key=${key}`);
+    }
     return args;
   }
-  const key = (sessionKey || cfg.sessionKey || '').trim();
   const sessionArgs = ['--session-mode=persistent'];
   if (key) {
     sessionArgs.push(`--session-key=${key}`);
@@ -4437,7 +4726,8 @@ function buildRemoteCommand(
   cfg: SlurmConnectConfig,
   sallocArgs: string[],
   sessionKey?: string,
-  clientId?: string
+  clientId?: string,
+  installSnippet?: string
 ): string {
   const proxyTokens = splitShellArgs(cfg.proxyCommand);
   if (proxyTokens.length === 0) {
@@ -4453,7 +4743,13 @@ function buildRemoteCommand(
   if (!baseCommand) {
     return '';
   }
-  return baseCommand;
+  if (!installSnippet) {
+    return baseCommand;
+  }
+  const encoded = Buffer.from(installSnippet, 'utf8').toString('base64');
+  const installScript = `echo ${encoded} | base64 -d | bash`;
+  const wrapped = `${installScript}; ${baseCommand}`;
+  return joinShellCommand(['bash', '-lc', wrapped]);
 }
 
 function buildDefaultAlias(
@@ -5601,6 +5897,10 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     accountCommand: fromCache('accountCommand', cfg.accountCommand || ''),
     user: fromCache('user', cfg.user || ''),
     identityFile: fromCache('identityFile', cfg.identityFile || ''),
+    preSshCommand: fromCache('preSshCommand', cfg.preSshCommand || ''),
+    preSshCheckCommand: fromCache('preSshCheckCommand', cfg.preSshCheckCommand || ''),
+    autoInstallProxyScriptOnClusterInfo: cfg.autoInstallProxyScriptOnClusterInfo,
+    additionalSshOptions: formatAdditionalSshOptions(cfg.additionalSshOptions),
     moduleLoad: fromCache('moduleLoad', cfg.moduleLoad || ''),
     moduleSelections: getCachedUiValue(cache, 'moduleSelections'),
     moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
@@ -5647,7 +5947,9 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
     ['sessionIdleTimeoutSeconds', parseNonNegativeNumberInput(values.sessionIdleTimeoutSeconds)],
     ['sessionStateDir', values.sessionStateDir.trim()],
     ['filterFreeResources', Boolean(values.filterFreeResources)],
+    ['autoInstallProxyScriptOnClusterInfo', Boolean(values.autoInstallProxyScriptOnClusterInfo)],
     ['sshHostPrefix', values.sshHostPrefix.trim()],
+    ['additionalSshOptions', parseAdditionalSshOptionsInput(values.additionalSshOptions)],
     ['forwardAgent', Boolean(values.forwardAgent)],
     ['requestTTY', Boolean(values.requestTTY)],
     ['openInNewWindow', Boolean(values.openInNewWindow)],
@@ -5676,6 +5978,8 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
   if (has('accountCommand')) overrides.accountCommand = String(values.accountCommand ?? '').trim();
   if (has('user')) overrides.user = String(values.user ?? '').trim();
   if (has('identityFile')) overrides.identityFile = String(values.identityFile ?? '').trim();
+  if (has('preSshCommand')) overrides.preSshCommand = String(values.preSshCommand ?? '').trim();
+  if (has('preSshCheckCommand')) overrides.preSshCheckCommand = String(values.preSshCheckCommand ?? '').trim();
   if (has('moduleLoad')) {
     overrides.moduleLoad = String(values.moduleLoad ?? '').trim();
   } else {
@@ -5687,8 +5991,6 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
       overrides.moduleLoad = `module load ${selections.join(' ')}`;
     }
   }
-  if (has('proxyCommand')) overrides.proxyCommand = String(values.proxyCommand ?? '').trim();
-  if (has('proxyArgs')) overrides.proxyArgs = parseListInput(String(values.proxyArgs ?? ''));
   if (has('extraSallocArgs')) overrides.extraSallocArgs = splitShellArgs(String(values.extraSallocArgs ?? ''));
   if (has('sessionMode')) overrides.sessionMode = normalizeSessionMode(String(values.sessionMode ?? ''));
   if (has('sessionKey')) overrides.sessionKey = String(values.sessionKey ?? '').trim();
@@ -5730,6 +6032,179 @@ function splitArgs(input: string): string[] {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function redactRemoteCommandForLog(entry: string): string {
+  const trimmed = entry.replace(/\r?\n$/, '');
+  const lines = trimmed.split(/\r?\n/).map((line) => {
+    const match = /^(\s*RemoteCommand\s+).+$/.exec(line);
+    if (!match) {
+      return line;
+    }
+    const command = line.slice(match[1].length);
+    const redacted = command.replace(
+      /echo\s+([A-Za-z0-9+/=]{20,})\s+\|\s*base64\s+-d/g,
+      (_full, b64) => {
+        if (b64.length <= 25) {
+          return `echo ${b64} | base64 -d`;
+        }
+        const head = b64.slice(0, 10);
+        const tail = b64.slice(-10);
+        return `echo ${head}...${tail} | base64 -d`;
+      }
+    );
+    return `${match[1]}${redacted}`;
+  });
+  return `${lines.join('\n')}\n`;
+}
+
+function formatAdditionalSshOptions(options: Record<string, string> | undefined): string {
+  if (!options || typeof options !== 'object') {
+    return '';
+  }
+  const lines: string[] = [];
+  for (const [key, rawValue] of Object.entries(options)) {
+    const name = String(key || '').trim();
+    const value = String(rawValue ?? '').trim();
+    if (!name || !value) {
+      continue;
+    }
+    lines.push(`${name} ${value}`);
+  }
+  return lines.join('\n');
+}
+
+function parseAdditionalSshOptionsInput(input: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const lines = String(input || '').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+    const match = /^(\S+)\s+(.+)$/.exec(trimmed);
+    if (!match) {
+      continue;
+    }
+    const key = match[1];
+    const value = match[2].trim();
+    if (!value) {
+      continue;
+    }
+    result[key] = value;
+  }
+  return result;
+}
+
+interface BundledProxyScript {
+  base64: string;
+  sha256: string;
+}
+
+interface ProxyInstallPlan extends BundledProxyScript {
+  installPath: string;
+}
+
+let bundledProxyScriptCache: BundledProxyScript | undefined;
+
+async function getBundledProxyScript(): Promise<BundledProxyScript | undefined> {
+  if (bundledProxyScriptCache) {
+    return bundledProxyScriptCache;
+  }
+  if (!extensionRootPath) {
+    return undefined;
+  }
+  const filePath = path.join(extensionRootPath, 'media', 'vscode-proxy.py');
+  try {
+    const data = await fs.readFile(filePath);
+    const sha256 = crypto.createHash('sha256').update(data).digest('hex');
+    const base64 = data.toString('base64');
+    bundledProxyScriptCache = { base64, sha256 };
+    return bundledProxyScriptCache;
+  } catch (error) {
+    getOutputChannel().appendLine(`Failed to read bundled proxy script: ${formatError(error)}`);
+    return undefined;
+  }
+}
+
+function normalizeShellHomePath(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === '~') {
+    return '$HOME';
+  }
+  if (trimmed.startsWith('~/')) {
+    return `$HOME/${trimmed.slice(2)}`;
+  }
+  return trimmed;
+}
+
+function buildProxyInstallSnippet(plan: ProxyInstallPlan): string {
+  const target = normalizeShellHomePath(plan.installPath);
+  const targetEscaped = target.replace(/"/g, '\\"');
+  const expected = plan.sha256;
+  const chunks: string[] = [];
+  const chunkSize = 76;
+  for (let i = 0; i < plan.base64.length; i += chunkSize) {
+    chunks.push(plan.base64.slice(i, i + chunkSize));
+  }
+  const hashSnippet = [
+    'import hashlib,sys',
+    'path=sys.argv[1]',
+    'try:',
+    '    data=open(path,"rb").read()',
+    'except Exception:',
+    '    sys.exit(1)',
+    'print(hashlib.sha256(data).hexdigest())'
+  ].join('\n');
+  const installSnippet = [
+    `target="${targetEscaped}"`,
+    `expected="${expected}"`,
+    'current=""',
+    'if [ -f "$target" ]; then',
+    '  current=$(python - "$target" 2>/dev/null <<\'PY\'',
+    hashSnippet,
+    'PY',
+    '  )',
+    'fi',
+    'if [ "$current" != "$expected" ]; then',
+    '  umask 077',
+    '  mkdir -p "$(dirname "$target")"',
+    '  python - "$target" <<\'PY\'',
+    'import base64,os,sys',
+    'path=sys.argv[1]',
+    'data=base64.b64decode("".join([',
+    ...chunks.map((chunk) => `    "${chunk}",`),
+    ']))',
+    'tmp=path + ".tmp"',
+    'with open(tmp,"wb") as f:',
+    '    f.write(data)',
+    'os.chmod(tmp,0o700)',
+    'os.replace(tmp,path)',
+    'PY',
+    '  current=$(python - "$target" 2>/dev/null <<\'PY\'',
+    hashSnippet,
+    'PY',
+    '  )',
+    '  if [ "$current" != "$expected" ]; then',
+    '    echo "Slurm Connect: proxy script hash mismatch after install" >&2',
+    '  fi',
+    'fi'
+  ];
+  return installSnippet.join('\n');
+}
+
+async function getProxyInstallSnippet(cfg: SlurmConnectConfig): Promise<string | undefined> {
+  if (!cfg.autoInstallProxyScriptOnClusterInfo) {
+    return undefined;
+  }
+  const bundled = await getBundledProxyScript();
+  if (!bundled) {
+    return undefined;
+  }
+  return buildProxyInstallSnippet({
+    ...bundled,
+    installPath: DEFAULT_PROXY_SCRIPT_INSTALL_PATH
+  });
 }
 
 async function waitForRemoteConnectionOrTimeout(timeoutMs: number, pollMs: number): Promise<boolean> {
@@ -5829,9 +6304,11 @@ function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
     accountCommand: values.accountCommand.trim(),
     user: values.user.trim(),
     identityFile: values.identityFile.trim(),
+    preSshCommand: values.preSshCommand.trim(),
+    preSshCheckCommand: values.preSshCheckCommand.trim(),
+    autoInstallProxyScriptOnClusterInfo: Boolean(values.autoInstallProxyScriptOnClusterInfo),
+    additionalSshOptions: parseAdditionalSshOptionsInput(values.additionalSshOptions),
     moduleLoad: resolvedModuleLoad,
-    proxyCommand: values.proxyCommand.trim(),
-    proxyArgs: parseListInput(values.proxyArgs),
     extraSallocArgs: splitShellArgs(values.extraSallocArgs),
     promptForExtraSallocArgs: Boolean(values.promptForExtraSallocArgs),
     sessionMode: normalizeSessionMode(values.sessionMode),
@@ -6377,10 +6854,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="qosCommand" type="text" />
     <label for="accountCommand">Account command (optional)</label>
     <input id="accountCommand" type="text" />
-    <label for="proxyCommand">Proxy command</label>
-    <input id="proxyCommand" type="text" />
-    <label for="proxyArgs">Proxy args (space or newline separated)</label>
-    <textarea id="proxyArgs" rows="2"></textarea>
     <label for="extraSallocArgs">Extra salloc args</label>
     <textarea id="extraSallocArgs" rows="2"></textarea>
     <div class="checkbox">
@@ -6404,6 +6877,16 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="temporarySshConfigPath" type="text" />
     <label for="sshQueryConfigPath">SSH query config path</label>
     <input id="sshQueryConfigPath" type="text" />
+    <label for="preSshCommand">Pre-SSH auth command (optional)</label>
+    <input id="preSshCommand" type="text" placeholder="" />
+    <label for="preSshCheckCommand">Pre-SSH check command (optional)</label>
+    <input id="preSshCheckCommand" type="text" placeholder="" />
+    <div class="checkbox">
+      <input id="autoInstallProxyScriptOnClusterInfo" type="checkbox" />
+      <label for="autoInstallProxyScriptOnClusterInfo">Auto-install bundled proxy script on connect</label>
+    </div>
+    <label for="additionalSshOptions">Additional SSH options (one per line)</label>
+    <textarea id="additionalSshOptions" rows="3" placeholder=""></textarea>
     <div class="checkbox">
       <input id="forwardAgent" type="checkbox" />
       <label for="forwardAgent">Forward agent</label>
@@ -6631,14 +7114,16 @@ function getWebviewHtml(webview: vscode.Webview): string {
       set('partitionCommand', defaults.partitionCommand);
       set('qosCommand', defaults.qosCommand);
       set('accountCommand', defaults.accountCommand);
-      set('proxyCommand', defaults.proxyCommand);
-      set('proxyArgs', defaults.proxyArgs);
       set('extraSallocArgs', defaults.extraSallocArgs);
       set('promptForExtraSallocArgs', defaults.promptForExtraSallocArgs);
       set('sessionMode', defaults.sessionMode);
       set('sessionKey', defaults.sessionKey);
       set('sessionIdleTimeoutSeconds', defaults.sessionIdleTimeoutSeconds);
       set('sessionStateDir', defaults.sessionStateDir);
+      set('preSshCommand', defaults.preSshCommand);
+      set('preSshCheckCommand', defaults.preSshCheckCommand);
+      set('autoInstallProxyScriptOnClusterInfo', defaults.autoInstallProxyScriptOnClusterInfo);
+      set('additionalSshOptions', defaults.additionalSshOptions);
       set('sshHostPrefix', defaults.sshHostPrefix);
       set('temporarySshConfigPath', defaults.temporarySshConfigPath);
       set('sshQueryConfigPath', defaults.sshQueryConfigPath);
@@ -8515,6 +9000,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         setResourceDisabled(false);
         return;
       }
+      setStatus('', false);
       setResourceDisabled(false);
       const resolved = resolvePartitionOptions(info);
       const partitionOptions = resolved.partitions.map((partition) => ({
@@ -8577,6 +9063,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         accountCommand: getValue('accountCommand'),
         user: getValue('user'),
         identityFile: getValue('identityFile'),
+        preSshCommand: getValue('preSshCommand'),
+        preSshCheckCommand: getValue('preSshCheckCommand'),
+        autoInstallProxyScriptOnClusterInfo: getValue('autoInstallProxyScriptOnClusterInfo'),
+        additionalSshOptions: getValue('additionalSshOptions'),
         moduleLoad: getValue('moduleLoad'),
         moduleSelections: selectedModules.slice(),
         moduleCustomCommand: customModuleCommand,
@@ -8825,6 +9315,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     document.getElementById('getClusterInfo').addEventListener('click', () => {
+      setStatus('', false);
       setClusterInfoLoading(true);
       vscode.postMessage({
         command: 'getClusterInfo',

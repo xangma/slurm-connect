@@ -99,6 +99,21 @@
           "default": "",
           "description": "Optional SSH identity file to include in generated host entries and used for resource queries."
         },
+        "slurmConnect.preSshCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional local command to run before SSH queries and Remote-SSH connections (e.g. step ssh login ...)."
+        },
+        "slurmConnect.preSshCheckCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional local command used to determine whether pre-SSH authentication is still valid (exit 0 = skip pre-SSH command)."
+        },
+        "slurmConnect.autoInstallProxyScriptOnClusterInfo": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-install/update the bundled proxy script on the login host when connecting."
+        },
         "slurmConnect.forwardAgent": {
           "type": "boolean",
           "default": true,
@@ -116,8 +131,8 @@
         },
         "slurmConnect.proxyCommand": {
           "type": "string",
-          "default": "python /usr/bin/vscode-shell-proxy.py",
-          "description": "Command that launches the Slurm proxy script on the remote host."
+          "default": "python ~/.slurm-connect/vscode-proxy.py",
+          "description": "Advanced: Command that launches the Slurm proxy script on the remote host (not shown in the UI)."
         },
         "slurmConnect.proxyArgs": {
           "type": "array",

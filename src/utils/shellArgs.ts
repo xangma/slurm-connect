@@ -6,7 +6,7 @@ export function quoteShellArg(value: string): string {
   if (value === '') {
     return "''";
   }
-  if (/^[A-Za-z0-9_./:@%+=-]+$/.test(value)) {
+  if (/^[A-Za-z0-9_./:@%+=~\-]+$/.test(value)) {
     return value;
   }
   return "'" + value.replace(/'/g, "'\\''") + "'";
