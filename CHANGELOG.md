@@ -41,6 +41,10 @@ _No unreleased changes._
 ### Docs
 - Split the README into shorter docs under `docs/` (usage, cluster info, SSH/auth, persistent sessions, settings reference).
 
+## 0.5.1 - 2026-01-20
+### Changed
+- Profile cards now collapse the "Other saved settings" list by default.
+
 ## 0.4.4 - 2026-01-18
 ### Added
 - Sticky action bar with Connect/status and cluster info timestamp.

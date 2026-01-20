@@ -6503,10 +6503,20 @@ function getWebviewHtml(webview: vscode.Webview): string {
       margin: 8px 0;
     }
     .profile-overrides { margin-top: 8px; }
-    .override-summary {
+    .profile-overrides summary {
       font-size: 11px;
       color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      list-style: none;
     }
+    .profile-overrides summary::-webkit-details-marker { display: none; }
+    .profile-overrides summary::before {
+      content: '▸';
+      display: inline-block;
+      margin-right: 6px;
+      transition: transform 0.15s ease;
+    }
+    .profile-overrides[open] summary::before { transform: rotate(90deg); }
     .override-list {
       display: flex;
       flex-direction: column;
@@ -6863,11 +6873,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
         </div>
       </div>
       <div id="profileSummaryTotals" class="summary-totals"></div>
-      <div id="profileOverrides" class="profile-overrides hidden">
+      <details id="profileOverrides" class="profile-overrides hidden">
         <div class="profile-divider"></div>
-        <div id="profileOverridesSummary" class="override-summary">Other saved settings</div>
+        <summary id="profileOverridesSummary">Other saved settings</summary>
         <div id="profileOverrideList" class="override-list"></div>
-      </div>
+      </details>
     </div>
     <div class="buttons" style="margin-top: 8px;">
       <button id="profileLoad">Load</button>
@@ -7749,7 +7759,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         const totalsEl = document.getElementById('profileSummaryTotals');
         if (totalsEl) totalsEl.textContent = '';
         if (overridesList) overridesList.innerHTML = '';
-        if (overridesDetails) overridesDetails.classList.add('hidden');
+        if (overridesDetails) {
+          overridesDetails.classList.add('hidden');
+          overridesDetails.open = false;
+        }
         return;
       }
 
@@ -7804,8 +7817,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (overridesDetails && overridesList && overridesSummary) {
         if (overrides.length === 0) {
           overridesDetails.classList.add('hidden');
+          overridesDetails.open = false;
         } else {
           overridesDetails.classList.remove('hidden');
+          overridesDetails.open = false;
           overridesSummary.textContent = 'Other saved settings (' + overrides.length + ')';
           overrides.forEach((entry) => {
             const row = document.createElement('div');

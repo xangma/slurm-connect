@@ -34,6 +34,7 @@ This doc covers the Slurm Connect UI and workflow. For cluster discovery details
 - **Save profile**: Saves current form values under the selected profile name (or creates a new one).
 - **Delete**: Removes the selected profile.
 Profiles include connection, resource, and advanced form values.
+- The "Other saved settings" list is collapsible; expand it to review non-default profile values.
 
 ### Advanced settings
 - **Login hosts command (optional)**: Remote command that outputs login hosts; run over SSH to discover hosts.
