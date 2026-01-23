@@ -3362,6 +3362,7 @@ function getSshAgentEnv(): { sock: string; pid: string } {
 
 type SshToolName = 'ssh' | 'ssh-add' | 'ssh-keygen';
 const sshToolPathCache: Partial<Record<SshToolName, string>> = {};
+const WINDOWS_OPENSSH_PATH = 'C:\\Windows\\System32\\OpenSSH\\ssh.exe';
 
 function stripOuterQuotes(value: string): string {
   const trimmed = value.trim();
@@ -3391,6 +3392,65 @@ async function resolveRemoteSshPath(): Promise<string | undefined> {
     return stripped;
   }
   return undefined;
+}
+
+async function listSshPathsFromWhere(): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync('where', ['ssh']);
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function isGitSshPath(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return normalized.includes('\\git\\') || normalized.includes('/git/');
+}
+
+async function resolveGitSshAgentPath(sshPath: string): Promise<string | undefined> {
+  if (!sshPath) {
+    return undefined;
+  }
+  const candidate = path.join(path.dirname(sshPath), 'ssh-agent.exe');
+  if (await fileExists(candidate)) {
+    return candidate;
+  }
+  return undefined;
+}
+
+async function ensureSshAgentEnvForCurrentSsh(): Promise<void> {
+  if (process.platform !== 'win32') {
+    return;
+  }
+  if (process.env.SSH_AUTH_SOCK) {
+    return;
+  }
+  const sshPath = await resolveSshToolPath('ssh');
+  if (!isGitSshPath(sshPath)) {
+    return;
+  }
+  const agentPath = await resolveGitSshAgentPath(sshPath);
+  if (!agentPath) {
+    return;
+  }
+  try {
+    const result = await execFileAsync(agentPath, ['-s']);
+    const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+    const sockMatch = /SSH_AUTH_SOCK=([^;\r\n]+)/.exec(output);
+    const pidMatch = /SSH_AGENT_PID=([^;\r\n]+)/.exec(output);
+    if (sockMatch && sockMatch[1]) {
+      process.env.SSH_AUTH_SOCK = sockMatch[1];
+    }
+    if (pidMatch && pidMatch[1]) {
+      process.env.SSH_AGENT_PID = pidMatch[1];
+    }
+  } catch {
+    // Ignore agent startup failures; ssh-add will surface errors.
+  }
 }
 
 async function resolveSshToolPath(tool: SshToolName): Promise<string> {
@@ -3818,6 +3878,7 @@ function looksLikeAgentUnavailable(text: string): boolean {
 
 async function getSshAgentInfo(): Promise<SshAgentInfo> {
   try {
+    await ensureSshAgentEnvForCurrentSsh();
     const sshAdd = await resolveSshToolPath('ssh-add');
     const result = await execFileAsync(sshAdd, ['-l']);
     const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
@@ -3923,6 +3984,7 @@ async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
 
 
 async function runSshAddInTerminal(identityPath: string): Promise<void> {
+  await ensureSshAgentEnvForCurrentSsh();
   const sshAdd = await resolveSshToolPath('ssh-add');
   const trimmed = identityPath.trim();
   const args = trimmed ? [trimmed] : [];
@@ -7145,8 +7207,47 @@ async function ensureLocalServerSetting(): Promise<void> {
   }
 }
 
+async function ensureRemoteSshPathOnWindows(): Promise<void> {
+  if (process.platform !== 'win32') {
+    return;
+  }
+  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
+  const configured = String(remoteCfg.get<string>('path') || '').trim();
+  if (configured) {
+    return;
+  }
+  const paths = await listSshPathsFromWhere();
+  if (paths.length === 0) {
+    return;
+  }
+  const primary = paths[0].toLowerCase();
+  const isGitSsh = primary.includes('\\git\\') || primary.includes('/git/');
+  if (!isGitSsh) {
+    return;
+  }
+  if (!(await fileExists(WINDOWS_OPENSSH_PATH))) {
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    'Remote-SSH is using Git SSH on Windows, which does not share the OpenSSH agent. Set remote.SSH.path to the Windows OpenSSH client to avoid passphrase prompts?',
+    'Set remote.SSH.path',
+    'Not Now'
+  );
+  if (choice !== 'Set remote.SSH.path') {
+    return;
+  }
+  try {
+    await remoteCfg.update('path', WINDOWS_OPENSSH_PATH, vscode.ConfigurationTarget.Global);
+  } catch (error) {
+    void vscode.window.showWarningMessage(
+      `Failed to update remote.SSH.path: ${formatError(error)}`
+    );
+  }
+}
+
 
 async function ensureRemoteSshSettings(cfg: SlurmConnectConfig): Promise<void> {
+  await ensureRemoteSshPathOnWindows();
   await ensureLocalServerSetting();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const enableRemoteCommand = remoteCfg.get<boolean>('enableRemoteCommand', false);
