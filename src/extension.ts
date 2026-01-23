@@ -2693,9 +2693,9 @@ async function fetchClusterInfoWithSessions(
   const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg);
   const log = getOutputChannel();
   const sessionsScript = buildSessionQueryScript(cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR);
-  const combinedCommand = buildCombinedClusterInfoCommand(commands, sessionsScript);
-  log.appendLine(`Cluster info single-call (with sessions) command: ${combinedCommand}`);
-  const output = await runSshCommand(loginHost, cfg, combinedCommand);
+  const combinedScript = buildCombinedClusterInfoScript(commands, sessionsScript);
+  log.appendLine(`Cluster info single-call (with sessions) script bytes: ${combinedScript.length}`);
+  const output = await runSshCommandWithInput(loginHost, cfg, 'bash -s', combinedScript);
   const { commandOutputs, modulesOutput, sessionsOutput } = parseCombinedClusterInfoOutput(output, commands.length);
   const info = buildClusterInfoFromOutputs(commandOutputs, modulesOutput, freeResourceIndexes);
   const sessions = applySessionIdleInfo(parseSessionListOutput(sessionsOutput));
@@ -3077,7 +3077,7 @@ const CLUSTER_MODULES_END = '__SC_MODULES_END__';
 const CLUSTER_SESSIONS_START = '__SC_SESSIONS_START__';
 const CLUSTER_SESSIONS_END = '__SC_SESSIONS_END__';
 
-function buildCombinedClusterInfoCommand(
+function buildCombinedClusterInfoScript(
   commands: string[],
   sessionsScript?: string
 ): string {
@@ -3117,8 +3117,7 @@ function buildCombinedClusterInfoCommand(
     `echo "${CLUSTER_MODULES_END}"`
   ].join('\n');
 
-  const encodedScript = Buffer.from(script, 'utf8').toString('base64');
-  return `bash -lc 'printf %s ${encodedScript} | base64 -d | bash'`;
+  return script;
 }
 
 function parseCombinedClusterInfoOutput(
@@ -3300,9 +3299,9 @@ async function fetchClusterInfoSingleCall(
   freeResourceIndexes?: FreeResourceCommandIndexes
 ): Promise<ClusterInfo> {
   const log = getOutputChannel();
-  const combinedCommand = buildCombinedClusterInfoCommand(commands);
-  log.appendLine(`Cluster info single-call command: ${combinedCommand}`);
-  const output = await runSshCommand(loginHost, cfg, combinedCommand);
+  const combinedScript = buildCombinedClusterInfoScript(commands);
+  log.appendLine(`Cluster info single-call script bytes: ${combinedScript.length}`);
+  const output = await runSshCommandWithInput(loginHost, cfg, 'bash -s', combinedScript);
   const { commandOutputs, modulesOutput } = parseCombinedClusterInfoOutput(output, commands.length);
   return buildClusterInfoFromOutputs(commandOutputs, modulesOutput, freeResourceIndexes);
 }
@@ -3800,6 +3799,56 @@ function looksLikeAuthFailure(text: string): boolean {
   ].some((pattern) => pattern.test(text));
 }
 
+async function execSshWithInput(
+  sshPath: string,
+  args: string[],
+  input: string,
+  timeoutMs: number
+): Promise<{ stdout: string; stderr: string }> {
+  return await new Promise((resolve, reject) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    const child = spawn(sshPath, args, { windowsHide: true });
+    let timedOut = false;
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => stdoutChunks.push(chunk));
+    child.stderr.on('data', (chunk) => stderrChunks.push(chunk));
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
+      if (timedOut) {
+        const error = new Error(`SSH command timed out after ${timeoutMs}ms`);
+        (error as { stdout?: string; stderr?: string }).stdout = stdout;
+        (error as { stdout?: string; stderr?: string }).stderr = stderr;
+        reject(error);
+        return;
+      }
+      if (code !== 0) {
+        const error = new Error(`SSH command exited with code ${code ?? 'unknown'}`);
+        (error as { stdout?: string; stderr?: string }).stdout = stdout;
+        (error as { stdout?: string; stderr?: string }).stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+
+    const normalizedInput = input.endsWith('\n') ? input : `${input}\n`;
+    child.stdin.write(normalizedInput);
+    child.stdin.end();
+  });
+}
+
 function appendSshHostKeyCheckingArgs(args: string[], cfg: SlurmConnectConfig): void {
   const mode = normalizeSshHostKeyChecking(cfg.sshHostKeyChecking);
   args.push('-o', `StrictHostKeyChecking=${mode}`);
@@ -3901,13 +3950,20 @@ async function waitForFile(filePath: string, pollMs: number): Promise<void> {
 async function runSshCommandInTerminal(
   host: string,
   cfg: SlurmConnectConfig,
-  command: string
+  command: string,
+  input?: string
 ): Promise<string> {
   const normalizedCommand =
     process.platform === 'win32' ? normalizeRemoteCommandForWindowsTerminal(command) : command;
   const args = buildSshArgs(host, cfg, normalizedCommand, { batchMode: false });
   const sshPath = await resolveSshToolPath('ssh');
   const { dirPath, stdoutPath, statusPath } = await createTerminalSshRunFiles();
+  let stdinPath: string | undefined;
+  if (input !== undefined) {
+    stdinPath = path.join(dirPath, 'stdin.txt');
+    const normalizedInput = input.endsWith('\n') ? input : `${input}\n`;
+    await fs.writeFile(stdinPath, normalizedInput, 'utf8');
+  }
   const isWindows = process.platform === 'win32';
   const shellCommand = isWindows
     ? (() => {
@@ -3915,22 +3971,29 @@ async function runSshCommandInTerminal(
         const psScript = [
           "$ErrorActionPreference = 'Continue'",
           `$sshPath = ${quotePowerShellString(sshPath)}`,
+          stdinPath ? `$stdinPath = ${quotePowerShellString(stdinPath)}` : '',
           `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
           `$statusPath = ${quotePowerShellString(statusPath)}`,
           '$exitCode = 1',
           'try {',
-          `  & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`,
+          stdinPath
+            ? `  Get-Content -Raw $stdinPath | & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`
+            : `  & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`,
           '  $exitCode = $LASTEXITCODE',
           '} catch {',
           '  $exitCode = 1',
           '}',
           '$exitCode | Out-File -FilePath $statusPath -Encoding ascii -NoNewline'
-        ].join('; ');
+        ].filter(Boolean).join('; ');
         const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
         return `powershell -NoProfile -EncodedCommand ${encoded}`;
       })()
     : (() => {
         const sshCommand = [sshPath, ...args].map(quoteShellArg).join(' ');
+        if (stdinPath) {
+          const inputCommand = `cat ${quoteShellArg(stdinPath)} | ${sshCommand}`;
+          return `${inputCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+        }
         return `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
       })();
   const terminal = await createLocalTerminal('Slurm Connect SSH');
@@ -4673,6 +4736,57 @@ async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: str
             cancellable: false
           },
           async () => await runSshCommandInTerminal(host, cfg, command)
+        );
+      } catch (retryError) {
+        const retryText = normalizeSshErrorText(retryError);
+        const retrySummary = pickSshErrorSummary(retryText);
+        throw new Error(retrySummary || 'SSH command failed');
+      }
+    }
+    const summary = pickSshErrorSummary(errorText);
+    throw new Error(summary || 'SSH command failed');
+  }
+}
+
+async function runSshCommandWithInput(
+  host: string,
+  cfg: SlurmConnectConfig,
+  command: string,
+  input: string
+): Promise<string> {
+  await ensurePreSshCommand(cfg, `SSH query to ${host}`);
+  const args = buildSshArgs(host, cfg, command, { batchMode: true });
+  const sshPath = await resolveSshToolPath('ssh');
+  const timeoutMs = cfg.sshConnectTimeoutSeconds * 1000;
+
+  const runOnce = async (): Promise<string> => {
+    const { stdout } = await execSshWithInput(sshPath, args, input, timeoutMs);
+    return stdout.trim();
+  };
+
+  try {
+    return await runOnce();
+  } catch (error) {
+    const errorText = normalizeSshErrorText(error);
+    const retry = await maybePromptForSshAuth(cfg, errorText);
+    if (retry?.kind === 'agent') {
+      try {
+        return await runOnce();
+      } catch (retryError) {
+        const retryText = normalizeSshErrorText(retryError);
+        const retrySummary = pickSshErrorSummary(retryText);
+        throw new Error(retrySummary || 'SSH command failed');
+      }
+    }
+    if (retry?.kind === 'terminal') {
+      try {
+        return await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: 'Waiting for SSH passphrase in terminal',
+            cancellable: false
+          },
+          async () => await runSshCommandInTerminal(host, cfg, command, input)
         );
       } catch (retryError) {
         const retryText = normalizeSshErrorText(retryError);
