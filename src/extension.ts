@@ -1888,6 +1888,11 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           getOutputChannel().appendLine(
             `Cancel job resolved. alias=${aliasForSession || '(none)'}, sessionKey=${sessionKey || '(none)'}, loginHost=${loginHost || '(none)'}, remote=${isRemoteSession}`
           );
+          if (!sessionKey) {
+            getOutputChannel().appendLine(
+              'Cancel job: session key unavailable; will rely on SLURM_JOB_ID in the remote terminal.'
+            );
+          }
           if (loginHost || isRemoteSession) {
             await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
               useTerminal: true
@@ -6012,9 +6017,8 @@ async function cancelPersistentSessionJob(
     const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
     if (vscode.env.remoteName === 'ssh-remote') {
       const localCommand = buildLocalCancelPersistentSessionCommand(stateDir, sessionKey);
-      log.appendLine(
-        `Cancelling session "${sessionKey || 'unknown'}" in remote terminal (loginHost=${loginHost}).`
-      );
+      const label = sessionKey || 'current session';
+      log.appendLine(`Cancelling session "${label}" in remote terminal (loginHost=${loginHost}).`);
       const terminal = await createLocalTerminal('Slurm Connect Cancel');
       terminal.show(true);
       terminal.sendText(localCommand, true);
