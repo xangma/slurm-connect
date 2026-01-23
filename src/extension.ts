@@ -4301,7 +4301,34 @@ async function getSshAgentInfo(identityPathRaw?: string): Promise<SshAgentInfo> 
     await ensureSshAgentEnvForCurrentSsh(identityPathRaw);
     const sshAdd = await resolveSshToolPath('ssh-add');
     const agentEnv = getSshAgentEnv();
-    const info = await probeSshAgentWithEnv(sshAdd, agentEnv);
+    let info: SshAgentInfo;
+    if (!agentEnv.sock && process.platform === 'win32') {
+      const sshPath = await resolveSshToolPath('ssh');
+      if (!isGitSshPath(sshPath)) {
+        try {
+          const result = await execFileAsync(sshAdd, ['-l']);
+          const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+          if (!output.trim() || /no identities/i.test(output)) {
+            info = { status: 'empty', output };
+          } else {
+            info = { status: 'available', output };
+          }
+        } catch (error) {
+          const errorText = normalizeSshErrorText(error);
+          if (/no identities/i.test(errorText)) {
+            info = { status: 'empty', output: errorText };
+          } else if (looksLikeAgentUnavailable(errorText)) {
+            info = { status: 'unavailable', output: errorText };
+          } else {
+            info = { status: 'unavailable', output: errorText };
+          }
+        }
+      } else {
+        info = await probeSshAgentWithEnv(sshAdd, agentEnv);
+      }
+    } else {
+      info = await probeSshAgentWithEnv(sshAdd, agentEnv);
+    }
     if (info.status === 'available') {
       storeSshAgentEnv(agentEnv);
     }
@@ -4414,13 +4441,19 @@ async function runSshAddInTerminal(identityPath: string): Promise<void> {
   const shellCommand = isWindows
     ? (() => {
         const psArgs = args.map((arg) => quotePowerShellString(arg)).join(', ');
+        const psEnvLines: string[] = [];
+        if (agentEnv.sock) {
+          psEnvLines.push(`$env:SSH_AUTH_SOCK = ${quotePowerShellString(agentEnv.sock)}`);
+        }
+        if (agentEnv.pid) {
+          psEnvLines.push(`$env:SSH_AGENT_PID = ${quotePowerShellString(agentEnv.pid)}`);
+        }
         const psScript = [
           "$ErrorActionPreference = 'Continue'",
           `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
           `$statusPath = ${quotePowerShellString(statusPath)}`,
           `$cmd = ${quotePowerShellString(sshAdd)}`,
-          `$env:SSH_AUTH_SOCK = ${quotePowerShellString(agentEnv.sock)}`,
-          `$env:SSH_AGENT_PID = ${quotePowerShellString(agentEnv.pid)}`,
+          ...psEnvLines,
           psArgs ? `$cmdArgs = @(${psArgs})` : '$cmdArgs = @()',
           '$exitCode = 1',
           'try {',
@@ -4435,9 +4468,11 @@ async function runSshAddInTerminal(identityPath: string): Promise<void> {
         return `powershell -NoProfile -EncodedCommand ${encoded}`;
       })()
     : (() => {
-        const envPrefix = `SSH_AUTH_SOCK=${quoteShellArg(agentEnv.sock)} SSH_AGENT_PID=${quoteShellArg(agentEnv.pid)}`;
         const sshCommand = [quoteShellArg(sshAdd), ...args.map(quoteShellArg)].join(' ');
-        return `${envPrefix} ${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+        const envPrefix = agentEnv.sock
+          ? `SSH_AUTH_SOCK=${quoteShellArg(agentEnv.sock)}${agentEnv.pid ? ` SSH_AGENT_PID=${quoteShellArg(agentEnv.pid)}` : ''} `
+          : '';
+        return `${envPrefix}${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
       })();
 
   const terminal = await createLocalTerminal('Slurm Connect SSH Add');
