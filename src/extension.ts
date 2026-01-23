@@ -3704,6 +3704,14 @@ async function resolveSshCommandPath(): Promise<string> {
   const log = getOutputChannel();
   const configured = resolveRemoteSshPathSetting();
   if (configured) {
+    if (await fileExists(configured)) {
+      const kind = await detectSshCommandKind(configured, log);
+      if (kind === SshCommandKind.NotFound) {
+        log.appendLine(`Using configured SSH path despite version check mismatch: ${configured}`);
+      }
+      sshToolPathCache.ssh = configured;
+      return configured;
+    }
     const kind = await detectSshCommandKind(configured, log);
     if (kind !== SshCommandKind.NotFound) {
       sshToolPathCache.ssh = configured;
@@ -3977,7 +3985,11 @@ async function runSshCommandInTerminal(
           '$exitCode = 1',
           'try {',
           stdinPath
-            ? `  Get-Content -Raw $stdinPath | & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`
+            ? [
+                '  $inputText = Get-Content -Raw $stdinPath',
+                '  $inputText = $inputText.Replace("`r", "")',
+                `  $inputText | & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`
+              ].join('; ')
             : `  & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`,
           '  $exitCode = $LASTEXITCODE',
           '} catch {',
