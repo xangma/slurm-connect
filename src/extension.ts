@@ -2352,10 +2352,20 @@ async function connectCommand(
       return false;
     }
 
+    await ensureSshAgentEnvForCurrentSsh();
+    const additionalSshOptions: Record<string, string> = { ...(cfg.additionalSshOptions || {}) };
+    if (process.platform === 'win32') {
+      const sshPath = await resolveSshToolPath('ssh');
+      const sock = process.env.SSH_AUTH_SOCK || '';
+      if (sock && isGitSshPath(sshPath) && !hasSshOption(additionalSshOptions, 'IdentityAgent')) {
+        additionalSshOptions.IdentityAgent = sock;
+      }
+    }
+
     const hostEntry = buildHostEntry(
       alias.trim(),
       loginHost,
-      { ...cfg, extraSshOptions: localProxyPlan.sshOptions },
+      { ...cfg, additionalSshOptions, extraSshOptions: localProxyPlan.sshOptions },
       remoteCommand
     );
     log.appendLine('Generated SSH host entry:');
@@ -3428,28 +3438,49 @@ async function ensureSshAgentEnvForCurrentSsh(): Promise<void> {
   if (process.env.SSH_AUTH_SOCK) {
     return;
   }
+  const log = getOutputChannel();
   const sshPath = await resolveSshToolPath('ssh');
   if (!isGitSshPath(sshPath)) {
+    log.appendLine(`Skipping Git ssh-agent setup (SSH path: ${sshPath}).`);
     return;
   }
   const agentPath = await resolveGitSshAgentPath(sshPath);
   if (!agentPath) {
+    log.appendLine(`Git ssh-agent not found next to ${sshPath}.`);
     return;
   }
   try {
+    log.appendLine(`Starting Git ssh-agent: ${agentPath}`);
     const result = await execFileAsync(agentPath, ['-s']);
     const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
     const sockMatch = /SSH_AUTH_SOCK=([^;\r\n]+)/.exec(output);
     const pidMatch = /SSH_AGENT_PID=([^;\r\n]+)/.exec(output);
     if (sockMatch && sockMatch[1]) {
-      process.env.SSH_AUTH_SOCK = sockMatch[1];
+      process.env.SSH_AUTH_SOCK = sockMatch[1].trim();
     }
     if (pidMatch && pidMatch[1]) {
-      process.env.SSH_AGENT_PID = pidMatch[1];
+      process.env.SSH_AGENT_PID = pidMatch[1].trim();
+    }
+    if (process.env.SSH_AUTH_SOCK) {
+      log.appendLine(`Git SSH_AUTH_SOCK set to ${process.env.SSH_AUTH_SOCK}`);
+    } else {
+      log.appendLine(`Git ssh-agent did not return SSH_AUTH_SOCK. Output: ${output.trim() || '(empty)'}`);
     }
   } catch {
+    log.appendLine('Failed to start Git ssh-agent.');
     // Ignore agent startup failures; ssh-add will surface errors.
   }
+}
+
+function hasSshOption(
+  options: Record<string, string> | undefined,
+  key: string
+): boolean {
+  if (!options) {
+    return false;
+  }
+  const target = key.toLowerCase();
+  return Object.keys(options).some((optionKey) => optionKey.toLowerCase() === target);
 }
 
 function resetSshToolCacheIfNeeded(): void {

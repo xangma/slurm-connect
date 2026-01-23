@@ -16,6 +16,7 @@ All notable changes to this project are documented in this file based on git tag
 - Windows: if Remote-SSH uses Git SSH, Slurm Connect starts the Git ssh-agent and exports SSH_AUTH_SOCK/SSH_AGENT_PID so agent checks align.
 - SSH queries and tunnels now follow Remote-SSH's SSH executable preference order (including Git OpenSSH on Windows when local server mode is enabled).
 - Windows: ensure Git ssh-agent environment is refreshed before Remote-SSH connects to reduce unexpected passphrase prompts.
+- Windows: when Git SSH is in use and an agent socket is available, Slurm Connect now writes `IdentityAgent` in generated host entries to ensure Remote-SSH uses the correct agent.
 
 ### Added
 - Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.
