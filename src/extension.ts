@@ -1199,8 +1199,8 @@ function resolveRemoteSshAlias(): string | undefined {
   }
   const folders = vscode.workspace.workspaceFolders;
   const folderAuthority = folders && folders.length > 0 ? folders[0].uri.authority : undefined;
-  const envWithAuthority = vscode.env as { remoteAuthority?: string };
-  const authority = folderAuthority || envWithAuthority.remoteAuthority;
+  const envAuthority = process.env.VSCODE_REMOTE_AUTHORITY;
+  const authority = folderAuthority || envAuthority;
   if (!authority) {
     return undefined;
   }
@@ -4077,7 +4077,8 @@ async function createTerminalSshRunFiles(): Promise<{
 }
 
 async function resolveLocalTerminalCwd(): Promise<string | undefined> {
-  if (vscode.env.remoteName) {
+  const hasRemoteAuthority = Boolean(vscode.env.remoteName || process.env.VSCODE_REMOTE_AUTHORITY);
+  if (hasRemoteAuthority) {
     if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
       const cfg = getConfig();
       const stored = getStoredConnectionState();
