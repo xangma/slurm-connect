@@ -24,6 +24,9 @@ All notable changes to this project are documented in this file based on git tag
 - SSH detection: honor an explicit remote.SSH.path even if `ssh -V` output is unexpected.
 - Windows: clear stale MSYS SSH_AUTH_SOCK when using Windows OpenSSH so the native agent is detected.
 - Windows: when using OpenSSH without SSH_AUTH_SOCK, agent checks now fall back to the native service.
+- UI: prevent the cluster info action row from forcing horizontal scrolling in narrow panels.
+- Cancel job: fall back to resolving the login host from SSH config when the original login host isn't cached.
+- Terminals: avoid forcing a local cwd when running in a remote window to prevent launch failures.
 
 ### Added
 - Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.

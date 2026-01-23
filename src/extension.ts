@@ -1848,9 +1848,17 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           const sessionKey =
             lastConnectionSessionKey ||
             (lastConnectionAlias ? resolveSessionKey(cfg, lastConnectionAlias) : '');
-          const loginHost =
+          let loginHost =
             lastConnectionLoginHost ||
             (cfg.loginHosts.length > 0 ? cfg.loginHosts[0] : undefined);
+          if (!loginHost && lastConnectionAlias) {
+            try {
+              const resolved = await resolveSshHostFromConfig(lastConnectionAlias, cfg);
+              loginHost = resolved.hostname || resolved.host || loginHost;
+            } catch {
+              // Ignore; we'll fall back to the existing value.
+            }
+          }
           if (loginHost && sessionKey) {
             await cancelPersistentSessionJob(loginHost, sessionKey, cfg, {
               useTerminal: true
@@ -3932,6 +3940,9 @@ async function createTerminalSshRunFiles(): Promise<{
 }
 
 async function resolveLocalTerminalCwd(): Promise<string | undefined> {
+  if (vscode.env.remoteName) {
+    return undefined;
+  }
   const candidates: string[] = [];
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
   if (workspaceFolder?.scheme === 'file') {
@@ -8638,8 +8649,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
     .buttons { display: flex; gap: 8px; }
     .buttons button { flex: 1; }
-    .cluster-actions { align-items: center; }
-    .cluster-actions button { flex: 0 0 auto; }
+    .cluster-actions { align-items: center; flex-wrap: wrap; }
+    .cluster-actions button { flex: 1 1 140px; }
+    .cluster-actions .spinner { flex: 0 0 auto; }
     .hidden { display: none !important; }
     .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
     .hint:empty { display: none; }
