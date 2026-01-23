@@ -10,6 +10,7 @@ The picker reads from `slurmConnect.sshQueryConfigPath` when set; otherwise it u
 ## SSH authentication for cluster info
 Cluster info queries use non-interactive SSH (`BatchMode=yes`). If your key is encrypted, you can either use ssh-agent or enter the passphrase in a terminal when prompted. ssh-agent is recommended but optional.
 Host key prompts are also non-interactive; `slurmConnect.sshHostKeyChecking` controls StrictHostKeyChecking for these queries (default `accept-new` to auto-trust first-seen keys). If you see "Host key verification failed", set it to `accept-new` or `no`. Use `ask` to require interactive confirmation, or `yes` to enforce strict checking.
+Slurm Connect runs SSH commands using the same SSH executable selection as Remote-SSH (`remote.SSH.path` if set; otherwise Remote-SSH's preference order). On Windows with `remote.SSH.useLocalServer=true`, this typically prefers Git's OpenSSH when available.
 
 What is ssh-agent?
 - `ssh-agent` is a background service that securely stores your SSH keys in memory after you unlock them once.

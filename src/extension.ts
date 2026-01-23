@@ -8,7 +8,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
 import * as zlib from 'zlib';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import {
   buildHostEntry,
@@ -3363,6 +3363,16 @@ function getSshAgentEnv(): { sock: string; pid: string } {
 type SshToolName = 'ssh' | 'ssh-add' | 'ssh-keygen';
 const sshToolPathCache: Partial<Record<SshToolName, string>> = {};
 const WINDOWS_OPENSSH_PATH = 'C:\\Windows\\System32\\OpenSSH\\ssh.exe';
+const SSH_VERSION_TIMEOUT_MS = 10_000;
+const HAS_WOW64 = Object.prototype.hasOwnProperty.call(process.env, 'PROCESSOR_ARCHITEW6432');
+let cachedRemoteSshPathSetting = '';
+let cachedRemoteUseLocalServer: boolean | undefined;
+
+enum SshCommandKind {
+  NotFound = 0,
+  WindowsSsh = 1,
+  Other = 2
+}
 
 function stripOuterQuotes(value: string): string {
   const trimmed = value.trim();
@@ -3377,21 +3387,10 @@ function stripOuterQuotes(value: string): string {
   return trimmed;
 }
 
-async function resolveRemoteSshPath(): Promise<string | undefined> {
+function resolveRemoteSshPathSetting(): string {
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const configured = String(remoteCfg.get<string>('path') || '').trim();
-  if (!configured) {
-    return undefined;
-  }
-  const stripped = stripOuterQuotes(configured);
-  const expanded = expandHome(stripped);
-  if (await fileExists(expanded)) {
-    return expanded;
-  }
-  if (await fileExists(stripped)) {
-    return stripped;
-  }
-  return undefined;
+  return configured ? stripOuterQuotes(configured) : '';
 }
 
 async function listSshPathsFromWhere(): Promise<string[]> {
@@ -3453,60 +3452,191 @@ async function ensureSshAgentEnvForCurrentSsh(): Promise<void> {
   }
 }
 
+function resetSshToolCacheIfNeeded(): void {
+  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
+  const pathSetting = String(remoteCfg.get<string>('path') || '').trim();
+  const useLocalServer = remoteCfg.get<boolean>('useLocalServer', false);
+  if (pathSetting === cachedRemoteSshPathSetting && useLocalServer === cachedRemoteUseLocalServer) {
+    return;
+  }
+  cachedRemoteSshPathSetting = pathSetting;
+  cachedRemoteUseLocalServer = useLocalServer;
+  for (const key of Object.keys(sshToolPathCache)) {
+    delete sshToolPathCache[key as SshToolName];
+  }
+}
+
+function collectWindowsSshCandidates(): string[] {
+  const candidates: string[] = [];
+  const pathEnv = process.env.PATH;
+  if (pathEnv) {
+    const parts = pathEnv
+      .split(';')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .filter((entry) => path.isAbsolute(entry))
+      .map((entry) => path.join(entry, 'ssh.exe'));
+    candidates.push(...parts);
+  }
+  if (process.env.windir) {
+    candidates.push(path.join(process.env.windir, 'System32', 'OpenSSH', 'ssh.exe'));
+  }
+  if (process.env.ProgramFiles) {
+    candidates.push(path.join(process.env.ProgramFiles, 'Git', 'usr', 'bin', 'ssh.exe'));
+  }
+  const programFilesX86 = process.env['ProgramFiles(x86)'];
+  if (programFilesX86) {
+    candidates.push(path.join(programFilesX86, 'Git', 'usr', 'bin', 'ssh.exe'));
+  }
+  if (process.env.LOCALAPPDATA) {
+    candidates.push(path.join(process.env.LOCALAPPDATA, 'Programs', 'Git', 'usr', 'bin', 'ssh.exe'));
+  }
+  if (HAS_WOW64) {
+    const root = process.env.SystemRoot || 'C:\\WINDOWS';
+    candidates.unshift(path.join(root, 'Sysnative', 'OpenSSH', 'ssh.exe'));
+  }
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    const key = candidate.toLowerCase();
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+async function detectSshCommandKind(sshCommand: string, log: vscode.OutputChannel): Promise<SshCommandKind> {
+  return new Promise((resolve) => {
+    log.appendLine(`Checking ssh with "${sshCommand} -V"`);
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let command = sshCommand;
+    let options: { shell?: boolean } | undefined;
+    if (process.platform === 'win32' && (sshCommand.endsWith('.bat') || sshCommand.endsWith('.cmd'))) {
+      command = `"${sshCommand}"`;
+      options = { shell: true };
+    }
+    const child = spawn(command, ['-V'], options);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      log.appendLine('ssh is not exiting, continuing');
+      resolve(SshCommandKind.NotFound);
+      child.kill();
+    }, SSH_VERSION_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => {
+      stdoutChunks.push(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrChunks.push(chunk);
+    });
+    child.on('error', (error) => {
+      if (timedOut) {
+        return;
+      }
+      clearTimeout(timeout);
+      log.appendLine(`Got error from ssh: ${error.message}`);
+      resolve(SshCommandKind.NotFound);
+    });
+    child.on('exit', (code) => {
+      if (timedOut) {
+        return;
+      }
+      clearTimeout(timeout);
+      if (code) {
+        log.appendLine(`ssh exited with code: ${code}`);
+        resolve(SshCommandKind.NotFound);
+        return;
+      }
+      const output = Buffer.concat([...stdoutChunks, ...stderrChunks]).toString('utf8').trim();
+      if (output.match(/OpenSSH_for_Windows/i)) {
+        resolve(SshCommandKind.WindowsSsh);
+        return;
+      }
+      if (output.match(/OpenSSH/i)) {
+        resolve(SshCommandKind.Other);
+        return;
+      }
+      log.appendLine('ssh output did not match /OpenSSH/');
+      resolve(SshCommandKind.NotFound);
+    });
+  });
+}
+
+async function isValidSshCommand(sshCommand: string, log: vscode.OutputChannel): Promise<boolean> {
+  return (await detectSshCommandKind(sshCommand, log)) !== SshCommandKind.NotFound;
+}
+
+async function resolveSshCommandPath(): Promise<string> {
+  resetSshToolCacheIfNeeded();
+  const cached = sshToolPathCache.ssh;
+  if (cached) {
+    return cached;
+  }
+  const log = getOutputChannel();
+  const configured = resolveRemoteSshPathSetting();
+  if (configured) {
+    const kind = await detectSshCommandKind(configured, log);
+    if (kind !== SshCommandKind.NotFound) {
+      sshToolPathCache.ssh = configured;
+      return configured;
+    }
+    log.appendLine(`The specified path ${configured} is not a valid SSH binary`);
+  }
+
+  if (process.platform !== 'win32') {
+    if (await isValidSshCommand('ssh', log)) {
+      sshToolPathCache.ssh = 'ssh';
+      return 'ssh';
+    }
+    throw new Error('ssh is not on the PATH');
+  }
+
+  const candidates = collectWindowsSshCandidates();
+  const useLocalServer = vscode.workspace.getConfiguration('remote.SSH').get<boolean>('useLocalServer', false);
+  if (useLocalServer) {
+    for (const candidate of candidates) {
+      if (await detectSshCommandKind(candidate, log) === SshCommandKind.Other) {
+        sshToolPathCache.ssh = candidate;
+        return candidate;
+      }
+      log.appendLine('Preferring non-Windows OpenSSH, skipping');
+    }
+  }
+  for (const candidate of candidates) {
+    if (await isValidSshCommand(candidate, log)) {
+      sshToolPathCache.ssh = candidate;
+      return candidate;
+    }
+  }
+
+  throw new Error('ssh installation not found');
+}
+
 async function resolveSshToolPath(tool: SshToolName): Promise<string> {
+  resetSshToolCacheIfNeeded();
   const cached = sshToolPathCache[tool];
   if (cached) {
     return cached;
   }
-  const remotePath = await resolveRemoteSshPath();
-  if (remotePath) {
-    sshToolPathCache.ssh = remotePath;
-    if (tool === 'ssh') {
-      return remotePath;
-    }
-    const ext = path.extname(remotePath);
-    const candidate = path.join(path.dirname(remotePath), ext ? `${tool}${ext}` : tool);
-    if (await fileExists(candidate)) {
-      sshToolPathCache[tool] = candidate;
-      return candidate;
-    }
+  const sshPath = await resolveSshCommandPath();
+  sshToolPathCache.ssh = sshPath;
+  if (tool === 'ssh') {
+    return sshPath;
   }
-  if (process.platform !== 'win32') {
+  if (sshPath === 'ssh') {
     sshToolPathCache[tool] = tool;
     return tool;
   }
-
-  const resolveWithWhere = async (name: string): Promise<string | undefined> => {
-    try {
-      const { stdout } = await execFileAsync('where', [name]);
-      const first = stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)[0];
-      return first || undefined;
-    } catch {
-      return undefined;
-    }
-  };
-
-  const sshPath = sshToolPathCache.ssh || (await resolveWithWhere('ssh'));
-  if (sshPath) {
-    sshToolPathCache.ssh = sshPath;
-    const candidate = path.join(path.dirname(sshPath), `${tool}.exe`);
-    if (await fileExists(candidate)) {
-      sshToolPathCache[tool] = candidate;
-      return candidate;
-    }
+  const ext = path.extname(sshPath);
+  const candidate = path.join(path.dirname(sshPath), ext ? `${tool}${ext}` : tool);
+  if (await fileExists(candidate)) {
+    sshToolPathCache[tool] = candidate;
+    return candidate;
   }
-
-  const resolved = await resolveWithWhere(tool);
-  if (resolved) {
-    sshToolPathCache[tool] = resolved;
-    return resolved;
-  }
-
-  sshToolPathCache[tool] = tool;
-  return tool;
+  sshToolPathCache[tool] = candidate;
+  return candidate;
 }
 
 function pickSshErrorSummary(text: string): string {
@@ -3615,6 +3745,7 @@ async function runSshCommandInTerminal(
   const normalizedCommand =
     process.platform === 'win32' ? normalizeRemoteCommandForWindowsTerminal(command) : command;
   const args = buildSshArgs(host, cfg, normalizedCommand, { batchMode: false });
+  const sshPath = await resolveSshToolPath('ssh');
   const { dirPath, stdoutPath, statusPath } = await createTerminalSshRunFiles();
   const isWindows = process.platform === 'win32';
   const shellCommand = isWindows
@@ -3622,11 +3753,12 @@ async function runSshCommandInTerminal(
         const psArgs = args.map((arg) => quotePowerShellString(arg)).join(', ');
         const psScript = [
           "$ErrorActionPreference = 'Continue'",
+          `$sshPath = ${quotePowerShellString(sshPath)}`,
           `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
           `$statusPath = ${quotePowerShellString(statusPath)}`,
           '$exitCode = 1',
           'try {',
-          `  & ssh @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`,
+          `  & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`,
           '  $exitCode = $LASTEXITCODE',
           '} catch {',
           '  $exitCode = 1',
@@ -3637,7 +3769,7 @@ async function runSshCommandInTerminal(
         return `powershell -NoProfile -EncodedCommand ${encoded}`;
       })()
     : (() => {
-        const sshCommand = ['ssh', ...args].map(quoteShellArg).join(' ');
+        const sshCommand = [sshPath, ...args].map(quoteShellArg).join(' ');
         return `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
       })();
   const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH' });
@@ -4322,16 +4454,17 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
 async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
   await ensurePreSshCommand(cfg, `SSH query to ${host}`);
   const args = buildSshArgs(host, cfg, command, { batchMode: true });
+  const sshPath = await resolveSshToolPath('ssh');
 
   try {
-    const { stdout } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+    const { stdout } = await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
     return stdout.trim();
   } catch (error) {
     const errorText = normalizeSshErrorText(error);
     const retry = await maybePromptForSshAuth(cfg, errorText);
     if (retry?.kind === 'agent') {
       try {
-        const { stdout } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+        const { stdout } = await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
         return stdout.trim();
       } catch (retryError) {
         const retryText = normalizeSshErrorText(retryError);
@@ -5695,6 +5828,7 @@ async function cleanupControlPath(controlPath: string): Promise<void> {
 }
 
 async function checkLocalProxyTunnel(state: LocalProxyTunnelState, cfg: SlurmConnectConfig): Promise<boolean> {
+  const sshPath = await resolveSshToolPath('ssh');
   const args: string[] = [];
   if (cfg.sshQueryConfigPath) {
     args.push('-F', expandHome(cfg.sshQueryConfigPath));
@@ -5707,7 +5841,7 @@ async function checkLocalProxyTunnel(state: LocalProxyTunnelState, cfg: SlurmCon
   }
   args.push(state.target);
   try {
-    await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+    await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
     return true;
   } catch {
     await cleanupControlPath(state.controlPath);
@@ -5721,7 +5855,9 @@ function stopLocalProxyTunnel(): void {
     return;
   }
   const args = ['-S', state.controlPath, '-O', 'exit', state.target];
-  void execFileAsync('ssh', args, { timeout: 5000 }).catch(() => undefined);
+  void resolveSshToolPath('ssh')
+    .then((sshPath) => execFileAsync(sshPath, args, { timeout: 5000 }))
+    .catch(() => undefined);
   localProxyTunnelState = undefined;
   persistLocalProxyTunnelState(undefined);
 }
@@ -5762,6 +5898,7 @@ async function startLocalProxyTunnel(
   configKey: string
 ): Promise<LocalProxyTunnelState> {
   const log = getOutputChannel();
+  const sshPath = await resolveSshToolPath('ssh');
   const maxAttempts = 3;
   let lastError: Error | undefined;
   const target = buildLocalProxyTunnelTarget(cfg, loginHost);
@@ -5781,7 +5918,7 @@ async function startLocalProxyTunnel(
     );
     const args = buildLocalProxyTunnelArgs(cfg, loginHost, remoteBind, remotePort, localPort, controlPath);
     try {
-      const { stderr } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+      const { stderr } = await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
       if (stderr && /remote port forwarding failed/i.test(stderr)) {
         log.appendLine(`Local proxy tunnel SSH warning: ${stderr.trim()}`);
         lastError = new Error('Remote port forwarding failed');
@@ -6800,13 +6937,14 @@ async function resolveSshHostFromConfig(
   cfg: SlurmConnectConfig
 ): Promise<ResolvedSshHostInfo> {
   const configPath = await resolveSshHostsConfigPath(cfg);
+  const sshPath = await resolveSshToolPath('ssh');
   const args: string[] = [];
   if (configPath) {
     args.push('-F', configPath);
   }
   args.push('-G', host);
   try {
-    const { stdout } = await execFileAsync('ssh', args);
+    const { stdout } = await execFileAsync(sshPath, args);
     const parsed = parseSshConfigOutput(stdout);
     const hostname = pickFirstValue(parsed.hostname);
     const port = pickFirstValue(parsed.port);

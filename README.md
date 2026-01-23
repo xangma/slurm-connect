@@ -16,7 +16,7 @@ Key features:
 - SSH authentication configured for the cluster (SSH config or agent; agent forwarding recommended).
 - Python 3.9+ available on the login nodes.
 - Bundled `vscode-proxy.py` auto-installed to `~/.slurm-connect/vscode-proxy.py` on connect (can be disabled).
-  - Windows note: if Remote-SSH picks Git's `ssh.exe`, the extension may prompt to switch to Windows OpenSSH so ssh-agent works reliably.
+  - Windows note: Slurm Connect follows Remote-SSH's SSH client selection. If Remote-SSH picks Git's `ssh.exe`, the extension may prompt to switch to Windows OpenSSH so ssh-agent works reliably.
 
 ## Quick start (users)
 1. Install the extension.
