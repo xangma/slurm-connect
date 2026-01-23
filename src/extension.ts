@@ -3678,7 +3678,7 @@ async function getPublicKeyFingerprint(identityPath: string): Promise<string | u
   if (!identityPath) {
     return undefined;
   }
-  const pubPath = identityPath.endsWith('.pub') ? identityPath : `${identityPath}.pub`;
+  const pubPath = getPublicKeyPath(identityPath);
   try {
     await fs.access(pubPath);
   } catch {
@@ -3692,6 +3692,17 @@ async function getPublicKeyFingerprint(identityPath: string): Promise<string | u
   } catch {
     return undefined;
   }
+}
+
+function getPublicKeyPath(identityPath: string): string {
+  return identityPath.endsWith('.pub') ? identityPath : `${identityPath}.pub`;
+}
+
+async function hasPublicKeyFile(identityPath: string): Promise<boolean> {
+  if (!identityPath) {
+    return false;
+  }
+  return await fileExists(getPublicKeyPath(identityPath));
 }
 
 function parsePublicKeyTokens(line: string): { type: string; key: string } | undefined {
@@ -3711,7 +3722,7 @@ function parsePublicKeyTokens(line: string): { type: string; key: string } | und
 }
 
 async function readPublicKeyTokens(identityPath: string): Promise<{ type: string; key: string } | undefined> {
-  const pubPath = identityPath.endsWith('.pub') ? identityPath : `${identityPath}.pub`;
+  const pubPath = getPublicKeyPath(identityPath);
   try {
     const text = await fs.readFile(pubPath, 'utf8');
     const line = text
@@ -3739,18 +3750,6 @@ async function getSshAgentPublicKeys(): Promise<Array<{ type: string; key: strin
   } catch {
     return [];
   }
-}
-
-function countAgentKeys(output: string): number {
-  if (!output.trim()) {
-    return 0;
-  }
-  return output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .filter((line) => /sha256:|md5:/i.test(line))
-    .length;
 }
 
 function escapeRegExp(value: string): string {
@@ -3827,9 +3826,6 @@ async function isSshKeyListedInAgentOutput(identityPath: string, output: string)
       return true;
     }
   }
-  if (!pubTokens && countAgentKeys(output) > 0) {
-    return true;
-  }
   return false;
 }
 
@@ -3848,6 +3844,7 @@ async function buildAgentStatusMessage(identityPathRaw: string): Promise<{ text:
   if (!identityExists) {
     return { text: `${agentBase}. Identity file not found.`, isError: true };
   }
+  const pubExists = await hasPublicKeyFile(identityPath);
   if (agentInfo.status === 'unavailable') {
     return {
       text: `SSH agent unavailable. Passphrase required for ${identityPath}.`,
@@ -3856,6 +3853,12 @@ async function buildAgentStatusMessage(identityPathRaw: string): Promise<{ text:
   }
   if (agentInfo.status === 'empty') {
     return { text: 'SSH agent running, no keys loaded.', isError: true };
+  }
+  if (!pubExists) {
+    return {
+      text: `SSH agent running, public key file missing (${getPublicKeyPath(identityPath)}). Generate it to verify the loaded key.`,
+      isError: true
+    };
   }
   const keyLoaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
   if (keyLoaded) {
@@ -3936,6 +3939,61 @@ async function runSshAddInTerminal(identityPath: string): Promise<void> {
   terminal.dispose();
 }
 
+async function runSshKeygenPublicKeyInTerminal(identityPath: string): Promise<void> {
+  const sshKeygen = await resolveSshToolPath('ssh-keygen');
+  const pubPath = getPublicKeyPath(identityPath);
+  const { dirPath, stdoutPath, statusPath } = await createTerminalSshRunFiles();
+  const isWindows = process.platform === 'win32';
+  const shellCommand = isWindows
+    ? (() => {
+        const args = ['-y', '-f', identityPath].map((arg) => quotePowerShellString(arg)).join(', ');
+        const psScript = [
+          "$ErrorActionPreference = 'Continue'",
+          `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
+          `$statusPath = ${quotePowerShellString(statusPath)}`,
+          `$cmd = ${quotePowerShellString(sshKeygen)}`,
+          `$cmdArgs = @(${args})`,
+          '$exitCode = 1',
+          'try {',
+          `  & $cmd @cmdArgs | Out-File -FilePath ${quotePowerShellString(pubPath)} -Encoding ascii`,
+          '  $exitCode = $LASTEXITCODE',
+          '} catch {',
+          '  $exitCode = 1',
+          '}',
+          '$exitCode | Out-File -FilePath $statusPath -Encoding ascii -NoNewline'
+        ].join('; ');
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+        return `powershell -NoProfile -EncodedCommand ${encoded}`;
+      })()
+    : (() => {
+        const cmd = `${quoteShellArg(sshKeygen)} -y -f ${quoteShellArg(identityPath)} > ${quoteShellArg(pubPath)}`;
+        return `${cmd}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+      })();
+
+  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH Keygen' });
+  terminal.show(true);
+  terminal.sendText(shellCommand, true);
+  void vscode.window.showInformationMessage('Follow the terminal prompt to generate the public key.');
+
+  let exitCode = NaN;
+  try {
+    await waitForFile(statusPath, 500);
+    const statusText = await fs.readFile(statusPath, 'utf8');
+    exitCode = Number(statusText.trim());
+  } finally {
+    try {
+      await fs.rm(dirPath, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+
+  if (!Number.isFinite(exitCode) || exitCode !== 0) {
+    throw new Error('ssh-keygen failed in the terminal. Check the terminal output for details.');
+  }
+  terminal.dispose();
+}
+
 async function fileExists(filePath: string): Promise<boolean> {
   if (!filePath) {
     return false;
@@ -3961,6 +4019,7 @@ async function maybePromptForSshAuth(
   }
   const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
   const identityExists = identityPath ? await fileExists(identityPath) : false;
+  const pubExists = identityPath && identityExists ? await hasPublicKeyFile(identityPath) : false;
   const canTerminalPassphrase = Boolean(identityPath && identityExists);
   const agentInfo = identityPath && identityExists ? await getSshAgentInfo() : undefined;
   if (identityPath && identityExists && agentInfo?.status === 'available') {
@@ -3990,6 +4049,9 @@ async function maybePromptForSshAuth(
   if (canAddToAgent) {
     actions.push('Add to Agent');
   }
+  if (identityPath && identityExists && !pubExists) {
+    actions.push('Generate Public Key');
+  }
   if (!identityPath || !identityExists) {
     actions.push('Open Slurm Connect');
   }
@@ -3999,7 +4061,9 @@ async function maybePromptForSshAuth(
     : identityPath
       ? agentStatus === 'unavailable'
         ? `SSH authentication failed while querying the cluster. SSH agent is unavailable, enter the passphrase for ${identityPath} in the terminal.`
-        : `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent or enter its passphrase in a terminal.`
+        : !pubExists
+          ? `SSH authentication failed while querying the cluster. Public key file is missing for ${identityPath}; generate it to verify the agent key.`
+          : `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent or enter its passphrase in a terminal.`
       : 'SSH authentication failed while querying the cluster. Ensure your SSH config/agent can authenticate, or set an identity file in the Slurm Connect view.';
   const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
   const defaultMode: SshAuthMode = canAddToAgent ? 'agent' : 'terminal';
@@ -4009,6 +4073,28 @@ async function maybePromptForSshAuth(
       ? 'agent'
       : defaultMode;
   lastSshAuthPrompt = { identityPath, timestamp: now, mode };
+  if (choice === 'Generate Public Key' && identityPath && identityExists && !pubExists) {
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Generating public key',
+          cancellable: false
+        },
+        async () => await runSshKeygenPublicKeyInTerminal(identityPath)
+      );
+      await refreshAgentStatus(cfg.identityFile);
+      if (agentInfo?.status === 'available') {
+        const refreshed = await getSshAgentInfo();
+        if (await isSshKeyListedInAgentOutput(identityPath, refreshed.output)) {
+          return { kind: 'agent' };
+        }
+      }
+    } catch (error) {
+      void vscode.window.showWarningMessage(`Failed to generate public key: ${formatError(error)}`);
+    }
+    return undefined;
+  }
   if (choice === 'Enter Passphrase in Terminal' && identityPath && identityExists && canTerminalPassphrase) {
     return { kind: 'terminal' };
   }
@@ -4041,6 +4127,7 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
     return true;
   }
   const identityExists = await fileExists(identityPath);
+  const pubExists = identityExists ? await hasPublicKeyFile(identityPath) : false;
   const agentInfo = identityExists ? await getSshAgentInfo() : undefined;
   if (identityExists && agentInfo?.status === 'available') {
     const loaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
@@ -4068,6 +4155,9 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
   if (canAddToAgent) {
     actions.push('Add to Agent');
   }
+  if (identityExists && !pubExists) {
+    actions.push('Generate Public Key');
+  }
   if (!identityExists) {
     actions.push('Open Slurm Connect');
   }
@@ -4075,7 +4165,9 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
 
   const message = !identityExists
     ? `SSH identity file ${identityPath} was not found. Update it in the Slurm Connect view.`
-    : `SSH key is not loaded in the agent. Add ${identityPath} to avoid extra prompts.`;
+    : !pubExists
+      ? `Public key file is missing for ${identityPath}; generate it to verify the agent key.`
+      : `SSH key is not loaded in the agent. Add ${identityPath} to avoid extra prompts.`;
 
   const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
   const mode: SshAuthMode = choice === 'Add to Agent' ? 'agent' : 'terminal';
@@ -4094,6 +4186,23 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
       await refreshAgentStatus(cfg.identityFile);
     } catch (error) {
       void vscode.window.showWarningMessage(`ssh-add failed: ${formatError(error)}`);
+    }
+    return true;
+  }
+
+  if (choice === 'Generate Public Key' && identityExists && !pubExists) {
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Generating public key',
+          cancellable: false
+        },
+        async () => await runSshKeygenPublicKeyInTerminal(identityPath)
+      );
+      await refreshAgentStatus(cfg.identityFile);
+    } catch (error) {
+      void vscode.window.showWarningMessage(`Failed to generate public key: ${formatError(error)}`);
     }
     return true;
   }

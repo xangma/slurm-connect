@@ -10,8 +10,7 @@ All notable changes to this project are documented in this file based on git tag
 - Agent status hint now refreshes immediately after ssh-add completes.
 - Agent key detection now matches against public key material when the ssh-add list output omits file paths.
 - ssh-add now runs with the same SSH_AUTH_SOCK/SSH_AGENT_PID as the extension so agent checks match on Windows.
-- Agent key detection treats a single loaded agent key as matching when no public key file is available.
-- Agent key detection now treats any loaded agent key as matching when no public key file is available (avoids false negatives on Windows).
+- Added a Generate Public Key option when the identity `.pub` file is missing (required for strict agent verification).
 
 ### Added
 - Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.
