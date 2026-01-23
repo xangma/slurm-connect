@@ -202,6 +202,7 @@ const LEGACY_CLUSTER_INFO_CACHE_KEY = 'sciamaSlurm.clusterInfoCache';
 const DEFAULT_SESSION_STATE_DIR = '~/.slurm-connect';
 const DEFAULT_PROXY_SCRIPT_INSTALL_PATH = '~/.slurm-connect/vscode-proxy.py';
 const PROXY_OVERRIDE_RESET_KEY = 'slurmConnect.proxyOverrideReset';
+const SSH_AGENT_ENV_KEY = 'slurmConnect.sshAgentEnv';
 const LOCAL_PROXY_TUNNEL_STATE_KEY = 'slurmConnect.localProxyTunnelState';
 const LOCAL_PROXY_RUNTIME_STATE_KEY = 'slurmConnect.localProxyRuntimeState';
 const CONFIG_KEYS = [
@@ -3370,9 +3371,33 @@ function getSshAgentEnv(): { sock: string; pid: string } {
   };
 }
 
+interface StoredSshAgentEnv {
+  sock: string;
+  pid?: string;
+}
+
+function getStoredSshAgentEnv(): StoredSshAgentEnv | undefined {
+  if (!extensionGlobalState) {
+    return undefined;
+  }
+  const stored = extensionGlobalState.get<StoredSshAgentEnv>(SSH_AGENT_ENV_KEY);
+  if (!stored || !stored.sock) {
+    return undefined;
+  }
+  return stored;
+}
+
+function storeSshAgentEnv(env: { sock: string; pid?: string }): void {
+  if (!extensionGlobalState || !env.sock) {
+    return;
+  }
+  void extensionGlobalState.update(SSH_AGENT_ENV_KEY, { sock: env.sock, pid: env.pid });
+}
+
 type SshToolName = 'ssh' | 'ssh-add' | 'ssh-keygen';
 const sshToolPathCache: Partial<Record<SshToolName, string>> = {};
 const WINDOWS_OPENSSH_PATH = 'C:\\Windows\\System32\\OpenSSH\\ssh.exe';
+const WINDOWS_OPENSSH_AGENT_PIPE = '\\\\.\\pipe\\openssh-ssh-agent';
 const SSH_VERSION_TIMEOUT_MS = 10_000;
 const HAS_WOW64 = Object.prototype.hasOwnProperty.call(process.env, 'PROCESSOR_ARCHITEW6432');
 let cachedRemoteSshPathSetting = '';
@@ -3431,11 +3456,8 @@ async function resolveGitSshAgentPath(sshPath: string): Promise<string | undefin
   return undefined;
 }
 
-async function ensureSshAgentEnvForCurrentSsh(): Promise<void> {
+async function ensureSshAgentEnvForCurrentSsh(identityPathRaw?: string): Promise<void> {
   if (process.platform !== 'win32') {
-    return;
-  }
-  if (process.env.SSH_AUTH_SOCK) {
     return;
   }
   const log = getOutputChannel();
@@ -3444,6 +3466,66 @@ async function ensureSshAgentEnvForCurrentSsh(): Promise<void> {
     log.appendLine(`Skipping Git ssh-agent setup (SSH path: ${sshPath}).`);
     return;
   }
+  const sshAdd = await resolveSshToolPath('ssh-add');
+  const identityPath = identityPathRaw ? expandHome(identityPathRaw) : '';
+  const identityFingerprint = identityPath ? await getPublicKeyFingerprint(identityPath) : undefined;
+
+  const candidates: Array<{ sock: string; pid?: string; label: string }> = [];
+  const seen = new Set<string>();
+  const currentEnv = getSshAgentEnv();
+  if (currentEnv.sock && !seen.has(currentEnv.sock)) {
+    seen.add(currentEnv.sock);
+    candidates.push({ sock: currentEnv.sock, pid: currentEnv.pid, label: 'current' });
+  }
+  const storedEnv = getStoredSshAgentEnv();
+  if (storedEnv?.sock && !seen.has(storedEnv.sock)) {
+    seen.add(storedEnv.sock);
+    candidates.push({ sock: storedEnv.sock, pid: storedEnv.pid, label: 'stored' });
+  }
+  if (!seen.has(WINDOWS_OPENSSH_AGENT_PIPE)) {
+    seen.add(WINDOWS_OPENSSH_AGENT_PIPE);
+    candidates.push({ sock: WINDOWS_OPENSSH_AGENT_PIPE, label: 'windows' });
+  }
+
+  const probes: Array<{
+    candidate: { sock: string; pid?: string; label: string };
+    info: SshAgentInfo;
+    matchesIdentity: boolean;
+  }> = [];
+
+  for (const candidate of candidates) {
+    const info = await probeSshAgentWithEnv(sshAdd, candidate);
+    if (info.status === 'unavailable') {
+      continue;
+    }
+    const matchesIdentity = identityFingerprint ? info.output.includes(identityFingerprint) : false;
+    probes.push({ candidate, info, matchesIdentity });
+  }
+
+  if (probes.length > 0) {
+    const matched = probes.find((probe) => probe.matchesIdentity);
+    const available = probes.find((probe) => probe.info.status === 'available');
+    const fallback = probes.find((probe) => probe.info.status === 'empty');
+    const selected = matched ?? available ?? fallback;
+    if (selected) {
+      process.env.SSH_AUTH_SOCK = selected.candidate.sock;
+      if (selected.candidate.pid) {
+        process.env.SSH_AGENT_PID = selected.candidate.pid;
+      } else {
+        delete process.env.SSH_AGENT_PID;
+      }
+      if (selected.candidate.label === 'windows') {
+        log.appendLine(`Using Windows OpenSSH agent pipe for Git SSH: ${WINDOWS_OPENSSH_AGENT_PIPE}`);
+      } else if (selected.candidate.label === 'stored') {
+        log.appendLine(`Restored SSH agent socket from state: ${selected.candidate.sock}`);
+      }
+      if (selected.info.status === 'available') {
+        storeSshAgentEnv({ sock: selected.candidate.sock, pid: selected.candidate.pid });
+      }
+      return;
+    }
+  }
+
   const agentPath = await resolveGitSshAgentPath(sshPath);
   if (!agentPath) {
     log.appendLine(`Git ssh-agent not found next to ${sshPath}.`);
@@ -3463,6 +3545,7 @@ async function ensureSshAgentEnvForCurrentSsh(): Promise<void> {
     }
     if (process.env.SSH_AUTH_SOCK) {
       log.appendLine(`Git SSH_AUTH_SOCK set to ${process.env.SSH_AUTH_SOCK}`);
+      storeSshAgentEnv({ sock: process.env.SSH_AUTH_SOCK, pid: process.env.SSH_AGENT_PID });
     } else {
       log.appendLine(`Git ssh-agent did not return SSH_AUTH_SOCK. Output: ${output.trim() || '(empty)'}`);
     }
@@ -3756,6 +3839,39 @@ async function createTerminalSshRunFiles(): Promise<{
   };
 }
 
+async function resolveLocalTerminalCwd(): Promise<string | undefined> {
+  const candidates: string[] = [];
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (workspaceFolder?.scheme === 'file') {
+    candidates.push(workspaceFolder.fsPath);
+  }
+  const homeDir = os.homedir();
+  if (homeDir) {
+    candidates.push(homeDir);
+  }
+  const currentDir = process.cwd();
+  if (currentDir) {
+    candidates.push(currentDir);
+  }
+  candidates.push(os.tmpdir());
+
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+async function createLocalTerminal(name: string): Promise<vscode.Terminal> {
+  const options: vscode.TerminalOptions = { name };
+  const cwd = await resolveLocalTerminalCwd();
+  if (cwd) {
+    options.cwd = cwd;
+  }
+  return vscode.window.createTerminal(options);
+}
+
 async function waitForFile(filePath: string, pollMs: number): Promise<void> {
   while (true) {
     try {
@@ -3803,7 +3919,7 @@ async function runSshCommandInTerminal(
         const sshCommand = [sshPath, ...args].map(quoteShellArg).join(' ');
         return `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
       })();
-  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH' });
+  const terminal = await createLocalTerminal('Slurm Connect SSH');
   terminal.show(true);
   terminal.sendText(shellCommand, true);
   void vscode.window.showInformationMessage('Enter your SSH key passphrase in the terminal.');
@@ -3856,7 +3972,7 @@ async function runPreSshCommandInTerminal(command: string): Promise<void> {
       })()
     : `${command}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
 
-  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect Auth' });
+  const terminal = await createLocalTerminal('Slurm Connect Auth');
   terminal.show(true);
   terminal.sendText(shellCommand, true);
   void vscode.window.showInformationMessage('Complete the pre-SSH authentication in the terminal.');
@@ -4039,16 +4155,47 @@ function looksLikeAgentUnavailable(text: string): boolean {
   ].some((pattern) => pattern.test(text));
 }
 
-async function getSshAgentInfo(): Promise<SshAgentInfo> {
+async function probeSshAgentWithEnv(
+  sshAdd: string,
+  env: { sock: string; pid?: string },
+  timeoutMs = 3000
+): Promise<SshAgentInfo> {
+  if (!env.sock) {
+    return { status: 'unavailable', output: '' };
+  }
+  const execEnv: NodeJS.ProcessEnv = { ...process.env, SSH_AUTH_SOCK: env.sock };
+  if (env.pid) {
+    execEnv.SSH_AGENT_PID = env.pid;
+  }
   try {
-    await ensureSshAgentEnvForCurrentSsh();
-    const sshAdd = await resolveSshToolPath('ssh-add');
-    const result = await execFileAsync(sshAdd, ['-l']);
+    const result = await execFileAsync(sshAdd, ['-l'], { env: execEnv, timeout: timeoutMs });
     const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
     if (!output.trim() || /no identities/i.test(output)) {
       return { status: 'empty', output };
     }
     return { status: 'available', output };
+  } catch (error) {
+    const errorText = normalizeSshErrorText(error);
+    if (/no identities/i.test(errorText)) {
+      return { status: 'empty', output: errorText };
+    }
+    if (looksLikeAgentUnavailable(errorText)) {
+      return { status: 'unavailable', output: errorText };
+    }
+    return { status: 'unavailable', output: errorText };
+  }
+}
+
+async function getSshAgentInfo(identityPathRaw?: string): Promise<SshAgentInfo> {
+  try {
+    await ensureSshAgentEnvForCurrentSsh(identityPathRaw);
+    const sshAdd = await resolveSshToolPath('ssh-add');
+    const agentEnv = getSshAgentEnv();
+    const info = await probeSshAgentWithEnv(sshAdd, agentEnv);
+    if (info.status === 'available') {
+      storeSshAgentEnv(agentEnv);
+    }
+    return info;
   } catch (error) {
     const errorText = normalizeSshErrorText(error);
     if (/no identities/i.test(errorText)) {
@@ -4097,7 +4244,7 @@ async function isSshKeyListedInAgentOutput(identityPath: string, output: string)
 }
 
 async function buildAgentStatusMessage(identityPathRaw: string): Promise<{ text: string; isError: boolean }> {
-  const agentInfo = await getSshAgentInfo();
+  const agentInfo = await getSshAgentInfo(identityPathRaw);
   const agentBase = agentInfo.status === 'available'
     ? 'SSH agent running'
     : agentInfo.status === 'empty'
@@ -4138,7 +4285,7 @@ async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
   if (!identityPath) {
     return false;
   }
-  const agentInfo = await getSshAgentInfo();
+  const agentInfo = await getSshAgentInfo(identityPath);
   if (agentInfo.status !== 'available') {
     return false;
   }
@@ -4183,7 +4330,7 @@ async function runSshAddInTerminal(identityPath: string): Promise<void> {
         return `${envPrefix} ${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
       })();
 
-  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH Add' });
+  const terminal = await createLocalTerminal('Slurm Connect SSH Add');
   terminal.show(true);
   terminal.sendText(shellCommand, true);
   void vscode.window.showInformationMessage('Follow the terminal prompt to add your SSH key with ssh-add.');
@@ -4238,7 +4385,7 @@ async function runSshKeygenPublicKeyInTerminal(identityPath: string): Promise<vo
         return `${cmd}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
       })();
 
-  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH Keygen' });
+  const terminal = await createLocalTerminal('Slurm Connect SSH Keygen');
   terminal.show(true);
   terminal.sendText(shellCommand, true);
   void vscode.window.showInformationMessage('Follow the terminal prompt to generate the public key.');
@@ -4289,7 +4436,7 @@ async function maybePromptForSshAuth(
   const identityExists = identityPath ? await fileExists(identityPath) : false;
   const pubExists = identityPath && identityExists ? await hasPublicKeyFile(identityPath) : false;
   const canTerminalPassphrase = Boolean(identityPath && identityExists);
-  const agentInfo = identityPath && identityExists ? await getSshAgentInfo() : undefined;
+  const agentInfo = identityPath && identityExists ? await getSshAgentInfo(identityPath) : undefined;
   if (identityPath && identityExists && agentInfo?.status === 'available') {
     if (await isSshKeyListedInAgentOutput(identityPath, agentInfo.output)) {
       return undefined;
@@ -4353,7 +4500,7 @@ async function maybePromptForSshAuth(
       );
       await refreshAgentStatus(cfg.identityFile);
       if (agentInfo?.status === 'available') {
-        const refreshed = await getSshAgentInfo();
+        const refreshed = await getSshAgentInfo(identityPath);
         if (await isSshKeyListedInAgentOutput(identityPath, refreshed.output)) {
           return { kind: 'agent' };
         }
@@ -4396,7 +4543,7 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
   }
   const identityExists = await fileExists(identityPath);
   const pubExists = identityExists ? await hasPublicKeyFile(identityPath) : false;
-  const agentInfo = identityExists ? await getSshAgentInfo() : undefined;
+  const agentInfo = identityExists ? await getSshAgentInfo(identityPath) : undefined;
   if (identityExists && agentInfo?.status === 'available') {
     const loaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
     if (loaded) {
