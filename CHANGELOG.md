@@ -22,6 +22,7 @@ All notable changes to this project are documented in this file based on git tag
 - Cluster info: stream the combined query script over stdin to avoid shell quoting/length errors on some hosts.
 - Windows: strip CRLF when piping stdin scripts through PowerShell to prevent bash `$'\r'` errors.
 - SSH detection: honor an explicit remote.SSH.path even if `ssh -V` output is unexpected.
+- Windows: clear stale MSYS SSH_AUTH_SOCK when using Windows OpenSSH so the native agent is detected.
 
 ### Added
 - Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.

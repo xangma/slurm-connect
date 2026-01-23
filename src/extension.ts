@@ -3422,6 +3422,21 @@ enum SshCommandKind {
   Other = 2
 }
 
+function isWindowsNamedPipe(value: string): boolean {
+  const lower = value.toLowerCase();
+  return lower.startsWith('\\\\.\\pipe\\') || lower.startsWith('//./pipe/');
+}
+
+function looksLikeMsysSocket(value: string): boolean {
+  if (!value) {
+    return false;
+  }
+  if (value.startsWith('/')) {
+    return true;
+  }
+  return value.includes('/ssh/') || value.includes('/agent/');
+}
+
 function stripOuterQuotes(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length < 2) {
@@ -3476,6 +3491,12 @@ async function ensureSshAgentEnvForCurrentSsh(identityPathRaw?: string): Promise
   const log = getOutputChannel();
   const sshPath = await resolveSshToolPath('ssh');
   if (!isGitSshPath(sshPath)) {
+    const existingSock = process.env.SSH_AUTH_SOCK || '';
+    if (existingSock && !isWindowsNamedPipe(existingSock) && looksLikeMsysSocket(existingSock)) {
+      log.appendLine(`Clearing SSH_AUTH_SOCK for Windows OpenSSH (${existingSock}).`);
+      delete process.env.SSH_AUTH_SOCK;
+      delete process.env.SSH_AGENT_PID;
+    }
     log.appendLine(`Skipping Git ssh-agent setup (SSH path: ${sshPath}).`);
     return;
   }
