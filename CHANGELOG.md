@@ -19,6 +19,7 @@ All notable changes to this project are documented in this file based on git tag
 - Windows: when Git SSH is in use and an agent socket is available, Slurm Connect now writes `IdentityAgent` in generated host entries to ensure Remote-SSH uses the correct agent.
 - Terminal-based prompts now use a safe local working directory to avoid failures when VS Code's default cwd is missing.
 - Windows: remember and reuse the last working SSH agent socket so reconnecting does not require re-adding keys.
+- Cluster info: avoid nested bash wrappers for session queries to prevent syntax errors on some hosts.
 
 ### Added
 - Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.

@@ -2692,8 +2692,8 @@ async function fetchClusterInfoWithSessions(
 ): Promise<{ info: ClusterInfo; sessions: SessionSummary[] }> {
   const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg);
   const log = getOutputChannel();
-  const sessionsCommand = buildSessionQueryCommand(cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR);
-  const combinedCommand = buildCombinedClusterInfoCommand(commands, sessionsCommand);
+  const sessionsScript = buildSessionQueryScript(cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR);
+  const combinedCommand = buildCombinedClusterInfoCommand(commands, sessionsScript);
   log.appendLine(`Cluster info single-call (with sessions) command: ${combinedCommand}`);
   const output = await runSshCommand(loginHost, cfg, combinedCommand);
   const { commandOutputs, modulesOutput, sessionsOutput } = parseCombinedClusterInfoOutput(output, commands.length);
@@ -2702,9 +2702,9 @@ async function fetchClusterInfoWithSessions(
   return { info, sessions };
 }
 
-function buildSessionQueryCommand(stateDir: string): string {
+function buildSessionQueryScript(stateDir: string): string {
   const dirLiteral = JSON.stringify(stateDir);
-  const script = [
+  return [
     'import json, os, subprocess, sys, re, time',
     `state_dir = os.path.expanduser(${dirLiteral})`,
     'sessions_dir = os.path.join(state_dir, "sessions")',
@@ -2852,6 +2852,10 @@ function buildSessionQueryCommand(stateDir: string): string {
     '    })',
     'print(json.dumps(sessions))'
   ].join('\n');
+}
+
+function buildSessionQueryCommand(stateDir: string): string {
+  const script = buildSessionQueryScript(stateDir);
   const encodedScript = Buffer.from(script, 'utf8').toString('base64');
   return wrapPythonScriptCommand(encodedScript, '"[]"');
 }
@@ -3075,10 +3079,22 @@ const CLUSTER_SESSIONS_END = '__SC_SESSIONS_END__';
 
 function buildCombinedClusterInfoCommand(
   commands: string[],
-  sessionsCommand?: string
+  sessionsScript?: string
 ): string {
   const encodedCommands = commands.map((command) => Buffer.from(command, 'utf8').toString('base64'));
   const commandArray = encodedCommands.map((encoded) => `'${encoded}'`).join(' ');
+  const sessionLines: string[] = [];
+  if (sessionsScript) {
+    const encodedSessions = Buffer.from(sessionsScript, 'utf8').toString('base64');
+    sessionLines.push(`echo "${CLUSTER_SESSIONS_START}"`);
+    sessionLines.push('PYTHON=$(command -v python3 || command -v python || true)');
+    sessionLines.push('if [ -z "$PYTHON" ]; then');
+    sessionLines.push('  echo "[]"');
+    sessionLines.push('else');
+    sessionLines.push(`  printf %s ${encodedSessions} | base64 -d | "$PYTHON" -`);
+    sessionLines.push('fi');
+    sessionLines.push(`echo "${CLUSTER_SESSIONS_END}"`);
+  }
   const script = [
     'set +e',
     `cmds=(${commandArray})`,
@@ -3090,9 +3106,7 @@ function buildCombinedClusterInfoCommand(
     `  echo "${CLUSTER_CMD_END}\${i}__"`,
     '  i=$((i+1))',
     'done',
-    sessionsCommand ? `echo "${CLUSTER_SESSIONS_START}"` : '',
-    sessionsCommand ? sessionsCommand : '',
-    sessionsCommand ? `echo "${CLUSTER_SESSIONS_END}"` : '',
+    ...sessionLines,
     `echo "${CLUSTER_MODULES_START}"`,
     'modules=$(module -t avail 2>&1)',
     'status=$?',
