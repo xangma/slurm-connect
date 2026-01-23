@@ -7,7 +7,7 @@ This doc covers the Slurm Connect UI and workflow. For cluster discovery details
 - **Login host**: Login node to connect/query. You can enter multiple hosts separated by spaces/commas/newlines; the first is used by default.
 - **SSH user**: Overrides the SSH username for queries and generated host entries. Leave blank to use your local OS username or SSH config.
 - **Identity file (optional)**: SSH private key path to use for queries and generated host entries. Leave blank to rely on your SSH config/agent.
-- **Remote folder to open (optional)**: Remote path that VS Code opens after connecting.
+- **Remote folder to open (optional)**: Remote path that VS Code opens after connecting (leave blank to open an empty window).
 - **Get cluster info**: Fetches partitions/resources via SSH and fills pickers/suggestions.
 - **Clear**: Clears the cached cluster info shown in the UI.
 - **Existing sessions**: When persistent sessions are enabled and found, lets you pick one to reuse.
@@ -75,7 +75,7 @@ Global settings such as the SSH host prefix, managed include path, session state
 - Other saved settings (non-default fields) are listed under the resource summary so you can audit what will be applied.
 - Inline validation hints appear under resource fields (nodes, memory, wall time).
 - The **Identity file** field includes a Browse button to insert local paths quickly.
-- The **Remote folder** field expects a path on the cluster (enter manually).
+- The **Remote folder** field expects a path on the cluster (enter manually). Leave it blank to connect without opening a folder.
 - Module selection supports chips, clear-all, and pasting multiple module names (space/newline separated), including `module load ...` lines.
 - Advanced settings include a **Reset advanced to defaults** button to restore command/SSH settings.
 - When connected to a persistent session, a **Cancel job (disconnects)** button appears to terminate the allocation (cancel is only available from an active remote session).

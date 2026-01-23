@@ -203,6 +203,8 @@ const DEFAULT_SESSION_STATE_DIR = '~/.slurm-connect';
 const DEFAULT_PROXY_SCRIPT_INSTALL_PATH = '~/.slurm-connect/vscode-proxy.py';
 const PROXY_OVERRIDE_RESET_KEY = 'slurmConnect.proxyOverrideReset';
 const SSH_AGENT_ENV_KEY = 'slurmConnect.sshAgentEnv';
+const LAST_CONNECTION_STATE_KEY = 'slurmConnect.lastConnectionState';
+const REMOTE_HOME_CACHE_KEY = 'slurmConnect.remoteHomeCache';
 const LOCAL_PROXY_TUNNEL_STATE_KEY = 'slurmConnect.localProxyTunnelState';
 const LOCAL_PROXY_RUNTIME_STATE_KEY = 'slurmConnect.localProxyRuntimeState';
 const CONFIG_KEYS = [
@@ -1210,6 +1212,7 @@ function resolveRemoteSshAlias(): string | undefined {
 }
 
 function syncConnectionStateFromEnvironment(): void {
+  applyStoredConnectionStateIfMissing();
   const remoteActive = vscode.env.remoteName === 'ssh-remote';
   if (remoteActive) {
     if (connectionState === 'idle') {
@@ -1218,6 +1221,12 @@ function syncConnectionStateFromEnvironment(): void {
     const alias = resolveRemoteSshAlias();
     if (alias) {
       lastConnectionAlias = alias;
+      storeConnectionState({
+        alias,
+        sessionKey: lastConnectionSessionKey,
+        sessionMode: lastConnectionSessionMode,
+        loginHost: lastConnectionLoginHost
+      });
     }
     const cfg = getConfig();
     if (!lastConnectionSessionMode) {
@@ -1229,6 +1238,12 @@ function syncConnectionStateFromEnvironment(): void {
     if (!lastConnectionLoginHost && cfg.loginHosts.length > 0) {
       lastConnectionLoginHost = cfg.loginHosts[0];
     }
+    storeConnectionState({
+      alias: lastConnectionAlias,
+      sessionKey: lastConnectionSessionKey,
+      sessionMode: lastConnectionSessionMode,
+      loginHost: lastConnectionLoginHost
+    });
     return;
   }
   if (connectionState === 'connected') {
@@ -1835,6 +1850,9 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             void vscode.window.showWarningMessage('No persistent Slurm session is active to cancel.');
             break;
           }
+          getOutputChannel().appendLine(
+            `Cancel job requested. remoteName=${vscode.env.remoteName || 'local'}, alias=${lastConnectionAlias || '(none)'}, sessionKey=${lastConnectionSessionKey || '(none)'}, loginHost=${lastConnectionLoginHost || '(none)'}`
+          );
           const label = lastConnectionSessionKey || lastConnectionAlias || 'current session';
           const choice = await vscode.window.showWarningMessage(
             `Cancel job "${label}"? This will end the allocation and close the remote connection. Close this dialog to keep it running.`,
@@ -1846,12 +1864,15 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           }
           const cfg = getConfig();
           const aliasFromRemote = resolveRemoteSshAlias();
-          const aliasForSession = lastConnectionAlias || aliasFromRemote || '';
+          const stored = getStoredConnectionState();
+          const aliasForSession = lastConnectionAlias || stored?.alias || aliasFromRemote || '';
           const sessionKey =
             lastConnectionSessionKey ||
+            stored?.sessionKey ||
             (aliasForSession ? resolveSessionKey(cfg, aliasForSession) : '');
           let loginHost =
             lastConnectionLoginHost ||
+            stored?.loginHost ||
             (cfg.loginHosts.length > 0 ? cfg.loginHosts[0] : undefined);
           if (!loginHost && aliasForSession) {
             try {
@@ -1862,11 +1883,17 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             }
           }
           const isRemoteSession = vscode.env.remoteName === 'ssh-remote';
+          getOutputChannel().appendLine(
+            `Cancel job resolved. alias=${aliasForSession || '(none)'}, sessionKey=${sessionKey || '(none)'}, loginHost=${loginHost || '(none)'}, remote=${isRemoteSession}`
+          );
           if (sessionKey && (loginHost || isRemoteSession)) {
             await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
               useTerminal: true
             });
           } else {
+            getOutputChannel().appendLine(
+              'Cancel job failed to resolve login host or session key; cannot proceed.'
+            );
             void vscode.window.showWarningMessage(
               'Unable to resolve the login host or session key to cancel the Slurm job.'
             );
@@ -2441,15 +2468,31 @@ async function connectCommand(
     }
   }
   didConnect = connected;
-  if (connected) {
-    lastConnectionSessionKey = sessionKey || undefined;
-    lastConnectionSessionMode = cfg.sessionMode;
-    lastConnectionLoginHost = loginHost;
-  } else {
-    lastConnectionSessionKey = undefined;
-    lastConnectionSessionMode = undefined;
-    lastConnectionLoginHost = undefined;
-  }
+    if (connected) {
+      lastConnectionSessionKey = sessionKey || undefined;
+      lastConnectionSessionMode = cfg.sessionMode;
+      lastConnectionLoginHost = loginHost;
+      storeConnectionState({
+        alias: lastConnectionAlias,
+        sessionKey: lastConnectionSessionKey,
+        sessionMode: lastConnectionSessionMode,
+        loginHost: lastConnectionLoginHost
+      });
+      if (loginHost) {
+        const cachedHome = getCachedRemoteHome(loginHost);
+        if (!cachedHome) {
+          void fetchRemoteHomeNoPrompt(loginHost, cfg).then((home) => {
+            if (home) {
+              storeRemoteHome(loginHost, home);
+            }
+          });
+        }
+      }
+    } else {
+      lastConnectionSessionKey = undefined;
+      lastConnectionSessionMode = undefined;
+      lastConnectionLoginHost = undefined;
+    }
   if (!connected) {
     if (!wasCancelled()) {
       void vscode.window.showWarningMessage(
@@ -3400,6 +3443,16 @@ interface StoredSshAgentEnv {
   pid?: string;
 }
 
+interface StoredConnectionState {
+  alias?: string;
+  sessionKey?: string;
+  sessionMode?: SessionMode;
+  loginHost?: string;
+  updatedAt?: number;
+}
+
+type RemoteHomeCache = Record<string, string>;
+
 function getStoredSshAgentEnv(): StoredSshAgentEnv | undefined {
   if (!extensionGlobalState) {
     return undefined;
@@ -3416,6 +3469,67 @@ function storeSshAgentEnv(env: { sock: string; pid?: string }): void {
     return;
   }
   void extensionGlobalState.update(SSH_AGENT_ENV_KEY, { sock: env.sock, pid: env.pid });
+}
+
+function getStoredConnectionState(): StoredConnectionState | undefined {
+  if (!extensionGlobalState) {
+    return undefined;
+  }
+  const stored = extensionGlobalState.get<StoredConnectionState>(LAST_CONNECTION_STATE_KEY);
+  if (!stored) {
+    return undefined;
+  }
+  return stored;
+}
+
+function storeConnectionState(state: StoredConnectionState): void {
+  if (!extensionGlobalState) {
+    return;
+  }
+  void extensionGlobalState.update(LAST_CONNECTION_STATE_KEY, { ...state, updatedAt: Date.now() });
+}
+
+function getRemoteHomeCache(): RemoteHomeCache {
+  if (!extensionGlobalState) {
+    return {};
+  }
+  return extensionGlobalState.get<RemoteHomeCache>(REMOTE_HOME_CACHE_KEY) || {};
+}
+
+function getCachedRemoteHome(loginHost: string): string | undefined {
+  if (!loginHost) {
+    return undefined;
+  }
+  const cache = getRemoteHomeCache();
+  return cache[loginHost];
+}
+
+function storeRemoteHome(loginHost: string, homeDir: string): void {
+  if (!extensionGlobalState || !loginHost || !homeDir) {
+    return;
+  }
+  const cache = getRemoteHomeCache();
+  cache[loginHost] = homeDir;
+  void extensionGlobalState.update(REMOTE_HOME_CACHE_KEY, cache);
+}
+
+function applyStoredConnectionStateIfMissing(): void {
+  const stored = getStoredConnectionState();
+  if (!stored) {
+    return;
+  }
+  if (!lastConnectionAlias && stored.alias) {
+    lastConnectionAlias = stored.alias;
+  }
+  if (!lastConnectionSessionKey && stored.sessionKey) {
+    lastConnectionSessionKey = stored.sessionKey;
+  }
+  if (!lastConnectionSessionMode && stored.sessionMode) {
+    lastConnectionSessionMode = stored.sessionMode;
+  }
+  if (!lastConnectionLoginHost && stored.loginHost) {
+    lastConnectionLoginHost = stored.loginHost;
+  }
 }
 
 type SshToolName = 'ssh' | 'ssh-add' | 'ssh-keygen';
@@ -3894,6 +4008,24 @@ function appendSshHostKeyCheckingArgs(args: string[], cfg: SlurmConnectConfig): 
   args.push('-o', `StrictHostKeyChecking=${mode}`);
 }
 
+async function fetchRemoteHomeNoPrompt(loginHost: string, cfg: SlurmConnectConfig): Promise<string | undefined> {
+  if (!loginHost) {
+    return undefined;
+  }
+  const sshPath = await resolveSshToolPath('ssh');
+  const args = buildSshArgs(loginHost, cfg, 'printf %s "$HOME"', { batchMode: true });
+  try {
+    const { stdout } = await execFileAsync(sshPath, args, { timeout: 5000 });
+    const trimmed = stdout.trim();
+    if (trimmed.startsWith('/') && !trimmed.includes('\u0000')) {
+      return trimmed;
+    }
+  } catch {
+    // Ignore failures; we'll fall back to a safe path.
+  }
+  return undefined;
+}
+
 function buildSshArgs(
   host: string,
   cfg: SlurmConnectConfig,
@@ -3945,7 +4077,33 @@ async function createTerminalSshRunFiles(): Promise<{
 async function resolveLocalTerminalCwd(): Promise<string | undefined> {
   if (vscode.env.remoteName) {
     if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
-      return '~';
+      const cfg = getConfig();
+      const stored = getStoredConnectionState();
+      let loginHost = stored?.loginHost || lastConnectionLoginHost || '';
+      let resolvedUser = cfg.user?.trim() || '';
+      const alias = stored?.alias || lastConnectionAlias || resolveRemoteSshAlias() || '';
+      if ((!loginHost || !resolvedUser) && alias) {
+        try {
+          const resolved = await resolveSshHostFromConfig(alias, cfg);
+          loginHost = loginHost || resolved.hostname || resolved.host || '';
+          resolvedUser = resolvedUser || (resolved.user || '').trim();
+        } catch {
+          // Ignore resolve failures; we'll fall back.
+        }
+      }
+      const cachedHome = loginHost ? getCachedRemoteHome(loginHost) : undefined;
+      if (cachedHome) {
+        return cachedHome;
+      }
+      const fetched = loginHost ? await fetchRemoteHomeNoPrompt(loginHost, cfg) : undefined;
+      if (fetched) {
+        storeRemoteHome(loginHost, fetched);
+        return fetched;
+      }
+      if (resolvedUser) {
+        return `/home/${resolvedUser}`;
+      }
+      return '/tmp';
     }
     return undefined;
   }
@@ -5841,8 +5999,8 @@ async function cancelPersistentSessionJob(
     const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
     if (vscode.env.remoteName === 'ssh-remote') {
       const localCommand = buildLocalCancelPersistentSessionCommand(stateDir, sessionKey);
-      log.appendLine(`Cancelling session "${sessionKey}" in remote terminal.`);
-      const terminal = vscode.window.createTerminal({ name: 'Slurm Connect Cancel' });
+      log.appendLine(`Cancelling session "${sessionKey}" in remote terminal (loginHost=${loginHost}).`);
+      const terminal = await createLocalTerminal('Slurm Connect Cancel');
       terminal.show(true);
       terminal.sendText(localCommand, true);
       void vscode.window.showInformationMessage(
@@ -7886,15 +8044,23 @@ async function connectToHost(
   }
 
   const hostArg = { host: alias };
+  const openEmptyOnly = !trimmedPath;
 
   if (openInNewWindow) {
     const commandCandidates: Array<[string, unknown]> = [
       ['opensshremotes.openEmptyWindow', hostArg],
-      ['remote-ssh.connectToHost', alias],
-      ['opensshremotes.connectToHost', hostArg],
       ['remote-ssh.openEmptyWindow', alias],
+      ['opensshremotes.openEmptyWindowInCurrentWindow', hostArg],
       ['remote-ssh.openEmptyWindowInCurrentWindow', alias]
     ];
+    if (!openEmptyOnly) {
+      commandCandidates.push(
+        ['remote-ssh.connectToHost', alias],
+        ['opensshremotes.connectToHost', hostArg]
+      );
+    } else {
+      log.appendLine('Remote folder not set; opening an empty remote window only.');
+    }
     for (const [command, args] of commandCandidates) {
       try {
         log.appendLine(`Trying command: ${command}`);
@@ -7907,18 +8073,29 @@ async function connectToHost(
       }
     }
     log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
+    if (openEmptyOnly) {
+      void vscode.window.showWarningMessage(
+        'Could not open an empty Remote-SSH window. Configure a remote folder to open or update Remote-SSH.'
+      );
+    }
     return false;
   }
 
   try {
     const commandCandidates: Array<[string, unknown]> = [
       ['opensshremotes.openEmptyWindowInCurrentWindow', hostArg],
-      ['opensshremotes.openEmptyWindow', hostArg],
-      ['remote-ssh.connectToHost', alias],
-      ['opensshremotes.connectToHost', hostArg],
       ['remote-ssh.openEmptyWindowInCurrentWindow', alias],
+      ['opensshremotes.openEmptyWindow', hostArg],
       ['remote-ssh.openEmptyWindow', alias]
     ];
+    if (!openEmptyOnly) {
+      commandCandidates.push(
+        ['remote-ssh.connectToHost', alias],
+        ['opensshremotes.connectToHost', hostArg]
+      );
+    } else {
+      log.appendLine('Remote folder not set; opening an empty remote window only.');
+    }
     for (const [command, args] of commandCandidates) {
       try {
         log.appendLine(`Trying command: ${command}`);
@@ -7931,6 +8108,11 @@ async function connectToHost(
       }
     }
     log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
+    if (openEmptyOnly) {
+      void vscode.window.showWarningMessage(
+        'Could not open an empty Remote-SSH window. Configure a remote folder to open or update Remote-SSH.'
+      );
+    }
     return false;
   } finally {
     // No-op

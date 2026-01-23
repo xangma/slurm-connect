@@ -26,8 +26,10 @@ All notable changes to this project are documented in this file based on git tag
 - Windows: when using OpenSSH without SSH_AUTH_SOCK, agent checks now fall back to the native service.
 - UI: prevent the cluster info action row from forcing horizontal scrolling in narrow panels.
 - Cancel job: fall back to resolving the login host from SSH config when the original login host isn't cached.
-- Terminals: use `~` as the cwd for remote terminals when no workspace is open to avoid local-path failures.
+- Terminals: default remote terminals to `$HOME` (queried once and cached); fall back to `/tmp` if unavailable.
+- Cancel job: persist last connection details so cancellation works even without an open workspace folder.
 - Cancel job: allow cancellation in a remote session even when the login host isn't cached.
+- Connect: when no remote folder is set, only open an empty Remote-SSH window instead of falling back to a folder.
 
 ### Added
 - Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.

@@ -8,7 +8,7 @@ Key features:
 - Automatic SSH include management for Remote-SSH (no manual host entries).
 - Resource validation hints and profile support for repeatable runs.
 - Module picker with paste, chips, and clear-all.
-- Optional remote folder open + window targeting.
+- Optional remote folder open (leave blank for an empty window) + window targeting.
 - Optional local HTTP(S) proxy for outbound requests from compute nodes (proxies all non-loopback hosts).
 
 ## Requirements

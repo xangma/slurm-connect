@@ -49,7 +49,7 @@ All settings live under the `slurmConnect` namespace.
 | `slurmConnect.defaultGpuCount` | number | `0` | Default GPU count. Set to 0 to leave unset. |
 | `slurmConnect.sshHostPrefix` | string | `"slurm"` | Prefix for generated SSH host aliases. |
 | `slurmConnect.openInNewWindow` | boolean | `false` | Open the Remote-SSH connection in a new window. |
-| `slurmConnect.remoteWorkspacePath` | string | `""` | Remote folder to open after connecting (e.g. /home/user/project). Leave blank to just connect. |
+| `slurmConnect.remoteWorkspacePath` | string | `""` | Remote folder to open after connecting (e.g. /home/user/project). Leave blank to open an empty window. |
 | `slurmConnect.temporarySshConfigPath` | string | `"~/.ssh/slurm-connect.conf"` | Path for the Slurm Connect SSH include file. The extension installs a small Include block (with a note) in your SSH config that points here. On Windows, prefer the `~/.ssh/...` form for compatibility with POSIX-style ssh clients. |
 | `slurmConnect.additionalSshOptions` | object | `{}` | Additional SSH config options to include in generated host entries. |
 | `slurmConnect.sshQueryConfigPath` | string | `""` | Optional SSH config path to use when querying the cluster. |
