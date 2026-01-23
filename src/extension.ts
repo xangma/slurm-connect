@@ -1198,7 +1198,9 @@ function resolveRemoteSshAlias(): string | undefined {
     return undefined;
   }
   const folders = vscode.workspace.workspaceFolders;
-  const authority = folders && folders.length > 0 ? folders[0].uri.authority : undefined;
+  const folderAuthority = folders && folders.length > 0 ? folders[0].uri.authority : undefined;
+  const envWithAuthority = vscode.env as { remoteAuthority?: string };
+  const authority = folderAuthority || envWithAuthority.remoteAuthority;
   if (!authority) {
     return undefined;
   }
@@ -1886,7 +1888,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           getOutputChannel().appendLine(
             `Cancel job resolved. alias=${aliasForSession || '(none)'}, sessionKey=${sessionKey || '(none)'}, loginHost=${loginHost || '(none)'}, remote=${isRemoteSession}`
           );
-          if (sessionKey && (loginHost || isRemoteSession)) {
+          if (loginHost || isRemoteSession) {
             await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
               useTerminal: true
             });
@@ -5959,38 +5961,48 @@ function buildSessionJobLookupScript(stateDir: string, sessionKey: string): stri
   ].join('\n');
 }
 
-function buildLocalCancelPersistentSessionCommand(stateDir: string, sessionKey: string): string {
-  const script = buildSessionJobLookupScript(stateDir, sessionKey);
-  return [
+function buildLocalCancelPersistentSessionCommand(stateDir: string, sessionKey?: string): string {
+  const key = (sessionKey || '').trim();
+  const lines = [
     'set +e',
     'JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-}}"',
     'if [ -n "$JOB_ID" ]; then',
     '  echo "Slurm Connect: cancelling job $JOB_ID (from SLURM_JOB_ID)"',
     '  scancel "$JOB_ID"',
     '  exit $?',
-    'fi',
-    'PYTHON=$(command -v python3 || command -v python || true)',
-    'if [ -z "$PYTHON" ]; then',
-    '  echo "Slurm Connect: python not available to resolve session job."',
-    '  exit 1',
-    'fi',
-    'JOB_ID=$("$PYTHON" - <<\'PY\'',
-    script,
-    'PY',
-    ')',
-    'JOB_ID=$(printf "%s" "$JOB_ID" | tr -d "\\r" | tail -n 1)',
-    'if [ -z "$JOB_ID" ]; then',
-    '  echo "Slurm Connect: no session job found."',
-    '  exit 1',
-    'fi',
-    'echo "Slurm Connect: cancelling job $JOB_ID"',
-    'scancel "$JOB_ID"'
-  ].join('\n');
+    'fi'
+  ];
+  if (!key) {
+    lines.push('echo "Slurm Connect: no session key available to look up job id."');
+    lines.push('exit 1');
+    return lines.join('\n');
+  }
+  const script = buildSessionJobLookupScript(stateDir, key);
+  return lines
+    .concat([
+      'PYTHON=$(command -v python3 || command -v python || true)',
+      'if [ -z "$PYTHON" ]; then',
+      '  echo "Slurm Connect: python not available to resolve session job."',
+      '  exit 1',
+      'fi',
+      'JOB_ID=$("$PYTHON" - <<\'PY\'',
+      script,
+      'PY',
+      ')',
+      'JOB_ID=$(printf "%s" "$JOB_ID" | tr -d "\\r" | tail -n 1)',
+      'if [ -z "$JOB_ID" ]; then',
+      '  echo "Slurm Connect: no session job found."',
+      '  exit 1',
+      'fi',
+      'echo "Slurm Connect: cancelling job $JOB_ID"',
+      'scancel "$JOB_ID"'
+    ])
+    .join('\n');
 }
 
 async function cancelPersistentSessionJob(
   loginHost: string,
-  sessionKey: string,
+  sessionKey: string | undefined,
   cfg: SlurmConnectConfig,
   options?: { useTerminal?: boolean }
 ): Promise<boolean> {
@@ -5999,7 +6011,9 @@ async function cancelPersistentSessionJob(
     const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
     if (vscode.env.remoteName === 'ssh-remote') {
       const localCommand = buildLocalCancelPersistentSessionCommand(stateDir, sessionKey);
-      log.appendLine(`Cancelling session "${sessionKey}" in remote terminal (loginHost=${loginHost}).`);
+      log.appendLine(
+        `Cancelling session "${sessionKey || 'unknown'}" in remote terminal (loginHost=${loginHost}).`
+      );
       const terminal = await createLocalTerminal('Slurm Connect Cancel');
       terminal.show(true);
       terminal.sendText(localCommand, true);

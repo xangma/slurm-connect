@@ -30,6 +30,7 @@ All notable changes to this project are documented in this file based on git tag
 - Cancel job: persist last connection details so cancellation works even without an open workspace folder.
 - Cancel job: allow cancellation in a remote session even when the login host isn't cached.
 - Connect: when no remote folder is set, only open an empty Remote-SSH window instead of falling back to a folder.
+- Cancel job: resolve the remote SSH alias even when no folder is open; allow SLURM_JOB_ID-based cancel when the session key is unavailable.
 
 ### Added
 - Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.
