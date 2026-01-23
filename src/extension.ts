@@ -7386,6 +7386,7 @@ async function ensureRemoteSshPathOnWindows(): Promise<void> {
 
 async function ensureRemoteSshSettings(cfg: SlurmConnectConfig): Promise<void> {
   await ensureRemoteSshPathOnWindows();
+  await ensureSshAgentEnvForCurrentSsh();
   await ensureLocalServerSetting();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const enableRemoteCommand = remoteCfg.get<boolean>('enableRemoteCommand', false);
@@ -7464,6 +7465,13 @@ async function connectToHost(
     return false;
   }
   const log = getOutputChannel();
+  await ensureSshAgentEnvForCurrentSsh();
+  if (process.platform === 'win32') {
+    const sshPath = await resolveSshToolPath('ssh');
+    if (isGitSshPath(sshPath) && !process.env.SSH_AUTH_SOCK) {
+      log.appendLine('Git SSH agent socket is not set; Remote-SSH may prompt for a passphrase.');
+    }
+  }
   await remoteExtension.activate();
   const availableCommands = await vscode.commands.getCommands(true);
   const sshCommands = availableCommands.filter((command) => /ssh|openssh/i.test(command));
