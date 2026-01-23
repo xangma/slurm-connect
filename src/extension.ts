@@ -3363,10 +3363,53 @@ function getSshAgentEnv(): { sock: string; pid: string } {
 type SshToolName = 'ssh' | 'ssh-add' | 'ssh-keygen';
 const sshToolPathCache: Partial<Record<SshToolName, string>> = {};
 
+function stripOuterQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length < 2) {
+    return trimmed;
+  }
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+async function resolveRemoteSshPath(): Promise<string | undefined> {
+  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
+  const configured = String(remoteCfg.get<string>('path') || '').trim();
+  if (!configured) {
+    return undefined;
+  }
+  const stripped = stripOuterQuotes(configured);
+  const expanded = expandHome(stripped);
+  if (await fileExists(expanded)) {
+    return expanded;
+  }
+  if (await fileExists(stripped)) {
+    return stripped;
+  }
+  return undefined;
+}
+
 async function resolveSshToolPath(tool: SshToolName): Promise<string> {
   const cached = sshToolPathCache[tool];
   if (cached) {
     return cached;
+  }
+  const remotePath = await resolveRemoteSshPath();
+  if (remotePath) {
+    sshToolPathCache.ssh = remotePath;
+    if (tool === 'ssh') {
+      return remotePath;
+    }
+    const ext = path.extname(remotePath);
+    const candidate = path.join(path.dirname(remotePath), ext ? `${tool}${ext}` : tool);
+    if (await fileExists(candidate)) {
+      sshToolPathCache[tool] = candidate;
+      return candidate;
+    }
   }
   if (process.platform !== 'win32') {
     sshToolPathCache[tool] = tool;
