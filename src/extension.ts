@@ -4201,16 +4201,23 @@ async function runSshCommandInTerminal(
           stdinPath ? `$stdinPath = ${quotePowerShellString(stdinPath)}` : '',
           `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
           `$statusPath = ${quotePowerShellString(statusPath)}`,
+          psArgs ? `$sshArgs = @(${psArgs})` : '$sshArgs = @()',
           '$exitCode = 1',
           'try {',
           stdinPath
             ? [
                 '  $inputText = Get-Content -Raw $stdinPath',
                 '  $inputText = $inputText.Replace("`r", "")',
-                `  $inputText | & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`
+                '  $stdinNormalizedPath = Join-Path ([System.IO.Path]::GetDirectoryName($stdinPath)) "stdin-normalized.txt"',
+                '  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)',
+                '  [System.IO.File]::WriteAllText($stdinNormalizedPath, $inputText, $utf8NoBom)',
+                '  $proc = Start-Process -FilePath $sshPath -ArgumentList $sshArgs -NoNewWindow -Wait -PassThru -RedirectStandardInput $stdinNormalizedPath -RedirectStandardOutput $stdoutPath',
+                '  $exitCode = if ($null -ne $proc) { $proc.ExitCode } else { $LASTEXITCODE }'
               ].join('; ')
-            : `  & $sshPath @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`,
-          '  $exitCode = $LASTEXITCODE',
+            : [
+                '  $proc = Start-Process -FilePath $sshPath -ArgumentList $sshArgs -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutPath',
+                '  $exitCode = if ($null -ne $proc) { $proc.ExitCode } else { $LASTEXITCODE }'
+              ].join('; '),
           '} catch {',
           '  $exitCode = 1',
           '}',

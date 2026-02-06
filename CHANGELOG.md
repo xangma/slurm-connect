@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file based on git tag
 - Proxy: ephemeral follow-up connections now stay on Slurm allocation by default; legacy login-shell bypass is opt-in via `--ephemeral-exec-server-bypass`.
 - Proxy: ephemeral shell launch now uses `salloc ... srun ...` so clusters that run `salloc <command>` on login nodes still start VS Code on compute nodes.
 - Remote-SSH settings check now warns when `remote.SSH.connectTimeout` is too low for first-time server download/start and offers to raise it to 300 seconds.
+- Windows: terminal fallback for SSH-with-stdin now streams normalized LF input via redirected stdin (avoids CRLF `$'\\r'` bash errors on remote `bash -s` scripts).
 
 ## 0.5.4 - 2026-01-23
 ### Fixed
