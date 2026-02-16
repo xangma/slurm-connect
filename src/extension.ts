@@ -1069,6 +1069,14 @@ type ProfileValues = { [K in ProfileUiKey]?: UiValues[K] };
 type ClusterUiCache = Partial<UiValues>;
 
 const PROFILE_UI_KEY_SET = new Set<keyof UiValues>(PROFILE_UI_KEYS);
+const OPTIONAL_NUMERIC_PROFILE_UI_KEYS = new Set<ProfileUiKey>([
+  'sessionIdleTimeoutSeconds',
+  'defaultNodes',
+  'defaultTasksPerNode',
+  'defaultCpusPerTask',
+  'defaultMemoryMb',
+  'defaultGpuCount'
+]);
 
 interface ProfileEntry {
   name: string;
@@ -1273,7 +1281,12 @@ function pickProfileValues(values: Partial<UiValues>): ProfileValues {
   const target = picked as Record<ProfileUiKey, UiValues[ProfileUiKey]>;
   for (const key of PROFILE_UI_KEY_SET) {
     if (Object.prototype.hasOwnProperty.call(values, key)) {
-      target[key as ProfileUiKey] = values[key] as UiValues[ProfileUiKey];
+      const typedKey = key as ProfileUiKey;
+      const value = values[typedKey];
+      if (OPTIONAL_NUMERIC_PROFILE_UI_KEYS.has(typedKey) && typeof value === 'string' && value.trim().length === 0) {
+        continue;
+      }
+      target[typedKey] = value as UiValues[ProfileUiKey];
     }
   }
   return picked;
@@ -1900,8 +1913,9 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
               'Cancel job: session key unavailable; will rely on SLURM_JOB_ID in the remote terminal.'
             );
           }
+          let cancelSent = false;
           if (loginHost || isRemoteSession) {
-            await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
+            cancelSent = await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
               useTerminal: true
             });
           } else {
@@ -1910,6 +1924,22 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             );
             void vscode.window.showWarningMessage(
               'Unable to resolve the login host or session key to cancel the Slurm job.'
+            );
+          }
+          if (!cancelSent) {
+            break;
+          }
+          setConnectionState('disconnecting');
+          const disconnected = await disconnectFromHost(aliasForSession || lastConnectionAlias);
+          if (disconnected) {
+            lastConnectionSessionKey = undefined;
+            lastConnectionSessionMode = undefined;
+            lastConnectionLoginHost = undefined;
+            setConnectionState('idle');
+          } else {
+            setConnectionState('connected');
+            void vscode.window.showWarningMessage(
+              'Job cancel command was sent, but the Remote-SSH window stayed connected. Disconnect manually if needed.'
             );
           }
           break;
@@ -8271,7 +8301,27 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
   await remoteExtension.activate();
   const availableCommands = await vscode.commands.getCommands(true);
   const sshCommands = availableCommands.filter((command) => /ssh|openssh|remote\.close/i.test(command));
-  const finalizeDisconnect = (): boolean => {
+  const ensureRemoteSessionClosed = async (): Promise<boolean> => {
+    if (vscode.env.remoteName !== 'ssh-remote') {
+      return true;
+    }
+    const timeoutMs = 5000;
+    const pollMs = 100;
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (vscode.env.remoteName !== 'ssh-remote') {
+        return true;
+      }
+      await delay(pollMs);
+    }
+    return vscode.env.remoteName !== 'ssh-remote';
+  };
+  const finalizeDisconnect = async (): Promise<boolean> => {
+    const closed = await ensureRemoteSessionClosed();
+    if (!closed) {
+      log.appendLine('Disconnect command completed but remote session is still active.');
+      return false;
+    }
     stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
     return true;
   };
@@ -8288,8 +8338,12 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
       try {
         log.appendLine(`Trying disconnect command: ${command}`);
         await vscode.commands.executeCommand(command);
-        log.appendLine(`Disconnect command succeeded: ${command}`);
-        return finalizeDisconnect();
+        const closed = await finalizeDisconnect();
+        if (closed) {
+          log.appendLine(`Disconnect command succeeded: ${command}`);
+          return true;
+        }
+        log.appendLine(`Disconnect command did not close remote session: ${command}`);
       } catch (error) {
         log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
       }
@@ -8327,8 +8381,12 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
     try {
       log.appendLine(`Trying disconnect command: ${command}`);
       await vscode.commands.executeCommand(command, args);
-      log.appendLine(`Disconnect command succeeded: ${command}`);
-      return finalizeDisconnect();
+      const closed = await finalizeDisconnect();
+      if (closed) {
+        log.appendLine(`Disconnect command succeeded: ${command}`);
+        return true;
+      }
+      log.appendLine(`Disconnect command did not close remote session: ${command}`);
     } catch (error) {
       log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
     }
@@ -8532,20 +8590,44 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
   if (has('sessionMode')) overrides.sessionMode = normalizeSessionMode(String(values.sessionMode ?? ''));
   if (has('sessionKey')) overrides.sessionKey = String(values.sessionKey ?? '').trim();
   if (has('sessionIdleTimeoutSeconds')) {
-    overrides.sessionIdleTimeoutSeconds = parseNonNegativeNumberInput(String(values.sessionIdleTimeoutSeconds ?? ''));
+    const parsed = parseOptionalNonNegativeNumberInput(String(values.sessionIdleTimeoutSeconds ?? ''));
+    if (parsed !== undefined) {
+      overrides.sessionIdleTimeoutSeconds = parsed;
+    }
   }
   if (has('defaultPartition')) overrides.defaultPartition = String(values.defaultPartition ?? '').trim();
-  if (has('defaultNodes')) overrides.defaultNodes = parsePositiveNumberInput(String(values.defaultNodes ?? ''));
+  if (has('defaultNodes')) {
+    const parsed = parseOptionalPositiveNumberInput(String(values.defaultNodes ?? ''));
+    if (parsed !== undefined) {
+      overrides.defaultNodes = parsed;
+    }
+  }
   if (has('defaultTasksPerNode')) {
-    overrides.defaultTasksPerNode = parsePositiveNumberInput(String(values.defaultTasksPerNode ?? ''));
+    const parsed = parseOptionalPositiveNumberInput(String(values.defaultTasksPerNode ?? ''));
+    if (parsed !== undefined) {
+      overrides.defaultTasksPerNode = parsed;
+    }
   }
   if (has('defaultCpusPerTask')) {
-    overrides.defaultCpusPerTask = parsePositiveNumberInput(String(values.defaultCpusPerTask ?? ''));
+    const parsed = parseOptionalPositiveNumberInput(String(values.defaultCpusPerTask ?? ''));
+    if (parsed !== undefined) {
+      overrides.defaultCpusPerTask = parsed;
+    }
   }
   if (has('defaultTime')) overrides.defaultTime = String(values.defaultTime ?? '').trim();
-  if (has('defaultMemoryMb')) overrides.defaultMemoryMb = parseNonNegativeNumberInput(String(values.defaultMemoryMb ?? ''));
+  if (has('defaultMemoryMb')) {
+    const parsed = parseOptionalNonNegativeNumberInput(String(values.defaultMemoryMb ?? ''));
+    if (parsed !== undefined) {
+      overrides.defaultMemoryMb = parsed;
+    }
+  }
   if (has('defaultGpuType')) overrides.defaultGpuType = String(values.defaultGpuType ?? '').trim();
-  if (has('defaultGpuCount')) overrides.defaultGpuCount = parseNonNegativeNumberInput(String(values.defaultGpuCount ?? ''));
+  if (has('defaultGpuCount')) {
+    const parsed = parseOptionalNonNegativeNumberInput(String(values.defaultGpuCount ?? ''));
+    if (parsed !== undefined) {
+      overrides.defaultGpuCount = parsed;
+    }
+  }
   if (has('forwardAgent')) overrides.forwardAgent = Boolean(values.forwardAgent);
   if (has('requestTTY')) overrides.requestTTY = Boolean(values.requestTTY);
   if (has('openInNewWindow')) overrides.openInNewWindow = Boolean(values.openInNewWindow);
@@ -8831,6 +8913,27 @@ function parseNonNegativeNumberInput(input: string): number {
   return Math.floor(parsed);
 }
 
+function parseOptionalPositiveNumberInput(input: string): number | undefined {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = parsePositiveNumberInput(trimmed);
+  return parsed > 0 ? parsed : undefined;
+}
+
+function parseOptionalNonNegativeNumberInput(input: string): number | undefined {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return undefined;
+  }
+  return Math.floor(parsed);
+}
+
 function normalizeNonNegativeInteger(value: number): number {
   if (!Number.isFinite(value) || value < 0) {
     return 0;
@@ -8863,7 +8966,7 @@ function buildOverridesFromUi(values: Partial<UiValues>): Partial<SlurmConnectCo
   const moduleSelections = normalizeModuleSelections(values.moduleSelections);
   const resolvedModuleLoad =
     moduleLoad || moduleCustom || (moduleSelections.length > 0 ? `module load ${moduleSelections.join(' ')}` : '');
-  return {
+  const overrides: Partial<SlurmConnectConfig> = {
     loginHosts: parseListInput(String(values.loginHosts ?? '')),
     loginHostsCommand: String(values.loginHostsCommand ?? '').trim(),
     loginHostsQueryHost: String(values.loginHostsQueryHost ?? '').trim(),
@@ -8882,20 +8985,39 @@ function buildOverridesFromUi(values: Partial<UiValues>): Partial<SlurmConnectCo
     promptForExtraSallocArgs: Boolean(values.promptForExtraSallocArgs),
     sessionMode: normalizeSessionMode(String(values.sessionMode ?? '')),
     sessionKey: String(values.sessionKey ?? '').trim(),
-    sessionIdleTimeoutSeconds: parseNonNegativeNumberInput(String(values.sessionIdleTimeoutSeconds ?? '')),
     defaultPartition: String(values.defaultPartition ?? '').trim(),
-    defaultNodes: parsePositiveNumberInput(String(values.defaultNodes ?? '')),
-    defaultTasksPerNode: parsePositiveNumberInput(String(values.defaultTasksPerNode ?? '')),
-    defaultCpusPerTask: parsePositiveNumberInput(String(values.defaultCpusPerTask ?? '')),
     defaultTime: String(values.defaultTime ?? '').trim(),
-    defaultMemoryMb: parseNonNegativeNumberInput(String(values.defaultMemoryMb ?? '')),
     defaultGpuType: String(values.defaultGpuType ?? '').trim(),
-    defaultGpuCount: parseNonNegativeNumberInput(String(values.defaultGpuCount ?? '')),
     forwardAgent: Boolean(values.forwardAgent),
     requestTTY: Boolean(values.requestTTY),
     openInNewWindow: Boolean(values.openInNewWindow),
     remoteWorkspacePath: String(values.remoteWorkspacePath ?? '').trim()
   };
+  const sessionIdleTimeoutSeconds = parseOptionalNonNegativeNumberInput(String(values.sessionIdleTimeoutSeconds ?? ''));
+  if (sessionIdleTimeoutSeconds !== undefined) {
+    overrides.sessionIdleTimeoutSeconds = sessionIdleTimeoutSeconds;
+  }
+  const defaultNodes = parseOptionalPositiveNumberInput(String(values.defaultNodes ?? ''));
+  if (defaultNodes !== undefined) {
+    overrides.defaultNodes = defaultNodes;
+  }
+  const defaultTasksPerNode = parseOptionalPositiveNumberInput(String(values.defaultTasksPerNode ?? ''));
+  if (defaultTasksPerNode !== undefined) {
+    overrides.defaultTasksPerNode = defaultTasksPerNode;
+  }
+  const defaultCpusPerTask = parseOptionalPositiveNumberInput(String(values.defaultCpusPerTask ?? ''));
+  if (defaultCpusPerTask !== undefined) {
+    overrides.defaultCpusPerTask = defaultCpusPerTask;
+  }
+  const defaultMemoryMb = parseOptionalNonNegativeNumberInput(String(values.defaultMemoryMb ?? ''));
+  if (defaultMemoryMb !== undefined) {
+    overrides.defaultMemoryMb = defaultMemoryMb;
+  }
+  const defaultGpuCount = parseOptionalNonNegativeNumberInput(String(values.defaultGpuCount ?? ''));
+  if (defaultGpuCount !== undefined) {
+    overrides.defaultGpuCount = defaultGpuCount;
+  }
+  return overrides;
 }
 
 function getWebviewHtml(webview: vscode.Webview): string {
@@ -8924,6 +9046,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
     h2 { font-size: 16px; margin: 0 0 12px 0; }
     .section { margin-bottom: 16px; }
     label { font-size: 12px; display: block; margin-bottom: 4px; color: var(--vscode-foreground); }
+    .advanced-label-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin-bottom: 4px;
+    }
+    .advanced-label-row > label {
+      margin-bottom: 0;
+      flex: 1;
+    }
     input, textarea, select, button { width: 100%; box-sizing: border-box; font-size: 12px; padding: 6px; }
     input:not([type="checkbox"]), textarea, select {
       background: var(--vscode-input-background, var(--vscode-editorWidget-background));
@@ -8952,6 +9085,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .row { display: flex; gap: 8px; }
     .row > div { flex: 1; }
     .checkbox { display: flex; align-items: center; gap: 6px; }
+    .checkbox > label { margin-bottom: 0; }
     input[type="checkbox"] {
       appearance: none;
       -webkit-appearance: none;
@@ -9103,6 +9237,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
     .button-secondary:hover {
       background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
+    }
+    .field-reset-button {
+      width: auto;
+      min-width: 22px;
+      padding: 0 6px;
+      line-height: 18px;
+      font-size: 12px;
+      flex: 0 0 auto;
+    }
+    .checkbox .field-reset-button {
+      margin-left: auto;
     }
     .spinner {
       width: 14px;
@@ -9678,30 +9823,119 @@ function getWebviewHtml(webview: vscode.Webview): string {
       el.style.color = sshHostHintIsError ? '#b00020' : '#555';
     }
 
+    const advancedResetFieldIds = [
+      'loginHostsCommand',
+      'loginHostsQueryHost',
+      'partitionInfoCommand',
+      'partitionCommand',
+      'qosCommand',
+      'accountCommand',
+      'extraSallocArgs',
+      'promptForExtraSallocArgs',
+      'sessionMode',
+      'sessionKey',
+      'sessionIdleTimeoutSeconds',
+      'preSshCommand',
+      'preSshCheckCommand',
+      'additionalSshOptions',
+      'localProxyEnabled',
+      'proxyDebugLogging',
+      'forwardAgent',
+      'requestTTY'
+    ];
+
+    function resetAdvancedFieldToDefault(fieldId) {
+      if (!uiDefaults || !Object.prototype.hasOwnProperty.call(uiDefaults, fieldId)) {
+        return false;
+      }
+      setValue(fieldId, uiDefaults[fieldId] ?? '');
+      return true;
+    }
+
+    function formatAdvancedDefaultValue(value) {
+      if (typeof value === 'boolean') {
+        return value ? 'enabled' : 'disabled';
+      }
+      const text = String(value ?? '').trim();
+      if (!text) {
+        return 'empty';
+      }
+      if (text.length > 42) {
+        return text.slice(0, 39) + '...';
+      }
+      return text;
+    }
+
+    function updateAdvancedResetButtonTooltip(button, fieldId) {
+      if (!button) {
+        return;
+      }
+      if (!uiDefaults || !Object.prototype.hasOwnProperty.call(uiDefaults, fieldId)) {
+        button.title = 'Reset this field to the default value';
+        return;
+      }
+      button.title =
+        'Reset this field to default (' + formatAdvancedDefaultValue(uiDefaults[fieldId]) + ')';
+    }
+
+    function updateAdvancedResetButtonTooltips() {
+      advancedResetFieldIds.forEach((fieldId) => {
+        const button = document.querySelector('.field-reset-button[data-field-id="' + fieldId + '"]');
+        updateAdvancedResetButtonTooltip(button, fieldId);
+      });
+    }
+
+    function attachAdvancedFieldResetButtons() {
+      advancedResetFieldIds.forEach((fieldId) => {
+        const label = document.querySelector('label[for="' + fieldId + '"]');
+        if (!label) {
+          return;
+        }
+        let button = document.querySelector('.field-reset-button[data-field-id="' + fieldId + '"]');
+        if (!button) {
+          button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'field-reset-button button-secondary';
+          button.dataset.fieldId = fieldId;
+          button.textContent = '↩';
+          const labelText = (label.textContent || fieldId).trim();
+          button.setAttribute('aria-label', 'Reset "' + labelText + '" to default');
+          button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (resetAdvancedFieldToDefault(fieldId)) {
+              scheduleAutoSave();
+            }
+          });
+          const checkboxRow = label.closest('.checkbox');
+          if (checkboxRow) {
+            checkboxRow.appendChild(button);
+          } else {
+            const parent = label.parentElement;
+            if (!parent) {
+              return;
+            }
+            let row = label.closest('.advanced-label-row');
+            if (!row) {
+              row = document.createElement('div');
+              row.className = 'advanced-label-row';
+              parent.insertBefore(row, label);
+              row.appendChild(label);
+            }
+            row.appendChild(button);
+          }
+        }
+        updateAdvancedResetButtonTooltip(button, fieldId);
+      });
+    }
+
     function resetAdvancedToDefaults() {
       if (!uiDefaults) {
         return;
       }
-      const defaults = uiDefaults;
-      const set = (id, value) => setValue(id, value ?? '');
-      set('loginHostsCommand', defaults.loginHostsCommand);
-      set('loginHostsQueryHost', defaults.loginHostsQueryHost);
-      set('partitionInfoCommand', defaults.partitionInfoCommand);
-      set('partitionCommand', defaults.partitionCommand);
-      set('qosCommand', defaults.qosCommand);
-      set('accountCommand', defaults.accountCommand);
-      set('extraSallocArgs', defaults.extraSallocArgs);
-      set('promptForExtraSallocArgs', defaults.promptForExtraSallocArgs);
-      set('sessionMode', defaults.sessionMode);
-      set('sessionKey', defaults.sessionKey);
-      set('sessionIdleTimeoutSeconds', defaults.sessionIdleTimeoutSeconds);
-      set('preSshCommand', defaults.preSshCommand);
-      set('preSshCheckCommand', defaults.preSshCheckCommand);
-      set('additionalSshOptions', defaults.additionalSshOptions);
-      set('localProxyEnabled', defaults.localProxyEnabled);
-      set('proxyDebugLogging', defaults.proxyDebugLogging);
-      set('forwardAgent', defaults.forwardAgent);
-      set('requestTTY', defaults.requestTTY);
+      advancedResetFieldIds.forEach((fieldId) => {
+        resetAdvancedFieldToDefault(fieldId);
+      });
       scheduleAutoSave();
     }
 
@@ -11890,6 +12124,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         lastValues = values;
         if (message.defaults) {
           uiDefaults = message.defaults;
+          updateAdvancedResetButtonTooltips();
         }
         connectedSessionMode = message.connectionSessionMode || '';
         if (message.profileSummaries) {
@@ -12342,6 +12577,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         resetAdvancedToDefaults();
       });
     }
+    attachAdvancedFieldResetButtons();
     document.getElementById('openSettings').addEventListener('click', () => {
       vscode.postMessage({ command: 'openSettings' });
     });
