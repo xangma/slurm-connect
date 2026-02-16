@@ -80,6 +80,8 @@ HOST_REWRITE_HINT_RE = re.compile(
 SESSION_TOKEN_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 HOSTNAME_VALUE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 EPHEMERAL_LOCK_TTL_SECONDS = 15
+PERSISTENT_UNREADY_CANCEL_GRACE_SECONDS = 5
+PERSISTENT_UNREADY_CANCEL_POLL_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,7 @@ class SessionInfo:
     idle_timeout_seconds: int
     stale_seconds: int
     node: Optional[str] = None
+    submitted_new: bool = False
 
 
 @dataclass(frozen=True)
@@ -603,10 +606,22 @@ def get_job_state(job_id: str, logger: logging.Logger) -> Optional[str]:
     return None
 
 
-def wait_for_job_running(job_id: str, timeout: int, logger: logging.Logger) -> bool:
+def wait_for_job_running(
+    job_id: str,
+    timeout: int,
+    logger: logging.Logger,
+    stop_event: Optional[threading.Event] = None,
+) -> bool:
     deadline = time.time() + max(0, timeout)
     last_state: Optional[str] = None
+    initial_parent = os.getppid()
     while True:
+        if stop_event and stop_event.is_set():
+            logger.info("Interrupted while waiting for job %s to reach RUNNING.", job_id)
+            return False
+        if initial_parent > 1 and os.getppid() != initial_parent:
+            logger.info("Parent process exited while waiting for job %s.", job_id)
+            return False
         state = get_job_state(job_id, logger)
         if state and state != last_state:
             logger.info("Job %s state: %s", job_id, state)
@@ -621,7 +636,14 @@ def wait_for_job_running(job_id: str, timeout: int, logger: logging.Logger) -> b
         if time.time() >= deadline:
             logger.error("Timed out waiting for job %s to reach RUNNING.", job_id)
             return False
-        time.sleep(2)
+        if stop_event:
+            if stop_event.wait(2):
+                logger.info(
+                    "Interrupted while waiting for job %s to reach RUNNING.", job_id
+                )
+                return False
+        else:
+            time.sleep(2)
 
 
 def get_job_nodelist(job_id: str, logger: logging.Logger) -> Optional[str]:
@@ -784,6 +806,94 @@ def cleanup_stale_markers(
                     )
     except Exception:
         logger.debug("Failed to cleanup stale markers.", exc_info=True)
+
+
+def maybe_auto_cancel_unready_persistent_job(
+    invoker: Optional[WorkgroupInvoker],
+    workgroup: Optional[str],
+    session_info: Optional[SessionInfo],
+    ready_emitted: bool,
+    logger: logging.Logger,
+    reason: str,
+) -> bool:
+    if not session_info:
+        return False
+    if not session_info.submitted_new:
+        logger.info(
+            "Skipping auto-cancel for job %s; session reused existing allocation.",
+            session_info.job_id,
+        )
+        return False
+    if ready_emitted:
+        logger.info(
+            "Skipping auto-cancel for job %s; connection reached ready state.",
+            session_info.job_id,
+        )
+        return False
+    clients_dir = os.path.join(session_info.session_dir, "clients")
+    deadline = time.monotonic() + max(0, PERSISTENT_UNREADY_CANCEL_GRACE_SECONDS)
+    active_markers = 0
+    while True:
+        cleanup_stale_markers(session_info.session_dir, session_info.stale_seconds, logger)
+        active_markers = 0
+        if os.path.isdir(clients_dir):
+            try:
+                active_markers = sum(
+                    1
+                    for name in os.listdir(clients_dir)
+                    if os.path.isfile(os.path.join(clients_dir, name))
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to count active markers in %s", clients_dir, exc_info=True
+                )
+        if active_markers > 0:
+            if time.monotonic() >= deadline:
+                logger.info(
+                    "Skipping auto-cancel for job %s; %d marker(s) still active.",
+                    session_info.job_id,
+                    active_markers,
+                )
+                return False
+            time.sleep(PERSISTENT_UNREADY_CANCEL_POLL_SECONDS)
+            continue
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(PERSISTENT_UNREADY_CANCEL_POLL_SECONDS)
+    is_active = job_is_active(session_info.job_id, logger)
+    if is_active is False:
+        logger.info("Skipping auto-cancel for job %s; job is already inactive.", session_info.job_id)
+        return False
+    if is_active is None:
+        logger.warning(
+            "Could not verify state for job %s before auto-cancel; attempting scancel.",
+            session_info.job_id,
+        )
+    command = build_slurm_command(invoker, workgroup, ["scancel", session_info.job_id])
+    logger.warning(
+        "Auto-cancelling persistent job %s (%s): %s",
+        session_info.job_id,
+        reason,
+        " ".join(command),
+    )
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        logger.error(
+            "Auto-cancel failed for job %s (exit %s): %s",
+            session_info.job_id,
+            result.returncode,
+            (result.stderr or "").strip(),
+        )
+        return False
+    logger.info("Auto-cancel succeeded for job %s.", session_info.job_id)
+    return True
 
 
 def extract_job_name(args: list[str]) -> Optional[str]:
@@ -950,6 +1060,7 @@ def submit_persistent_job(
         job_name=job_name,
         idle_timeout_seconds=int(max(0, idle_timeout)),
         stale_seconds=int(max(0, stale_seconds)),
+        submitted_new=True,
     )
 
 
@@ -1583,13 +1694,6 @@ def terminate_process(
             return proc.poll(), "kill-failed"
 
 
-def resolve_remote_shell() -> str:
-    shell = (os.environ.get("SHELL") or "/bin/bash").strip()
-    if not shell:
-        return "/bin/bash"
-    return shell.split()[0]
-
-
 def start_client_keepalive(
     session_dir: str,
     client_id: str,
@@ -1598,7 +1702,8 @@ def start_client_keepalive(
     logger: logging.Logger,
 ) -> Optional[threading.Thread]:
     safe_id = sanitize_token(client_id or uuid.uuid4().hex)
-    client_name = f"client-{safe_id}"
+    instance_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    client_name = f"client-{safe_id}.{instance_id}"
     clients_dir = os.path.join(session_dir, "clients")
     last_seen_path = os.path.join(session_dir, "last_seen")
     client_path = os.path.join(clients_dir, client_name)
@@ -1759,6 +1864,8 @@ def main() -> int:
     condition = threading.Condition()
     state = SharedState()
     marker = f"__SLURM_CONNECT_PROXY_{pid}_{uuid.uuid4().hex}__"
+    persistent_ready_event = threading.Event()
+    persistent_session_info: Optional[SessionInfo] = None
     client_thread: Optional[threading.Thread] = None
     proc_started_at = time.monotonic()
     shutdown_reason: Optional[str] = None
@@ -1816,9 +1923,38 @@ def main() -> int:
             logger.critical("Failed to establish persistent session.", exc_info=True)
             close_tees()
             return 1
+        persistent_session_info = session_info
+        client_id = (
+            args.session_client_id or ""
+        ).strip() or f"{pid}-{uuid.uuid4().hex}"
+        client_thread = start_client_keepalive(
+            session_info.session_dir,
+            client_id,
+            session_info.stale_seconds,
+            shutdown_event,
+            logger,
+        )
+        if client_thread is None:
+            logger.warning(
+                "Failed to start session keepalive; auto-cancel protection may be less accurate."
+            )
         if not wait_for_job_running(
-            session_info.job_id, args.session_ready_timeout, logger
+            session_info.job_id,
+            args.session_ready_timeout,
+            logger,
+            stop_event=shutdown_event,
         ):
+            shutdown_event.set()
+            if client_thread:
+                client_thread.join(timeout=1)
+            maybe_auto_cancel_unready_persistent_job(
+                invoker,
+                workgroup,
+                persistent_session_info,
+                ready_emitted=persistent_ready_event.is_set(),
+                logger=logger,
+                reason="session failed to reach RUNNING",
+            )
             close_tees()
             return 1
         chosen_node = choose_session_node(
@@ -1832,30 +1968,6 @@ def main() -> int:
             with condition:
                 state.target_host = chosen_node
                 condition.notify_all()
-        client_id = (
-            args.session_client_id or ""
-        ).strip() or f"{pid}-{uuid.uuid4().hex}"
-        client_thread = start_client_keepalive(
-            session_info.session_dir,
-            client_id,
-            session_info.stale_seconds,
-            shutdown_event,
-            logger,
-        )
-        if client_thread is None:
-            logger.warning(
-                "Failed to start session keepalive; idle tracking may be wrong."
-            )
-        # shell = resolve_remote_shell()
-        # use_pty = sys.stdin.isatty() and sys.stdout.isatty()
-        # command = build_srun_command(
-        #     invoker,
-        #     workgroup,
-        #     session_info.job_id,
-        #     shell,
-        #     use_pty,
-        #     chosen_node,
-        # )
         shell_cmd = ["/bin/bash", "-l"]
         if tunnel_config:
             shell_cmd = build_tunnel_shell_command(shell_cmd, tunnel_config)
@@ -1907,6 +2019,14 @@ def main() -> int:
         shutdown_event.set()
         if client_thread:
             client_thread.join(timeout=1)
+        maybe_auto_cancel_unready_persistent_job(
+            invoker,
+            workgroup,
+            persistent_session_info,
+            ready_emitted=persistent_ready_event.is_set(),
+            logger=logger,
+            reason="remote shell launch failed",
+        )
         close_tees()
         return 1
 
@@ -1915,6 +2035,14 @@ def main() -> int:
         shutdown_event.set()
         if client_thread:
             client_thread.join(timeout=1)
+        maybe_auto_cancel_unready_persistent_job(
+            invoker,
+            workgroup,
+            persistent_session_info,
+            ready_emitted=persistent_ready_event.is_set(),
+            logger=logger,
+            reason="remote shell pipes unavailable",
+        )
         close_tees()
         return 1
 
@@ -2053,6 +2181,7 @@ def main() -> int:
                             proxy_server.start_listening()
                         condition.wait(timeout=0.1)
                 if rewritten:
+                    persistent_ready_event.set()
                     stdout_stream.write(rewritten)
                 else:
                     if proxy_failed:
@@ -2140,6 +2269,7 @@ def main() -> int:
                             proxy_server.start_listening()
                         condition.wait(timeout=0.1)
                 if rewritten:
+                    persistent_ready_event.set()
                     stdout_stream.write(rewritten)
                 else:
                     if proxy_failed:
@@ -2248,6 +2378,14 @@ def main() -> int:
         emit_failure_diagnostics(
             f"remote shell exited non-zero ({proc_returncode})"
         )
+    maybe_auto_cancel_unready_persistent_job(
+        invoker,
+        workgroup,
+        persistent_session_info,
+        ready_emitted=persistent_ready_event.is_set(),
+        logger=logger,
+        reason=f"proxy shutdown ({final_reason})",
+    )
 
     close_tees()
 
