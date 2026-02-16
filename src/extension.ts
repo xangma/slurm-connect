@@ -4370,9 +4370,19 @@ async function runSshCommandInTerminal(
   return stdout.trim();
 }
 
-async function runPreSshCommandInTerminal(command: string): Promise<void> {
+async function runPreSshCommandInTerminal(
+  command: string,
+  options?: {
+    terminalName?: string;
+    promptMessage?: string;
+    failureMessage?: string;
+    wrapInBash?: boolean;
+  }
+): Promise<void> {
   const { dirPath, statusPath } = await createTerminalSshRunFiles();
   const isWindows = process.platform === 'win32';
+  const wrappedCommand =
+    !isWindows && options?.wrapInBash ? `bash -lc ${quoteShellArg(command)}` : command;
   const shellCommand = isWindows
     ? (() => {
         const psScript = [
@@ -4390,12 +4400,15 @@ async function runPreSshCommandInTerminal(command: string): Promise<void> {
         const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
         return `powershell -NoProfile -EncodedCommand ${encoded}`;
       })()
-    : `${command}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+    : `${wrappedCommand}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
 
-  const terminal = await createLocalTerminal('Slurm Connect Auth');
+  const terminal = await createLocalTerminal(options?.terminalName || 'Slurm Connect Auth');
   terminal.show(true);
   terminal.sendText(shellCommand, true);
-  void vscode.window.showInformationMessage('Complete the pre-SSH authentication in the terminal.');
+  const promptMessage = options?.promptMessage ?? 'Complete the pre-SSH authentication in the terminal.';
+  if (promptMessage.trim().length > 0) {
+    void vscode.window.showInformationMessage(promptMessage);
+  }
 
   let exitCode = NaN;
   try {
@@ -4411,7 +4424,9 @@ async function runPreSshCommandInTerminal(command: string): Promise<void> {
   }
 
   if (!Number.isFinite(exitCode) || exitCode !== 0) {
-    throw new Error('Pre-SSH command failed in the terminal. Check the terminal output for details.');
+    throw new Error(
+      options?.failureMessage || 'Pre-SSH command failed in the terminal. Check the terminal output for details.'
+    );
   }
   terminal.dispose();
 }
@@ -6146,11 +6161,23 @@ async function cancelPersistentSessionJob(
       const localCommand = buildLocalCancelPersistentSessionCommand(stateDir, sessionKey);
       const label = sessionKey || 'current session';
       log.appendLine(`Cancelling session "${label}" in remote terminal (loginHost=${loginHost}).`);
-      const terminal = await createLocalTerminal('Slurm Connect Cancel');
-      terminal.show(true);
-      terminal.sendText(localCommand, true);
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Cancelling Slurm allocation',
+          cancellable: false
+        },
+        async () =>
+          await runPreSshCommandInTerminal(localCommand, {
+            terminalName: 'Slurm Connect Cancel',
+            promptMessage: '',
+            failureMessage: 'Cancel command failed in the terminal. Check terminal output for details.',
+            wrapInBash: true
+          })
+      );
+      log.appendLine(`Session cancel completed for "${label}".`);
       void vscode.window.showInformationMessage(
-        `Cancel command sent to the terminal. Check terminal output to confirm cancellation for "${sessionKey}".`
+        `Cancelled Slurm allocation for "${label}".`
       );
       return true;
     }
