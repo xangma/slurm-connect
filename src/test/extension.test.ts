@@ -74,6 +74,27 @@ function testParsePartitionInfoOutputNodeNames(): void {
   assert.strictEqual(infoWithCount.partitions[0].nodes, 10);
 }
 
+function testParsePartitionInfoOutputNoGpuPartition(): void {
+  const output = 'lrd_all_serial*|node001|32|256000|';
+  const info = parsePartitionInfoOutput(output);
+  assert.strictEqual(info.defaultPartition, 'lrd_all_serial');
+  assert.strictEqual(info.partitions.length, 1);
+  assert.strictEqual(info.partitions[0].name, 'lrd_all_serial');
+  assert.strictEqual(info.partitions[0].gpuMax, 0);
+  assert.deepStrictEqual(info.partitions[0].gpuTypes, {});
+}
+
+function testParsePartitionInfoOutputGpuPartitionMax(): void {
+  const output = [
+    'gpuq|node001|64|256000|gpu:a100:4',
+    'gpuq|node002|64|256000|gpu:a100:8'
+  ].join('\n');
+  const info = parsePartitionInfoOutput(output);
+  assert.strictEqual(info.partitions.length, 1);
+  assert.strictEqual(info.partitions[0].gpuMax, 8);
+  assert.strictEqual(info.partitions[0].gpuTypes.a100, 8);
+}
+
 function testSplitShellArgsQuoted(): void {
   const tokens = splitShellArgs('--comment "foo bar" --mem=32G');
   assert.deepStrictEqual(tokens, ['--comment', 'foo bar', '--mem=32G']);
@@ -101,6 +122,8 @@ function run(): void {
   testBuildSlurmConnectIncludeHelpers();
   testExpandHome();
   testParsePartitionInfoOutputNodeNames();
+  testParsePartitionInfoOutputNoGpuPartition();
+  testParsePartitionInfoOutputGpuPartitionMax();
   testSplitShellArgsQuoted();
   testSplitShellArgsComma();
   testJoinShellCommandQuotes();

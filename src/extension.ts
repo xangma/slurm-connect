@@ -2281,6 +2281,17 @@ async function connectCommand(
     return false;
   }
 
+  const gpuValidation = validateGpuRequestAgainstCachedClusterInfo(loginHost, partition, gpuCount, gpuType);
+  if (gpuValidation.note) {
+    log.appendLine(gpuValidation.note);
+  }
+  if (gpuValidation.blocked) {
+    const message = gpuValidation.message || 'GPU request is incompatible with the selected partition.';
+    log.appendLine(message);
+    void vscode.window.showErrorMessage(message);
+    return false;
+  }
+
   const sallocArgs = buildSallocArgs({
     partition,
     nodes,
@@ -2744,6 +2755,57 @@ async function resolvePartitionDefaultTimeForHost(
     getOutputChannel().appendLine(`Failed to resolve partition default time: ${formatError(error)}`);
     return undefined;
   }
+}
+
+interface CachedGpuValidationResult {
+  blocked: boolean;
+  message?: string;
+  note?: string;
+}
+
+function validateGpuRequestAgainstCachedClusterInfo(
+  loginHost: string,
+  partition: string | undefined,
+  gpuCount: number,
+  gpuType?: string
+): CachedGpuValidationResult {
+  if (!Number.isFinite(gpuCount) || gpuCount <= 0) {
+    return { blocked: false };
+  }
+  const cachedInfo = getCachedClusterInfo(loginHost)?.info;
+  if (!cachedInfo || !Array.isArray(cachedInfo.partitions) || cachedInfo.partitions.length === 0) {
+    return {
+      blocked: false,
+      note: `GPU validation skipped for ${loginHost}: no cached cluster info.`
+    };
+  }
+  const requestedPartition = (partition || '').trim();
+  const effectivePartition = requestedPartition || resolveDefaultPartitionName(cachedInfo);
+  if (!effectivePartition) {
+    return {
+      blocked: false,
+      note: `GPU validation skipped for ${loginHost}: partition is not set and no default partition was found in cache.`
+    };
+  }
+  const partitionInfo = cachedInfo.partitions.find((entry) => entry.name === effectivePartition);
+  if (!partitionInfo) {
+    return {
+      blocked: false,
+      note: `GPU validation skipped for ${loginHost}: partition "${effectivePartition}" not found in cached cluster info.`
+    };
+  }
+  if (partitionInfo.gpuMax > 0) {
+    return { blocked: false };
+  }
+  const requestedType = (gpuType || '').trim();
+  const resourceText = requestedType ? `GPU type "${requestedType}"` : 'GPU resources';
+  return {
+    blocked: true,
+    message:
+      `Partition "${effectivePartition}" does not advertise GPUs in cached cluster info, ` +
+      `but this request asks for ${gpuCount} ${resourceText}. ` +
+      'Set GPU count to 0 or choose a GPU partition.'
+  };
 }
 
 async function fetchExistingSessions(loginHost: string, cfg: SlurmConnectConfig): Promise<SessionSummary[]> {
@@ -9446,6 +9508,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let clusterInfo = null;
     let clusterInfoFetchedAt = null;
     let lastValues = {};
+    let rememberedGpuSelection = { type: '', count: '' };
+    let gpuSelectionSuppressedForCpuPartition = false;
     let connectionState = 'idle';
     let availableModules = [];
     let moduleDisplayMap = new Map();
@@ -9887,7 +9951,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
             );
             gpuCountHint = 'Max ' + gpuType + ' per node: ' + maxForType + '.';
           }
-        } else if (partition.gpuMax && gpuCount > partition.gpuMax) {
+        } else if (typeof partition.gpuMax === 'number' && gpuCount > partition.gpuMax) {
           warnings.push('GPU count (' + gpuCount + ') exceeds partition max (' + partition.gpuMax + ').');
           gpuCountHint = 'Max GPUs per node: ' + partition.gpuMax + '.';
         }
@@ -10528,10 +10592,18 @@ function getWebviewHtml(webview: vscode.Webview): string {
       field.options = normalized;
       const input = document.getElementById(field.input);
       if (input) {
-        const current = input.value;
-        if (selectedValue !== undefined && selectedValue !== null && selectedValue !== '') {
-          input.value = String(selectedValue);
+        const allowed = new Set(normalized.map((opt) => opt.value));
+        const fallback = normalized.length > 0 ? normalized[0].value : '';
+        const candidates = [];
+        if (selectedValue !== undefined && selectedValue !== null) {
+          candidates.push(String(selectedValue));
         }
+        candidates.push(String(input.value || ''), fallback);
+        const next =
+          normalized.length === 0
+            ? ''
+            : candidates.find((candidate) => allowed.has(candidate)) || fallback;
+        input.value = next;
       }
       if (field.picker) {
         const picker = document.getElementById(field.picker);
@@ -11241,6 +11313,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
         setValue(key, '');
         lastValues[key] = '';
       });
+      setRememberedGpuSelection('', '');
+      gpuSelectionSuppressedForCpuPartition = false;
       selectedModules = [];
       customModuleCommand = '';
       renderModuleList();
@@ -11379,35 +11453,93 @@ function getWebviewHtml(webview: vscode.Webview): string {
         return;
       }
 
+      const filterFree = Boolean(getValue('filterFreeResources'));
+      const hasFreeNodesData = filterFree && typeof chosen.freeNodes === 'number';
+      const hasFreeCpuData = filterFree && typeof chosen.freeCpusPerNode === 'number';
+      const gpuTypes = chosen.gpuTypes || {};
+      const hasFreeGpuData = filterFree && chosen.freeGpuTypes !== undefined;
+      const effectiveGpuTypes = hasFreeGpuData ? chosen.freeGpuTypes : gpuTypes;
+
       const meta = document.getElementById('partitionMeta');
       if (meta) {
-        const gpuSummary = (() => {
-          if (!chosen.gpuMax || !chosen.gpuTypes || Object.keys(chosen.gpuTypes).length === 0) {
-            return 'GPU: none';
+        const hasAnyFreeSummaryData =
+          filterFree &&
+          (hasFreeNodesData ||
+            hasFreeCpuData ||
+            hasFreeGpuData ||
+            typeof chosen.freeCpuTotal === 'number' ||
+            typeof chosen.freeGpuTotal === 'number' ||
+            typeof chosen.freeGpuMax === 'number');
+        if (hasAnyFreeSummaryData) {
+          const summaryParts = ['Nodes total: ' + chosen.nodes];
+
+          if (hasFreeCpuData || typeof chosen.freeCpuTotal === 'number') {
+            const cpuTotal = typeof chosen.freeCpuTotal === 'number' ? chosen.freeCpuTotal : 0;
+            const cpuPerNode = typeof chosen.freeCpusPerNode === 'number' ? chosen.freeCpusPerNode : 0;
+            let cpuSummary = 'CPU free: ' + cpuTotal + ' total';
+            if (hasFreeNodesData) {
+              cpuSummary += ' across ' + chosen.freeNodes + ' nodes';
+            }
+            cpuSummary += ' (max ' + cpuPerNode + ' on one node)';
+            summaryParts.push(cpuSummary);
+          } else {
+            summaryParts.push('CPUs/node: ' + chosen.cpus);
           }
-          const parts = Object.keys(chosen.gpuTypes)
-            .sort()
-            .map((key) => {
-              const label = key ? key : 'gpu';
-              return label + 'x' + chosen.gpuTypes[key];
-            });
-          return 'GPU: ' + parts.join(', ');
-        })();
-        meta.textContent =
-          'Nodes: ' +
-          chosen.nodes +
-          ' | CPUs/node: ' +
-          chosen.cpus +
-          ' | Mem/node: ' +
-          formatMem(chosen.memMb) +
-          ' | ' +
-          gpuSummary;
+
+          summaryParts.push('Mem/node: ' + formatMem(chosen.memMb));
+
+          const partitionHasGpuCapacity =
+            (typeof chosen.gpuMax === 'number' && chosen.gpuMax > 0) || Object.keys(gpuTypes || {}).length > 0;
+          if (partitionHasGpuCapacity) {
+            if (hasFreeGpuData || typeof chosen.freeGpuTotal === 'number' || typeof chosen.freeGpuMax === 'number') {
+              const gpuTotal = typeof chosen.freeGpuTotal === 'number' ? chosen.freeGpuTotal : 0;
+              const gpuPerNode = typeof chosen.freeGpuMax === 'number' ? chosen.freeGpuMax : 0;
+              const gpuTypeKeys = Object.keys(effectiveGpuTypes || {});
+              let gpuSummary = 'GPU free: ' + gpuTotal + ' total (max ' + gpuPerNode + ' on one node)';
+              if (gpuTypeKeys.length > 0) {
+                const typed = gpuTypeKeys
+                  .sort()
+                  .map((key) => {
+                    const label = key ? key : 'gpu';
+                    return label + 'x' + effectiveGpuTypes[key];
+                  });
+                gpuSummary += ', per-node max by type: ' + typed.join(', ');
+              }
+              summaryParts.push(gpuSummary);
+            } else {
+              summaryParts.push('GPU: none');
+            }
+          }
+
+          meta.textContent = summaryParts.join(' | ');
+        } else {
+          const totalGpuKeys = Object.keys(gpuTypes || {});
+          const gpuSummary =
+            totalGpuKeys.length === 0
+              ? 'GPU: none'
+              : 'GPU: ' +
+                totalGpuKeys
+                  .sort()
+                  .map((key) => {
+                    const label = key ? key : 'gpu';
+                    return label + 'x' + gpuTypes[key];
+                  })
+                  .join(', ');
+          meta.textContent =
+            'Nodes: ' +
+            chosen.nodes +
+            ' | CPUs/node: ' +
+            chosen.cpus +
+            ' | Mem/node: ' +
+            formatMem(chosen.memMb) +
+            ' | ' +
+            gpuSummary;
+        }
       }
 
       const preferredNodes = getValue('defaultNodes') || lastValues.defaultNodes;
       const preferredCpus = getValue('defaultCpusPerTask') || lastValues.defaultCpusPerTask;
       const preferredMem = getValue('defaultMemoryMb') || lastValues.defaultMemoryMb;
-      const filterFree = Boolean(getValue('filterFreeResources'));
       const nodesLimit =
         filterFree && typeof chosen.freeNodes === 'number' ? chosen.freeNodes : chosen.nodes;
       const cpuLimit =
@@ -11417,16 +11549,25 @@ function getWebviewHtml(webview: vscode.Webview): string {
       setFieldOptions('defaultCpusPerTask', buildRangeOptions(cpuLimit), preferredCpus);
       setFieldOptions('defaultMemoryMb', buildMemoryOptions(chosen.memMb), preferredMem);
 
-      const gpuTypes = chosen.gpuTypes || {};
-      const hasFreeGpuData = filterFree && chosen.freeGpuTypes !== undefined;
-      const effectiveGpuTypes = hasFreeGpuData ? chosen.freeGpuTypes : gpuTypes;
       const gpuTypeKeys = Object.keys(effectiveGpuTypes || {});
-      const preferredGpuType = getValue('defaultGpuType') || lastValues.defaultGpuType;
-      const preferredGpuCount = getValue('defaultGpuCount') || lastValues.defaultGpuCount;
+      const currentGpuType = String(getValue('defaultGpuType') || '').trim();
+      const currentGpuCount = String(getValue('defaultGpuCount') || '').trim();
+      const preferredGpuType = gpuSelectionSuppressedForCpuPartition
+        ? rememberedGpuSelection.type || lastValues.defaultGpuType
+        : currentGpuType || lastValues.defaultGpuType;
+      const preferredGpuCount = gpuSelectionSuppressedForCpuPartition
+        ? rememberedGpuSelection.count || lastValues.defaultGpuCount
+        : currentGpuCount || lastValues.defaultGpuCount;
 
       if (gpuTypeKeys.length === 0) {
+        if (!gpuSelectionSuppressedForCpuPartition) {
+          rememberGpuSelectionFromInputs();
+        }
         setFieldOptions('defaultGpuType', [{ value: '', label: 'None' }], '');
-        setFieldOptions('defaultGpuCount', [{ value: '0', label: '0' }], preferredGpuCount);
+        setFieldOptions('defaultGpuCount', [{ value: '0', label: '0' }], '0');
+        setValue('defaultGpuType', '');
+        setValue('defaultGpuCount', '0');
+        gpuSelectionSuppressedForCpuPartition = true;
         setFieldDisabled('defaultGpuType', true);
         setFieldDisabled('defaultGpuCount', true);
       } else {
@@ -11446,6 +11587,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
         setFieldOptions('defaultGpuCount', countOptions, preferredGpuCount);
         setFieldDisabled('defaultGpuType', false);
         setFieldDisabled('defaultGpuCount', false);
+        gpuSelectionSuppressedForCpuPartition = false;
+        rememberGpuSelectionFromInputs();
       }
       updateResourceWarning();
     }
@@ -11561,6 +11704,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
         return el.checked;
       }
       return el.value || '';
+    }
+
+    function setRememberedGpuSelection(typeValue, countValue) {
+      rememberedGpuSelection = {
+        type: String(typeValue || '').trim(),
+        count: String(countValue || '').trim()
+      };
+    }
+
+    function rememberGpuSelectionFromInputs() {
+      setRememberedGpuSelection(getValue('defaultGpuType'), getValue('defaultGpuCount'));
     }
 
     function gather() {
@@ -11742,6 +11896,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
           profileSummaries = message.profileSummaries;
         }
         Object.keys(values).forEach((key) => setValue(key, values[key]));
+        rememberGpuSelectionFromInputs();
+        gpuSelectionSuppressedForCpuPartition = false;
         const saveTarget = document.getElementById('saveTarget');
         if (saveTarget && message.saveTarget) {
           saveTarget.value = message.saveTarget;
@@ -12067,11 +12223,21 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     addFieldListener('defaultPartition', updatePartitionDetails);
-    addFieldListener('defaultGpuType', updatePartitionDetails);
+    addFieldListener('defaultGpuType', () => {
+      if (!gpuSelectionSuppressedForCpuPartition) {
+        rememberGpuSelectionFromInputs();
+      }
+      updatePartitionDetails();
+    });
     addFieldListener('defaultNodes', updateResourceWarning);
     addFieldListener('defaultCpusPerTask', updateResourceWarning);
     addFieldListener('defaultMemoryMb', updateResourceWarning);
-    addFieldListener('defaultGpuCount', updateResourceWarning);
+    addFieldListener('defaultGpuCount', () => {
+      if (!gpuSelectionSuppressedForCpuPartition) {
+        rememberGpuSelectionFromInputs();
+      }
+      updateResourceWarning();
+    });
 
     const tasksPerNodeInput = document.getElementById('defaultTasksPerNode');
     if (tasksPerNodeInput) {
