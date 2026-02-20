@@ -50,6 +50,7 @@ Profiles include connection, resource, and advanced form values.
 - **Session idle timeout (seconds, 0 = never)**: Idle duration before auto-cancel in persistent mode.
 - **Pre-SSH auth command (optional)**: Local command run before SSH queries/connect (e.g., `step ssh login`).
 - **Pre-SSH check command (optional)**: Local non-interactive check; exit 0 skips the pre-SSH auth command.
+- **Startup command (optional)**: Remote shell command run at job startup before module commands/proxy launch (e.g., `. ~/envfile.sh`).
 - **Additional SSH options (one per line)**: Extra SSH config lines added to generated host entries.
 - **Local proxy**: Enable a local HTTP(S) proxy (advanced options live in Settings).
 - **Forward agent**: Adds `ForwardAgent yes` to generated host entries.

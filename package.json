@@ -127,7 +127,12 @@
         "slurmConnect.moduleLoad": {
           "type": "string",
           "default": "",
-          "description": "Optional module load command prepended to the RemoteCommand."
+          "description": "Optional module command (for example: module load <name>) run before the proxy command."
+        },
+        "slurmConnect.startupCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional shell command to run before moduleLoad and the proxy command (for example: . ~/envfile.sh)."
         },
         "slurmConnect.proxyCommand": {
           "type": "string",

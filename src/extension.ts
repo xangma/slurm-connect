@@ -46,6 +46,7 @@ interface SlurmConnectConfig {
   forwardAgent: boolean;
   requestTTY: boolean;
   moduleLoad: string;
+  startupCommand: string;
   proxyCommand: string;
   proxyArgs: string[];
   proxyDebugLogging: boolean;
@@ -226,6 +227,7 @@ const CONFIG_KEYS = [
   'forwardAgent',
   'requestTTY',
   'moduleLoad',
+  'startupCommand',
   'proxyCommand',
   'proxyArgs',
   'proxyDebugLogging',
@@ -274,6 +276,7 @@ const CLUSTER_SETTING_KEYS = [
   'preSshCheckCommand',
   'additionalSshOptions',
   'moduleLoad',
+  'startupCommand',
   'extraSallocArgs',
   'promptForExtraSallocArgs',
   'sessionMode',
@@ -994,6 +997,7 @@ interface UiValues {
   autoInstallProxyScriptOnClusterInfo: boolean;
   additionalSshOptions: string;
   moduleLoad: string;
+  startupCommand: string;
   moduleSelections?: string[];
   moduleCustomCommand?: string;
   proxyCommand: string;
@@ -1043,6 +1047,7 @@ const PROFILE_UI_KEYS = [
   'preSshCheckCommand',
   'additionalSshOptions',
   'moduleLoad',
+  'startupCommand',
   'moduleSelections',
   'moduleCustomCommand',
   'extraSallocArgs',
@@ -1449,6 +1454,9 @@ function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOve
   if (diffString(values.preSshCheckCommand, defaults.preSshCheckCommand)) {
     add('Pre-SSH check command', values.preSshCheckCommand);
   }
+  if (diffString(values.startupCommand, defaults.startupCommand)) {
+    add('Startup command', values.startupCommand);
+  }
   if (diffString(values.additionalSshOptions, defaults.additionalSshOptions)) {
     add('Additional SSH options', values.additionalSshOptions);
   }
@@ -1585,6 +1593,7 @@ function getConfigFromSettings(): SlurmConnectConfig {
     forwardAgent: cfg.get<boolean>('forwardAgent', true),
     requestTTY: cfg.get<boolean>('requestTTY', true),
     moduleLoad: (cfg.get<string>('moduleLoad') || '').trim(),
+    startupCommand: (cfg.get<string>('startupCommand') || '').trim(),
     proxyCommand: (cfg.get<string>('proxyCommand') || '').trim(),
     proxyArgs: cfg.get<string[]>('proxyArgs', []),
     proxyDebugLogging: cfg.get<boolean>('proxyDebugLogging', false),
@@ -1647,6 +1656,7 @@ function getConfigDefaultsFromSettings(): SlurmConnectConfig {
     forwardAgent: Boolean(getDefault<boolean>('forwardAgent', true)),
     requestTTY: Boolean(getDefault<boolean>('requestTTY', true)),
     moduleLoad: String(getDefault<string>('moduleLoad', '') || '').trim(),
+    startupCommand: String(getDefault<string>('startupCommand', '') || '').trim(),
     proxyCommand: String(getDefault<string>('proxyCommand', '') || '').trim(),
     proxyArgs: getDefault<string[]>('proxyArgs', []),
     proxyDebugLogging: Boolean(getDefault<boolean>('proxyDebugLogging', false)),
@@ -7185,10 +7195,9 @@ function buildRemoteCommand(
   const proxyArgs = buildProxyArgs(cfg, sessionKey, clientId, localProxyPlan);
   const sallocFlags = sallocArgs.map((arg) => `--salloc-arg=${arg}`);
   const fullProxyCommand = joinShellCommand([...envTokens, ...proxyTokens, ...proxyArgs, ...sallocFlags]);
+  const startupCommand = (cfg.startupCommand || '').trim();
   const moduleLoad = cfg.moduleLoad ? escapeModuleLoadCommand(cfg.moduleLoad) : '';
-  const baseCommand = moduleLoad
-    ? `${moduleLoad} && ${fullProxyCommand}`.trim()
-    : fullProxyCommand;
+  const baseCommand = [startupCommand, moduleLoad, fullProxyCommand].filter((entry) => entry).join(' && ').trim();
   if (!baseCommand) {
     return '';
   }
@@ -8491,6 +8500,7 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     autoInstallProxyScriptOnClusterInfo: cfg.autoInstallProxyScriptOnClusterInfo,
     additionalSshOptions: fromCache('additionalSshOptions', formatAdditionalSshOptions(cfg.additionalSshOptions)),
     moduleLoad: fromCache('moduleLoad', cfg.moduleLoad || ''),
+    startupCommand: fromCache('startupCommand', cfg.startupCommand || ''),
     moduleSelections: getCachedUiValue(cache, 'moduleSelections'),
     moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
     proxyCommand: fromCache('proxyCommand', cfg.proxyCommand || ''),
@@ -8610,6 +8620,7 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
       overrides.moduleLoad = `module load ${selections.join(' ')}`;
     }
   }
+  if (has('startupCommand')) overrides.startupCommand = String(values.startupCommand ?? '').trim();
   if (has('extraSallocArgs')) overrides.extraSallocArgs = splitShellArgs(String(values.extraSallocArgs ?? ''));
   if (has('promptForExtraSallocArgs')) {
     overrides.promptForExtraSallocArgs = Boolean(values.promptForExtraSallocArgs);
@@ -9008,6 +9019,7 @@ function buildOverridesFromUi(values: Partial<UiValues>): Partial<SlurmConnectCo
     preSshCheckCommand: String(values.preSshCheckCommand ?? '').trim(),
     additionalSshOptions: parseAdditionalSshOptionsInput(String(values.additionalSshOptions ?? '')),
     moduleLoad: resolvedModuleLoad,
+    startupCommand: String(values.startupCommand ?? '').trim(),
     extraSallocArgs: splitShellArgs(String(values.extraSallocArgs ?? '')),
     promptForExtraSallocArgs: Boolean(values.promptForExtraSallocArgs),
     sessionMode: normalizeSessionMode(String(values.sessionMode ?? '')),
@@ -9621,6 +9633,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="preSshCommand" type="text" placeholder="" />
     <label for="preSshCheckCommand">Pre-SSH check command (optional)</label>
     <input id="preSshCheckCommand" type="text" placeholder="" />
+    <label for="startupCommand">Startup command (optional)</label>
+    <input id="startupCommand" type="text" placeholder="e.g. . ~/envfile.sh" />
     <label for="additionalSshOptions">Additional SSH options (one per line)</label>
     <textarea id="additionalSshOptions" rows="3" placeholder=""></textarea>
     <div class="checkbox">
@@ -9864,6 +9878,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       'sessionIdleTimeoutSeconds',
       'preSshCommand',
       'preSshCheckCommand',
+      'startupCommand',
       'additionalSshOptions',
       'localProxyEnabled',
       'proxyDebugLogging',
@@ -11993,6 +12008,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         identityFile: getValue('identityFile'),
         preSshCommand: getValue('preSshCommand'),
         preSshCheckCommand: getValue('preSshCheckCommand'),
+        startupCommand: getValue('startupCommand'),
         additionalSshOptions: getValue('additionalSshOptions'),
         moduleLoad: getValue('moduleLoad'),
         moduleSelections: selectedModules.slice(),

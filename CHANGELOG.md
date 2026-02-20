@@ -3,6 +3,13 @@ All notable changes to this project are documented in this file based on git tag
 
 ## Unreleased
 
+## 0.5.8 - 2026-02-20
+### Added
+- Added `slurmConnect.startupCommand` to run explicit remote startup shell commands (for example `. ~/envfile.sh`) before module/proxy launch.
+
+### Changed
+- Clarified `slurmConnect.moduleLoad` as the module command stage in startup sequencing.
+
 ## 0.5.7 - 2026-02-16
 ### Changed
 - Resource hints now report aggregate free CPU/GPU capacity and clearer per-node maxima; GPU metrics are shown only for GPU-capable partitions.

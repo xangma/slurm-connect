@@ -23,7 +23,8 @@ All settings live under the `slurmConnect` namespace.
 | `slurmConnect.autoInstallProxyScriptOnClusterInfo` | boolean | `true` | Auto-install/update the bundled proxy script on the login host when connecting. |
 | `slurmConnect.forwardAgent` | boolean | `true` | Whether to set ForwardAgent yes in generated host entries. |
 | `slurmConnect.requestTTY` | boolean | `true` | Whether to set RequestTTY yes in generated host entries. |
-| `slurmConnect.moduleLoad` | string | `""` | Optional module load command prepended to the RemoteCommand. |
+| `slurmConnect.moduleLoad` | string | `""` | Optional module command (for example `module load ...`) run before the proxy command. |
+| `slurmConnect.startupCommand` | string | `""` | Optional shell command run before `moduleLoad` and the proxy command (for example `. ~/envfile.sh`). |
 | `slurmConnect.proxyCommand` | string | `"python ~/.slurm-connect/vscode-proxy.py"` | Advanced: Command that launches the Slurm proxy script on the remote host (not shown in the UI). |
 | `slurmConnect.proxyArgs` | array | `[]` | Extra arguments appended to the proxy command. |
 | `slurmConnect.proxyDebugLogging` | boolean | `false` | Enables proxy debug logging by adding `-vv` and a default `--log-file` path unless you already set those in `proxyArgs`. |
