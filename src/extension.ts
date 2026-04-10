@@ -26,6 +26,26 @@ import {
   parsePartitionInfoOutput
 } from './utils/clusterInfo';
 import { isShellOperatorToken, joinShellCommand, quoteShellArg, splitShellArgs } from './utils/shellArgs';
+import {
+  buildLocalProxyControlPath as buildLocalProxyControlPathUtil,
+  buildLocalProxyRemotePortCandidates as buildLocalProxyRemotePortCandidatesUtil,
+  buildLocalProxyTunnelConfigKey as buildLocalProxyTunnelConfigKeyUtil,
+  buildLocalProxyTunnelTarget as buildLocalProxyTunnelTargetUtil,
+  buildNoProxyValue as buildNoProxyValueUtil,
+  isHostAllowed as isHostAllowedUtil,
+  isProxyAuthValid as isProxyAuthValidUtil,
+  normalizeProxyPort as normalizeProxyPortUtil,
+  parseProxyTarget as parseProxyTargetUtil,
+  resolveRemoteBindConnectHost as resolveRemoteBindConnectHostUtil,
+  splitHostPort as splitHostPortUtil
+} from './utils/localProxy';
+import { parseModulesOutput as parseModulesOutputUtil } from './utils/moduleOutput';
+import { applySessionIdleInfo as applySessionIdleInfoUtil, parseSessionListOutput as parseSessionListOutputUtil } from './utils/sessionInfo';
+import {
+  applyFreeResourceSummary as applyFreeResourceSummaryUtil,
+  buildClusterInfoCommandSet as buildClusterInfoCommandSetUtil,
+  computeFreeResourceSummary as computeFreeResourceSummaryUtil,
+} from './utils/slurmResources';
 
 const execFileAsync = promisify(execFile);
 
@@ -167,6 +187,22 @@ interface LocalProxyEnv {
   noProxy?: string;
 }
 
+export interface TestConnectInvocation {
+  alias: string;
+  openInNewWindow: boolean;
+  remoteWorkspacePath?: string;
+}
+
+export interface TestConnectResult {
+  didConnect: boolean;
+  alias?: string;
+  sessionKey?: string;
+  loginHost?: string;
+  includeFilePath: string;
+  logFilePath: string;
+  connectInvocations: TestConnectInvocation[];
+}
+
 let outputChannel: vscode.OutputChannel | undefined;
 let logFilePath: string | undefined;
 let extensionStoragePath: string | undefined;
@@ -187,6 +223,12 @@ let logWriteQueue: Promise<void> = Promise.resolve();
 let localProxyState: LocalProxyState | undefined;
 let localProxyTunnelState: LocalProxyTunnelState | undefined;
 let localProxyConfigKey: string | undefined;
+let testConnectToHostOverride:
+  | ((alias: string, openInNewWindow: boolean, remoteWorkspacePath?: string) => Promise<boolean>)
+  | undefined;
+let testEnsureRemoteSshSettingsOverride: ((cfg: SlurmConnectConfig) => Promise<void>) | undefined;
+let testRemoteSshConfigPathOverride: string | undefined;
+let sessionE2EStarted = false;
 
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const LOG_TRUNCATE_KEEP_BYTES = 4 * 1024 * 1024;
@@ -261,58 +303,22 @@ const CONFIG_KEYS = [
   'sshHostKeyChecking',
   'sshConnectTimeoutSeconds'
 ];
-const CLUSTER_SETTING_KEYS = [
-  'loginHosts',
-  'loginHostsCommand',
-  'loginHostsQueryHost',
-  'partitionCommand',
-  'partitionInfoCommand',
-  'filterFreeResources',
-  'qosCommand',
-  'accountCommand',
-  'user',
-  'identityFile',
-  'preSshCommand',
-  'preSshCheckCommand',
-  'additionalSshOptions',
-  'moduleLoad',
-  'startupCommand',
-  'extraSallocArgs',
-  'promptForExtraSallocArgs',
-  'sessionMode',
-  'sessionKey',
-  'sessionIdleTimeoutSeconds',
-  'defaultPartition',
-  'defaultNodes',
-  'defaultTasksPerNode',
-  'defaultCpusPerTask',
-  'defaultTime',
-  'defaultMemoryMb',
-  'defaultGpuType',
-  'defaultGpuCount',
-  'forwardAgent',
-  'requestTTY',
-  'openInNewWindow',
-  'remoteWorkspacePath'
-] as const;
-
-type ClusterSettingKey = typeof CLUSTER_SETTING_KEYS[number];
+async function runStartupMigrations(): Promise<void> {
+  await migrateLegacyState();
+  await migrateLegacySettings();
+  await migrateLegacyModuleCommands();
+  await resetProxyOverridesToDefaults();
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionStoragePath = context.globalStorageUri.fsPath;
   extensionRootPath = context.extensionUri.fsPath;
   extensionGlobalState = context.globalState;
   extensionWorkspaceState = context.workspaceState;
-  await migrateLegacyState();
-  await migrateLegacySettings();
-  await migrateLegacyModuleCommands();
-  await migrateClusterSettingsToCache();
-  await resetProxyOverridesToDefaults();
+  await runStartupMigrations();
   syncConnectionStateFromEnvironment();
   void resumeLocalProxyForRemoteSession();
-  const disposable = vscode.commands.registerCommand('slurmConnect.connect', () => {
-    void connectCommand();
-  });
+  const disposable = vscode.commands.registerCommand('slurmConnect.connect', async () => connectCommand());
   context.subscriptions.push(disposable);
 
   void migrateStaleRemoteSshConfigIfNeeded();
@@ -321,6 +327,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('slurmConnect.connectView', viewProvider)
   );
+  maybeRunSessionE2E();
 }
 
 export function deactivate(): void {
@@ -640,24 +647,7 @@ async function migrateLegacyModuleCommands(): Promise<void> {
 }
 
 async function resetProxyOverridesToDefaults(): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
-  const folders = vscode.workspace.workspaceFolders || [];
-  const resetKeys = ['proxyCommand', 'proxyArgs'];
-  const resetConfig = async (
-    targetCfg: vscode.WorkspaceConfiguration,
-    target: vscode.ConfigurationTarget
-  ): Promise<void> => {
-    for (const key of resetKeys) {
-      try {
-        await targetCfg.update(key, undefined, target);
-      } catch {
-        // Ignore reset failures.
-      }
-    }
-  };
-
   if (extensionGlobalState && !extensionGlobalState.get<boolean>(PROXY_OVERRIDE_RESET_KEY)) {
-    await resetConfig(cfg, vscode.ConfigurationTarget.Global);
     const current = getClusterUiCache(extensionGlobalState);
     const { next, changed } = stripProxyOverridesFromCache(current);
     if (changed) {
@@ -683,169 +673,12 @@ async function resetProxyOverridesToDefaults(): Promise<void> {
   }
 
   if (extensionWorkspaceState && !extensionWorkspaceState.get<boolean>(PROXY_OVERRIDE_RESET_KEY)) {
-    await resetConfig(cfg, vscode.ConfigurationTarget.Workspace);
-    for (const folder of folders) {
-      const folderCfg = vscode.workspace.getConfiguration(SETTINGS_SECTION, folder.uri);
-      await resetConfig(folderCfg, vscode.ConfigurationTarget.WorkspaceFolder);
-    }
     const current = getClusterUiCache(extensionWorkspaceState);
     const { next, changed } = stripProxyOverridesFromCache(current);
     if (changed) {
       await extensionWorkspaceState.update(CLUSTER_UI_CACHE_KEY, next);
     }
     await extensionWorkspaceState.update(PROXY_OVERRIDE_RESET_KEY, true);
-  }
-}
-
-function mapConfigValueToUi(key: ClusterSettingKey, value: unknown): UiValues[ClusterSettingKey] {
-  switch (key) {
-    case 'loginHosts':
-    case 'extraSallocArgs': {
-      if (Array.isArray(value)) {
-        return value.map((entry) => String(entry)).join('\n');
-      }
-      if (typeof value === 'string') {
-        return value;
-      }
-      return value === undefined || value === null ? '' : String(value);
-    }
-    case 'defaultNodes':
-    case 'defaultTasksPerNode':
-    case 'defaultCpusPerTask':
-    case 'defaultMemoryMb':
-    case 'defaultGpuCount': {
-      const numeric = typeof value === 'number' ? value : Number(value);
-      if (!Number.isFinite(numeric) || numeric <= 0) {
-        return '';
-      }
-      return String(Math.floor(numeric));
-    }
-    case 'sessionIdleTimeoutSeconds': {
-      const numeric = typeof value === 'number' ? value : Number(value);
-      if (!Number.isFinite(numeric) || numeric < 0) {
-        return '0';
-      }
-      return String(Math.floor(numeric));
-    }
-    case 'filterFreeResources':
-    case 'promptForExtraSallocArgs':
-    case 'forwardAgent':
-    case 'requestTTY':
-    case 'openInNewWindow':
-      return Boolean(value) as UiValues[ClusterSettingKey];
-    case 'additionalSshOptions': {
-      if (value && typeof value === 'object') {
-        return formatAdditionalSshOptions(value as Record<string, string>) as UiValues[ClusterSettingKey];
-      }
-      return value === undefined || value === null ? '' : String(value);
-    }
-    default:
-      return value === undefined || value === null ? '' : String(value);
-  }
-}
-
-async function migrateClusterSettingsToCache(): Promise<void> {
-  if (!extensionGlobalState) {
-    return;
-  }
-
-  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
-  const folders = vscode.workspace.workspaceFolders || [];
-
-  const nextGlobalCache: ClusterUiCache = { ...(getClusterUiCache(extensionGlobalState) || {}) };
-  const nextWorkspaceCache: ClusterUiCache = { ...(getClusterUiCache(extensionWorkspaceState) || {}) };
-  let updatedGlobal = false;
-  let updatedWorkspace = false;
-
-  const globalKeysToClear = new Set<ClusterSettingKey>();
-  const workspaceKeysToClear = new Set<ClusterSettingKey>();
-  const folderKeysToClear: Array<{ key: ClusterSettingKey; folder: vscode.WorkspaceFolder }> = [];
-
-  for (const key of CLUSTER_SETTING_KEYS) {
-    const inspect = cfg.inspect(key);
-    if (inspect?.globalValue !== undefined) {
-      if (!Object.prototype.hasOwnProperty.call(nextGlobalCache, key)) {
-        (nextGlobalCache as Record<ClusterSettingKey, UiValues[ClusterSettingKey]>)[key] = mapConfigValueToUi(
-          key,
-          inspect.globalValue
-        );
-        updatedGlobal = true;
-      }
-      globalKeysToClear.add(key);
-    }
-    if (inspect?.workspaceValue !== undefined) {
-      if (!Object.prototype.hasOwnProperty.call(nextWorkspaceCache, key)) {
-        (nextWorkspaceCache as Record<ClusterSettingKey, UiValues[ClusterSettingKey]>)[key] = mapConfigValueToUi(
-          key,
-          inspect.workspaceValue
-        );
-        updatedWorkspace = true;
-      }
-      workspaceKeysToClear.add(key);
-    }
-
-    if (folders.length > 0) {
-      const folderValues: Array<{ folder: vscode.WorkspaceFolder; value: unknown }> = [];
-      for (const folder of folders) {
-        const folderCfg = vscode.workspace.getConfiguration(SETTINGS_SECTION, folder.uri);
-        const folderInspect = folderCfg.inspect(key);
-        if (folderInspect?.workspaceFolderValue !== undefined) {
-          folderValues.push({ folder, value: folderInspect.workspaceFolderValue });
-        }
-      }
-
-      if (folderValues.length > 0) {
-        const serialized = folderValues.map((entry) => JSON.stringify(entry.value));
-        const unique = new Set(serialized);
-        if (unique.size === 1) {
-          if (inspect?.workspaceValue === undefined) {
-            if (!Object.prototype.hasOwnProperty.call(nextWorkspaceCache, key)) {
-              (nextWorkspaceCache as Record<ClusterSettingKey, UiValues[ClusterSettingKey]>)[key] =
-                mapConfigValueToUi(key, folderValues[0].value);
-              updatedWorkspace = true;
-            }
-          }
-          folderValues.forEach((entry) => {
-            folderKeysToClear.push({ key, folder: entry.folder });
-          });
-        } else {
-          const log = getOutputChannel();
-          log.appendLine(
-            `Skipping migration for ${SETTINGS_SECTION}.${key} workspace-folder values because they differ across folders.`
-          );
-        }
-      }
-    }
-  }
-
-  if (updatedGlobal) {
-    await extensionGlobalState.update(CLUSTER_UI_CACHE_KEY, nextGlobalCache);
-  }
-  if (updatedWorkspace && extensionWorkspaceState) {
-    await extensionWorkspaceState.update(CLUSTER_UI_CACHE_KEY, nextWorkspaceCache);
-  }
-
-  for (const key of globalKeysToClear) {
-    try {
-      await cfg.update(key, undefined, vscode.ConfigurationTarget.Global);
-    } catch {
-      // Ignore cleanup failures.
-    }
-  }
-  for (const key of workspaceKeysToClear) {
-    try {
-      await cfg.update(key, undefined, vscode.ConfigurationTarget.Workspace);
-    } catch {
-      // Ignore cleanup failures.
-    }
-  }
-  for (const entry of folderKeysToClear) {
-    try {
-      const folderCfg = vscode.workspace.getConfiguration(SETTINGS_SECTION, entry.folder.uri);
-      await folderCfg.update(entry.key, undefined, vscode.ConfigurationTarget.WorkspaceFolder);
-    } catch {
-      // Ignore cleanup failures.
-    }
   }
 }
 
@@ -1210,14 +1043,18 @@ function finalizeConnectToken(token?: ConnectToken): void {
   }
 }
 
+function resolveRemoteAuthority(): string | undefined {
+  const folders = vscode.workspace.workspaceFolders;
+  const folderAuthority = folders && folders.length > 0 ? folders[0].uri.authority : undefined;
+  const envAuthority = process.env.VSCODE_REMOTE_AUTHORITY;
+  return folderAuthority || envAuthority;
+}
+
 function resolveRemoteSshAlias(): string | undefined {
   if (vscode.env.remoteName !== 'ssh-remote') {
     return undefined;
   }
-  const folders = vscode.workspace.workspaceFolders;
-  const folderAuthority = folders && folders.length > 0 ? folders[0].uri.authority : undefined;
-  const envAuthority = process.env.VSCODE_REMOTE_AUTHORITY;
-  const authority = folderAuthority || envAuthority;
+  const authority = resolveRemoteAuthority();
   if (!authority) {
     return undefined;
   }
@@ -1227,6 +1064,144 @@ function resolveRemoteSshAlias(): string | undefined {
     return decodeURIComponent(raw);
   } catch {
     return raw;
+  }
+}
+
+function parseSessionE2EOverrides(): Partial<SlurmConnectConfig> {
+  const raw = process.env.SLURM_CONNECT_SESSION_E2E_CONNECT_OVERRIDES;
+  if (!raw) {
+    return {};
+  }
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('SLURM_CONNECT_SESSION_E2E_CONNECT_OVERRIDES must be a JSON object.');
+  }
+  return parsed as Partial<SlurmConnectConfig>;
+}
+
+function hasSessionE2EContext(): boolean {
+  return (
+    Boolean(process.env.SLURM_CONNECT_SESSION_E2E_MODE) ||
+    Boolean(process.env.SLURM_CONNECT_SESSION_E2E_REMOTE_MARKER) ||
+    Boolean(process.env.SLURM_CONNECT_SESSION_E2E_STATUS_MARKER)
+  );
+}
+
+async function writeSessionE2EJson(filePath: string | undefined, payload: Record<string, unknown>): Promise<void> {
+  if (!filePath) {
+    return;
+  }
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+async function writeSessionE2EStatus(phase: string, details: Record<string, unknown> = {}): Promise<void> {
+  await writeSessionE2EJson(process.env.SLURM_CONNECT_SESSION_E2E_STATUS_MARKER, {
+    phase,
+    remoteName: vscode.env.remoteName || '',
+    authority: resolveRemoteAuthority() || '',
+    alias: resolveRemoteSshAlias() || '',
+    ...details
+  });
+}
+
+async function maybeWriteSessionE2ERemoteFsMarker(authority: string | undefined): Promise<void> {
+  const remoteMarkerPath = process.env.SLURM_CONNECT_SESSION_E2E_REMOTE_FS_MARKER;
+  if (!remoteMarkerPath || !authority) {
+    return;
+  }
+  const uri = vscode.Uri.from({
+    scheme: 'vscode-remote',
+    authority,
+    path: remoteMarkerPath
+  });
+  const contents = Buffer.from(
+    JSON.stringify(
+      {
+        remoteName: vscode.env.remoteName || '',
+        authority,
+        alias: resolveRemoteSshAlias() || '',
+        timestamp: new Date().toISOString()
+      },
+      null,
+      2
+    ),
+    'utf8'
+  );
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      await vscode.workspace.fs.writeFile(uri, contents);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 29) {
+        break;
+      }
+      await delay(1000);
+    }
+  }
+  throw lastError;
+}
+
+async function handleSessionE2ERemoteWindow(): Promise<void> {
+  const authority = resolveRemoteAuthority();
+  const alias = resolveRemoteSshAlias() || '';
+  const expectedAlias = process.env.SLURM_CONNECT_SESSION_E2E_EXPECTED_ALIAS || '';
+  const payload: Record<string, unknown> = {
+    remoteName: vscode.env.remoteName || '',
+    authority: authority || '',
+    alias,
+    expectedAlias,
+    timestamp: new Date().toISOString()
+  };
+  try {
+    await maybeWriteSessionE2ERemoteFsMarker(authority);
+    if (expectedAlias && alias !== expectedAlias) {
+      payload.error = `Expected alias ${expectedAlias}, got ${alias}`;
+    }
+    await writeSessionE2EJson(process.env.SLURM_CONNECT_SESSION_E2E_REMOTE_MARKER, payload);
+    await writeSessionE2EStatus(payload.error ? 'remote-marker-error' : 'remote-marker-written', payload);
+  } catch (error) {
+    payload.error = formatError(error);
+    await writeSessionE2EJson(process.env.SLURM_CONNECT_SESSION_E2E_REMOTE_MARKER, payload);
+    await writeSessionE2EStatus('remote-marker-error', payload);
+  }
+}
+
+async function handleSessionE2ELocalWindow(): Promise<void> {
+  await writeSessionE2EStatus('local-start');
+  try {
+    await delay(1000);
+    await writeSessionE2EStatus('local-command-ready');
+    const mode = process.env.SLURM_CONNECT_SESSION_E2E_MODE || 'noninteractive';
+    const result =
+      mode === 'command'
+        ? await vscode.commands.executeCommand<boolean>('slurmConnect.connect')
+        : await connectCommand(parseSessionE2EOverrides(), { interactive: false });
+    const didConnect = result === undefined ? true : Boolean(result);
+    await writeSessionE2EStatus(didConnect ? 'local-command-complete' : 'local-command-failed', {
+      result: didConnect
+    });
+  } catch (error) {
+    await writeSessionE2EStatus('local-command-error', { error: formatError(error) });
+  }
+}
+
+function maybeRunSessionE2E(): void {
+  if (sessionE2EStarted) {
+    return;
+  }
+  if (!hasSessionE2EContext()) {
+    return;
+  }
+  sessionE2EStarted = true;
+  if (vscode.env.remoteName === 'ssh-remote') {
+    void handleSessionE2ERemoteWindow();
+    return;
+  }
+  if (vscode.env.remoteName !== 'ssh-remote') {
+    void handleSessionE2ELocalWindow();
   }
 }
 
@@ -1798,7 +1773,18 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             getOutputChannel().appendLine(`Connect failed: ${formatError(error)}`);
           }
           if (!isConnectCancelled(token)) {
-            setConnectionState(connected ? 'connected' : 'idle');
+            const expectedAlias = (lastConnectionAlias || '').trim();
+            const currentRemoteAlias = (resolveRemoteSshAlias() || '').trim();
+            const aliasMatchesCurrentWindow =
+              !expectedAlias || (currentRemoteAlias.length > 0 && currentRemoteAlias === expectedAlias);
+            if (connected && vscode.env.remoteName === 'ssh-remote' && !aliasMatchesCurrentWindow) {
+              getOutputChannel().appendLine(
+                `Connect state check mismatch: expected alias "${expectedAlias || '(none)'}", current remote alias "${currentRemoteAlias || '(none)'}".`
+              );
+            }
+            const connectedInCurrentWindow =
+              connected && vscode.env.remoteName === 'ssh-remote' && aliasMatchesCurrentWindow;
+            setConnectionState(connectedInCurrentWindow ? 'connected' : 'idle');
           }
           finalizeConnectToken(token);
           break;
@@ -2378,7 +2364,8 @@ async function connectCommand(
   let proxyPortCandidates: number[] = [];
   let localProxyPlan: LocalProxyPlan = { enabled: false };
 
-  await ensureRemoteSshSettings(cfg);
+  const ensureRemoteSshSettingsFn = testEnsureRemoteSshSettingsOverride ?? ensureRemoteSshSettings;
+  await ensureRemoteSshSettingsFn(cfg);
   if (cancelAndReturn()) {
     return false;
   }
@@ -2387,7 +2374,7 @@ async function connectCommand(
     return false;
   }
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  const currentRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
+  const currentRemoteConfig = testRemoteSshConfigPathOverride || normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
   const baseConfigPath = normalizeSshPath(currentRemoteConfig || defaultSshConfigPath());
   if (!currentRemoteConfig) {
     try {
@@ -2513,7 +2500,8 @@ async function connectCommand(
       return false;
     }
 
-    connected = await connectToHost(
+    const connectToHostFn = testConnectToHostOverride ?? connectToHost;
+    connected = await connectToHostFn(
       alias.trim(),
       cfg.openInNewWindow,
       cfg.remoteWorkspacePath
@@ -3031,72 +3019,11 @@ function buildSessionQueryCommand(stateDir: string): string {
 }
 
 function parseSessionListOutput(output: string): SessionSummary[] {
-  const trimmed = output.trim();
-  if (!trimmed) {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    const results: SessionSummary[] = [];
-    for (const entry of parsed) {
-      if (!entry || typeof entry !== 'object') {
-        continue;
-      }
-      const sessionKey = typeof entry.sessionKey === 'string' ? entry.sessionKey.trim() : '';
-      const jobId = typeof entry.jobId === 'string' ? entry.jobId.trim() : '';
-      if (!sessionKey || !jobId) {
-        continue;
-      }
-      const state = typeof entry.state === 'string' ? entry.state.trim() : '';
-      const jobName = typeof entry.jobName === 'string' ? entry.jobName.trim() : '';
-      const createdAt = typeof entry.createdAt === 'string' ? entry.createdAt.trim() : '';
-      const partition = typeof entry.partition === 'string' ? entry.partition.trim() : '';
-      const timeLimit = typeof entry.timeLimit === 'string' ? entry.timeLimit.trim() : '';
-      const nodes = Number(entry.nodes);
-      const cpus = Number(entry.cpus);
-      const clientsValue = Number(entry.clients);
-      const lastSeenValue = Number(entry.lastSeen);
-      const idleTimeoutValue = Number(entry.idleTimeoutSeconds);
-      results.push({
-        sessionKey,
-        jobId,
-        state,
-        jobName: jobName || undefined,
-        createdAt: createdAt || undefined,
-        partition: partition || undefined,
-        nodes: Number.isFinite(nodes) && nodes > 0 ? nodes : undefined,
-        cpus: Number.isFinite(cpus) && cpus > 0 ? cpus : undefined,
-        timeLimit: timeLimit || undefined,
-        clients: Number.isFinite(clientsValue) && clientsValue >= 0 ? clientsValue : undefined,
-        lastSeenEpoch: Number.isFinite(lastSeenValue) && lastSeenValue > 0 ? lastSeenValue : undefined,
-        idleTimeoutSeconds:
-          Number.isFinite(idleTimeoutValue) && idleTimeoutValue > 0 ? idleTimeoutValue : undefined
-      });
-    }
-    return results;
-  } catch {
-    return [];
-  }
+  return parseSessionListOutputUtil(output);
 }
 
 function applySessionIdleInfo(sessions: SessionSummary[]): SessionSummary[] {
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  return sessions.map((session) => {
-    const next: SessionSummary = { ...session };
-    const timeout = typeof session.idleTimeoutSeconds === 'number' ? session.idleTimeoutSeconds : 0;
-    if (timeout > 0) {
-      const clients = typeof session.clients === 'number' ? session.clients : 0;
-      const lastSeen = session.lastSeenEpoch;
-      if (clients === 0 && typeof lastSeen === 'number' && Number.isFinite(lastSeen)) {
-        const idleSeconds = Math.max(0, nowSeconds - lastSeen);
-        next.idleRemainingSeconds = Math.max(0, timeout - idleSeconds);
-      }
-    }
-    return next;
-  });
+  return applySessionIdleInfoUtil(sessions);
 }
 
 async function handleClusterInfoRequest(values: Partial<UiValues>, webview: vscode.Webview): Promise<void> {
@@ -3351,115 +3278,8 @@ function parseCombinedClusterInfoOutput(
   };
 }
 
-function sanitizeModuleOutput(output: string): string {
-  const withoutOsc = output.replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, '');
-  const withoutAnsi = withoutOsc.replace(
-    /[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><]/g,
-    ''
-  );
-  return withoutAnsi.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u0080-\u009F]/g, '');
-}
-
 function parseModulesOutput(output: string): string[] {
-  if (!output) {
-    return [];
-  }
-  const sanitized = sanitizeModuleOutput(output);
-  const lowered = sanitized.toLowerCase();
-  if (lowered.includes('command not found') || lowered.includes('module: not found')) {
-    return [];
-  }
-  const lines = sanitized.split(/\r?\n/);
-  const entries: string[] = [];
-  const isSeparatorToken = (token: string): boolean => /^-+$/.test(token);
-  const isLegendLine = (line: string): boolean => {
-    const lower = line.toLowerCase();
-    if (lower.startsWith('where:')) {
-      return true;
-    }
-    if (lower.includes('module is loaded') || lower.includes('module is auto-loaded')) {
-      return true;
-    }
-    if (lower.includes('module is inactive') || lower.includes('module is hidden')) {
-      return true;
-    }
-    if (lower.includes('module spider') || lower.includes('module help')) {
-      return true;
-    }
-    if (lower.startsWith('to get ') || lower.startsWith('to find ') || lower.startsWith('to list ')) {
-      return true;
-    }
-    if (lower.startsWith('use "module') || lower.startsWith('use module')) {
-      return true;
-    }
-    return false;
-  };
-  const stripTrailingTag = (value: string): string => {
-    let trimmed = value.trim();
-    if (!trimmed) {
-      return trimmed;
-    }
-    const defaultMatch = trimmed.match(/^(.*?)(?:\s*[<(]\s*(?:default|d)\s*[>)]\s*)$/i);
-    if (defaultMatch) {
-      const base = defaultMatch[1].trim();
-      return base ? `${base} (default)` : trimmed;
-    }
-    const shortTagPattern = /^(.*?)(?:\s*[<(]\s*[a-zA-Z]{1,3}\s*[>)]\s*)$/;
-    while (shortTagPattern.test(trimmed)) {
-      trimmed = trimmed.replace(shortTagPattern, '$1').trim();
-    }
-    return trimmed;
-  };
-  const normalizeHeader = (value: string): string => {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return '';
-    }
-    return trimmed.endsWith(':') ? trimmed : `${trimmed}:`;
-  };
-  const headerFromDashLine = (line: string): string | null => {
-    const match = line.match(/^-+\s*(\/\S.*?)\s*-+$/);
-    return match ? match[1] : null;
-  };
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    if (isLegendLine(trimmed)) {
-      continue;
-    }
-    if (trimmed.startsWith('/') && trimmed.endsWith(':')) {
-      entries.push(trimmed);
-      continue;
-    }
-    const dashedHeader = headerFromDashLine(trimmed);
-    if (dashedHeader) {
-      const normalized = normalizeHeader(dashedHeader);
-      if (normalized) {
-        entries.push(normalized);
-      }
-      continue;
-    }
-    const tokens = /\s/.test(trimmed)
-      ? trimmed.split(/\s+/).map((value) => value.trim()).filter(Boolean)
-      : [trimmed];
-    for (const token of tokens) {
-      if (isSeparatorToken(token)) {
-        continue;
-      }
-      if (token.startsWith('/') && token.endsWith(':')) {
-        entries.push(token);
-        continue;
-      }
-      const cleaned = stripTrailingTag(token);
-      if (!cleaned) {
-        continue;
-      }
-      entries.push(cleaned);
-    }
-  }
-  return uniqueList(entries);
+  return parseModulesOutputUtil(output);
 }
 
 async function fetchClusterInfoSingleCall(
@@ -5470,18 +5290,6 @@ function parsePartitionDefaultTimesOutput(
   return { defaults, defaultPartition };
 }
 
-const FREE_RESOURCE_NODE_INFO_COMMAND = 'sinfo -h -N -o "%n|%c|%t|%P|%G"';
-const FREE_RESOURCE_SQUEUE_COMMAND = 'squeue -h -o "%t|%C|%b|%N"';
-const FREE_RESOURCE_BAD_STATES = new Set(['down', 'drain', 'drng', 'maint', 'fail']);
-
-interface NodeInfo {
-  name: string;
-  cpus: number;
-  state: string;
-  partitions: string[];
-  gpuTypes: Record<string, number>;
-}
-
 interface PartitionFreeSummary {
   freeNodes: number;
   freeCpuTotal: number;
@@ -5500,360 +5308,18 @@ interface FreeResourceCommandIndexes {
 function buildClusterInfoCommandSet(
   cfg: SlurmConnectConfig
 ): { commands: string[]; freeResourceIndexes: FreeResourceCommandIndexes } {
-  const baseCommands = [
-    cfg.partitionInfoCommand,
-    'sinfo -h -N -o "%P|%n|%c|%m|%G"',
-    'sinfo -h -o "%P|%D|%c|%m|%G"',
-    'scontrol show partition -o'
-  ].filter(Boolean);
-  const commands = baseCommands.slice();
-  const nodeIndex = commands.length;
-  commands.push(FREE_RESOURCE_NODE_INFO_COMMAND);
-  const jobIndex = commands.length;
-  commands.push(FREE_RESOURCE_SQUEUE_COMMAND);
-  return {
-    commands,
-    freeResourceIndexes: { infoCommandCount: baseCommands.length, nodeIndex, jobIndex }
-  };
-}
-
-function normalizePartitionName(value: string): string {
-  return value.replace(/\*/g, '').trim();
-}
-
-function parseGresField(raw: string): Record<string, number> {
-  const result: Record<string, number> = {};
-  if (!raw || raw === '(null)' || raw === 'N/A') {
-    return result;
-  }
-  const tokens = raw
-    .split(',')
-    .map((token) => token.trim())
-    .filter(Boolean);
-  for (const token of tokens) {
-    if (!token.includes('gpu')) {
-      continue;
-    }
-    let cleaned = token.replace(/\(.*?\)/g, '').trim();
-    if (!cleaned) {
-      continue;
-    }
-    if (cleaned.startsWith('gres/')) {
-      cleaned = cleaned.slice('gres/'.length);
-    }
-    if (cleaned === 'gpu') {
-      cleaned = '';
-    } else if (cleaned.startsWith('gpu:')) {
-      cleaned = cleaned.slice(4);
-    } else if (cleaned.startsWith('gpu')) {
-      cleaned = cleaned.slice(3);
-      if (cleaned.startsWith(':')) {
-        cleaned = cleaned.slice(1);
-      }
-    }
-
-    const parts = cleaned
-      .split(':')
-      .map((part) => part.trim())
-      .filter(Boolean);
-    let count = 0;
-    let type = '';
-    if (parts.length === 0) {
-      count = 1;
-    } else {
-      const last = parts[parts.length - 1];
-      if (/^\d+$/.test(last)) {
-        count = Number(last);
-        type = parts.slice(0, -1).join(':');
-      } else {
-        count = 1;
-        type = parts.join(':');
-      }
-    }
-    if (!Number.isFinite(count) || count <= 0) {
-      continue;
-    }
-    result[type] = (result[type] || 0) + count;
-  }
-  return result;
-}
-
-function parseNodeInfoOutput(output: string): Map<string, NodeInfo> {
-  const nodes = new Map<string, NodeInfo>();
-  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (const line of lines) {
-    const fields = line.split('|').map((value) => value.trim());
-    if (fields.length < 5) {
-      continue;
-    }
-    const name = fields[0];
-    const cpuStr = fields[1];
-    const stateRaw = fields[2] || '';
-    const partitionsRaw = fields[3] || '';
-    const gresRaw = fields[4] || '';
-    if (!name) {
-      continue;
-    }
-    const cpus = Number(cpuStr);
-    const state = stateRaw.toLowerCase().replace(/[\*\+~]+/g, '');
-    const partitions = partitionsRaw
-      .split(',')
-      .map((entry) => normalizePartitionName(entry))
-      .filter(Boolean);
-    const gpuTypes = parseGresField(gresRaw);
-    nodes.set(name, {
-      name,
-      cpus: Number.isFinite(cpus) ? Math.max(0, Math.floor(cpus)) : 0,
-      state,
-      partitions: partitions.length ? partitions : ['unknown'],
-      gpuTypes
-    });
-  }
-  return nodes;
-}
-
-function splitSlurmList(input: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let depth = 0;
-  for (const char of input) {
-    if (char === '[') {
-      depth += 1;
-    } else if (char === ']') {
-      depth = Math.max(0, depth - 1);
-    }
-    if (char === ',' && depth === 0) {
-      if (current) {
-        result.push(current);
-      }
-      current = '';
-      continue;
-    }
-    current += char;
-  }
-  if (current) {
-    result.push(current);
-  }
-  return result.map((entry) => entry.trim()).filter(Boolean);
-}
-
-function padNumber(value: number, width: number): string {
-  const raw = String(value);
-  if (raw.length >= width) {
-    return raw;
-  }
-  return '0'.repeat(width - raw.length) + raw;
-}
-
-function expandNumericRange(value: string): string[] {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return [];
-  }
-  const parts = trimmed.split(':');
-  const rangePart = parts[0];
-  const step = parts.length > 1 ? Number(parts[1]) : 1;
-  const match = rangePart.match(/^(\d+)-(\d+)$/);
-  if (!match) {
-    return [rangePart];
-  }
-  const startRaw = match[1];
-  const endRaw = match[2];
-  const start = Number(startRaw);
-  const end = Number(endRaw);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(step) || step <= 0) {
-    return [rangePart];
-  }
-  const width = Math.max(startRaw.length, endRaw.length);
-  const results: string[] = [];
-  if (start <= end) {
-    for (let value = start; value <= end; value += step) {
-      results.push(padNumber(value, width));
-    }
-  } else {
-    for (let value = start; value >= end; value -= step) {
-      results.push(padNumber(value, width));
-    }
-  }
-  return results;
-}
-
-function expandBracketValues(value: string): string[] {
-  const entries = value
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  const result: string[] = [];
-  for (const entry of entries) {
-    result.push(...expandNumericRange(entry));
-  }
-  return result;
-}
-
-function expandHostToken(token: string): string[] {
-  const openIndex = token.indexOf('[');
-  if (openIndex === -1) {
-    return [token];
-  }
-  const closeIndex = token.indexOf(']', openIndex + 1);
-  if (closeIndex === -1) {
-    return [token];
-  }
-  const prefix = token.slice(0, openIndex);
-  const inner = token.slice(openIndex + 1, closeIndex);
-  const suffix = token.slice(closeIndex + 1);
-  const expandedInner = expandBracketValues(inner);
-  const expandedSuffix = suffix ? expandHostToken(suffix) : [''];
-  const result: string[] = [];
-  for (const innerValue of expandedInner) {
-    for (const suffixValue of expandedSuffix) {
-      result.push(prefix + innerValue + suffixValue);
-    }
-  }
-  return result;
-}
-
-function expandSlurmHostList(input: string): string[] {
-  const trimmed = input.trim();
-  if (!trimmed || trimmed === '(null)' || trimmed === 'N/A') {
-    return [];
-  }
-  const tokens = splitSlurmList(trimmed);
-  const result: string[] = [];
-  for (const token of tokens) {
-    result.push(...expandHostToken(token));
-  }
-  return result;
-}
-
-function parseSqueueUsageOutput(output: string): {
-  nodeCpuUsed: Map<string, number>;
-  nodeGpuUsedTypes: Map<string, Record<string, number>>;
-} {
-  const nodeCpuUsed = new Map<string, number>();
-  const nodeGpuUsedTypes = new Map<string, Record<string, number>>();
-  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (const line of lines) {
-    const fields = line.split('|');
-    if (fields.length < 4) {
-      continue;
-    }
-    const state = fields[0].trim();
-    if (!state || state.startsWith('PD')) {
-      continue;
-    }
-    const cpuStr = fields[1].trim();
-    const gresRaw = fields[2] || '';
-    const nodelist = fields.slice(3).join('|').trim();
-    const cpus = Number(cpuStr);
-    const nodes = expandSlurmHostList(nodelist);
-    if (!Number.isFinite(cpus) || nodes.length === 0) {
-      continue;
-    }
-    const perNodeCpu = Math.max(Math.floor(cpus / nodes.length), 1);
-    const remCpu = cpus % nodes.length;
-    const gpuReq = parseGresField(gresRaw);
-    const perNodeGpu: Record<string, number> = {};
-    const remGpu: Record<string, number> = {};
-    for (const [type, count] of Object.entries(gpuReq)) {
-      perNodeGpu[type] = Math.floor(count / nodes.length);
-      remGpu[type] = count % nodes.length;
-    }
-    nodes.forEach((node, index) => {
-      const incCpu = perNodeCpu + (index < remCpu ? 1 : 0);
-      nodeCpuUsed.set(node, (nodeCpuUsed.get(node) || 0) + incCpu);
-      if (Object.keys(gpuReq).length === 0) {
-        return;
-      }
-      const current = nodeGpuUsedTypes.get(node) || {};
-      for (const [type, base] of Object.entries(perNodeGpu)) {
-        const incGpu = base + (index < (remGpu[type] || 0) ? 1 : 0);
-        if (incGpu <= 0) {
-          continue;
-        }
-        current[type] = (current[type] || 0) + incGpu;
-      }
-      nodeGpuUsedTypes.set(node, current);
-    });
-  }
-  return { nodeCpuUsed, nodeGpuUsedTypes };
+  return buildClusterInfoCommandSetUtil(cfg);
 }
 
 function computeFreeResourceSummary(
   nodeInfoOutput: string,
   squeueOutput: string
 ): Map<string, PartitionFreeSummary> | undefined {
-  const nodesInfo = parseNodeInfoOutput(nodeInfoOutput);
-  if (nodesInfo.size === 0) {
-    return undefined;
-  }
-  const { nodeCpuUsed, nodeGpuUsedTypes } = parseSqueueUsageOutput(squeueOutput);
-  const summary = new Map<string, PartitionFreeSummary>();
-
-  for (const node of nodesInfo.values()) {
-    const bad = FREE_RESOURCE_BAD_STATES.has(node.state);
-    const usedCpu = nodeCpuUsed.get(node.name) || 0;
-    const freeCpu = bad ? 0 : Math.max(node.cpus - usedCpu, 0);
-    const usedGpuTypes = nodeGpuUsedTypes.get(node.name) || {};
-    let freeGpuTotal = 0;
-    const nodeFreeGpuTypes: Record<string, number> = {};
-    for (const [type, total] of Object.entries(node.gpuTypes)) {
-      const used = usedGpuTypes[type] || 0;
-      const free = bad ? 0 : Math.max(total - used, 0);
-      if (free > 0) {
-        nodeFreeGpuTypes[type] = free;
-      }
-      freeGpuTotal += free;
-    }
-    const partitions = node.partitions.length
-      ? node.partitions.map((entry) => normalizePartitionName(entry)).filter(Boolean)
-      : ['unknown'];
-    const uniquePartitions = Array.from(new Set(partitions));
-    for (const partition of uniquePartitions) {
-      const entry = summary.get(partition) || {
-        freeNodes: 0,
-        freeCpuTotal: 0,
-        freeCpusPerNode: 0,
-        freeGpuTotal: 0,
-        freeGpuMax: 0,
-        freeGpuTypes: {}
-      };
-      if (freeCpu > 0) {
-        entry.freeNodes += 1;
-      }
-      entry.freeCpuTotal += freeCpu;
-      entry.freeCpusPerNode = Math.max(entry.freeCpusPerNode, freeCpu);
-      entry.freeGpuTotal += freeGpuTotal;
-      entry.freeGpuMax = Math.max(entry.freeGpuMax, freeGpuTotal);
-      for (const [type, free] of Object.entries(nodeFreeGpuTypes)) {
-        const current = entry.freeGpuTypes[type] || 0;
-        if (free > current) {
-          entry.freeGpuTypes[type] = free;
-        }
-      }
-      summary.set(partition, entry);
-    }
-  }
-
-  return summary;
+  return computeFreeResourceSummaryUtil(nodeInfoOutput, squeueOutput);
 }
 
 function applyFreeResourceSummary(info: ClusterInfo, summary: Map<string, PartitionFreeSummary>): void {
-  if (!info.partitions || info.partitions.length === 0) {
-    return;
-  }
-  for (const partition of info.partitions) {
-    const free = summary.get(partition.name);
-    if (!free) {
-      continue;
-    }
-    partition.freeNodes = free.freeNodes;
-    partition.freeCpuTotal = free.freeCpuTotal;
-    partition.freeCpusPerNode = free.freeCpusPerNode;
-    partition.freeGpuTotal = free.freeGpuTotal;
-    partition.freeGpuMax = free.freeGpuMax;
-    partition.freeGpuTypes = free.freeGpuTypes;
-  }
+  applyFreeResourceSummaryUtil(info, summary);
 }
 
 async function pickFromList(title: string, items: string[], allowManual: boolean): Promise<string | undefined> {
@@ -6279,32 +5745,11 @@ function resolveLocalProxyTunnelTimeoutSeconds(): number | undefined {
 }
 
 function normalizeProxyPort(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-  const port = Math.floor(value);
-  if (port < 0 || port > 65535) {
-    return 0;
-  }
-  return port;
+  return normalizeProxyPortUtil(value);
 }
 
 function buildLocalProxyRemotePortCandidates(basePort: number, attempts: number): number[] {
-  const total = Math.max(1, Math.floor(attempts || 1));
-  const ports = new Set<number>();
-  const base = normalizeProxyPort(basePort);
-  if (base > 0) {
-    ports.add(base);
-  }
-  const min = 49152;
-  const max = 65535;
-  while (ports.size < total) {
-    const port = Math.floor(Math.random() * (max - min + 1)) + min;
-    if (port > 0) {
-      ports.add(port);
-    }
-  }
-  return Array.from(ports);
+  return buildLocalProxyRemotePortCandidatesUtil(basePort, attempts);
 }
 
 async function pickRemoteForwardPort(
@@ -6341,112 +5786,16 @@ async function pickRemoteForwardPort(
   return Math.floor(port);
 }
 
-function normalizeHostForMatch(host: string): string {
-  const trimmed = (host || '').trim().toLowerCase();
-  if (!trimmed) {
-    return '';
-  }
-  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed.endsWith('.') ? trimmed.slice(0, -1) : trimmed;
-}
-
-function extractIpv4FromMappedIpv6(host: string): string | undefined {
-  const match = /^(?:0:0:0:0:0:ffff:|::ffff:)(.+)$/.exec(host);
-  if (!match) {
-    return undefined;
-  }
-  const tail = match[1];
-  if (tail.includes('.')) {
-    return net.isIP(tail) === 4 ? tail : undefined;
-  }
-  const parts = tail.split(':');
-  const isHex = (value: string): boolean => /^[0-9a-f]{1,4}$/.test(value);
-  let num: number | undefined;
-  if (parts.length === 2 && parts.every(isHex)) {
-    num = (parseInt(parts[0], 16) << 16) | parseInt(parts[1], 16);
-  } else if (parts.length === 1 && /^[0-9a-f]{1,8}$/.test(parts[0])) {
-    num = parseInt(parts[0], 16);
-  }
-  if (num === undefined || !Number.isFinite(num)) {
-    return undefined;
-  }
-  const bytes = [
-    (num >>> 24) & 0xff,
-    (num >>> 16) & 0xff,
-    (num >>> 8) & 0xff,
-    num & 0xff
-  ];
-  return bytes.join('.');
-}
-
-function isLoopbackHost(host: string): boolean {
-  const normalized = normalizeHostForMatch(host);
-  if (!normalized) {
-    return false;
-  }
-  if (normalized === 'localhost' || normalized === '0.0.0.0' || normalized === '::' || normalized === '::1') {
-    return true;
-  }
-  if (normalized === 'ip6-localhost' || normalized === 'ip6-loopback') {
-    return true;
-  }
-  const ipType = net.isIP(normalized);
-  if (ipType === 4) {
-    return normalized.startsWith('127.') || normalized === '0.0.0.0';
-  }
-  if (ipType === 6) {
-    if (normalized === '0:0:0:0:0:0:0:1') {
-      return true;
-    }
-    const mapped = extractIpv4FromMappedIpv6(normalized);
-    if (mapped) {
-      return mapped.startsWith('127.') || mapped === '0.0.0.0';
-    }
-  }
-  return false;
-}
-
 function splitHostPort(input: string): { host: string; port?: number } {
-  const trimmed = (input || '').trim();
-  if (!trimmed) {
-    return { host: '' };
-  }
-  if (trimmed.startsWith('[')) {
-    const closeIndex = trimmed.indexOf(']');
-    if (closeIndex > 0) {
-      const host = trimmed.slice(1, closeIndex);
-      const rest = trimmed.slice(closeIndex + 1);
-      if (rest.startsWith(':')) {
-        const port = Number(rest.slice(1));
-        return { host, port: Number.isFinite(port) ? port : undefined };
-      }
-      return { host };
-    }
-  }
-  const lastColon = trimmed.lastIndexOf(':');
-  if (lastColon > 0 && trimmed.indexOf(':') === lastColon) {
-    const host = trimmed.slice(0, lastColon);
-    const port = Number(trimmed.slice(lastColon + 1));
-    return { host, port: Number.isFinite(port) ? port : undefined };
-  }
-  return { host: trimmed };
+  return splitHostPortUtil(input);
 }
 
 function isHostAllowed(host: string): boolean {
-  if (!host) {
-    return false;
-  }
-  return !isLoopbackHost(host);
+  return isHostAllowedUtil(host);
 }
 
 function buildNoProxyValue(values: string[]): string {
-  const cleaned = values.map((entry) => entry.trim()).filter(Boolean);
-  if (cleaned.length === 0) {
-    return '';
-  }
-  return uniqueList(cleaned).join(',');
+  return buildNoProxyValueUtil(values);
 }
 
 function buildLocalProxyTunnelConfigKey(
@@ -6455,32 +5804,19 @@ function buildLocalProxyTunnelConfigKey(
   remoteBind: string,
   localPort: number
 ): string {
-  return JSON.stringify({
-    loginHost,
-    user: cfg.user || '',
-    identityFile: cfg.identityFile || '',
-    sshQueryConfigPath: cfg.sshQueryConfigPath || '',
-    remoteBind,
-    localPort
-  });
+  return buildLocalProxyTunnelConfigKeyUtil(cfg, loginHost, remoteBind, localPort);
 }
 
 function buildLocalProxyTunnelTarget(cfg: SlurmConnectConfig, loginHost: string): string {
-  return cfg.user ? `${cfg.user}@${loginHost}` : loginHost;
+  return buildLocalProxyTunnelTargetUtil(cfg, loginHost);
 }
 
 function buildLocalProxyControlPath(key: string): string {
-  const hash = crypto.createHash('sha256').update(key).digest('hex').slice(0, 12);
-  const baseDir = process.platform === 'win32' ? os.tmpdir() : '/tmp';
-  return path.join(baseDir, `slurm-connect-tunnel-${hash}.sock`);
+  return buildLocalProxyControlPathUtil(key);
 }
 
 function resolveRemoteBindConnectHost(bindHost: string): string {
-  const trimmed = (bindHost || '').trim().toLowerCase();
-  if (!trimmed || trimmed === '0.0.0.0' || trimmed === '::' || trimmed === '[::]') {
-    return '127.0.0.1';
-  }
-  return trimmed;
+  return resolveRemoteBindConnectHostUtil(bindHost);
 }
 
 async function verifyRemoteForwardListener(
@@ -6736,71 +6072,11 @@ function parseProxyTarget(req: http.IncomingMessage): {
   isHttps: boolean;
   hostHeader: string;
 } | null {
-  const rawUrl = String(req.url || '');
-  let parsed: URL;
-  if (/^https?:\/\//i.test(rawUrl)) {
-    try {
-      parsed = new URL(rawUrl);
-    } catch {
-      return null;
-    }
-  } else {
-    const hostHeader = String(req.headers.host || '').trim();
-    if (!hostHeader) {
-      return null;
-    }
-    try {
-      parsed = new URL(`http://${hostHeader}${rawUrl}`);
-    } catch {
-      return null;
-    }
-  }
-  const hostname = parsed.hostname;
-  const isHttps = parsed.protocol === 'https:';
-  const port = parsed.port ? Number(parsed.port) : isHttps ? 443 : 80;
-  if (!hostname || !Number.isFinite(port)) {
-    return null;
-  }
-  const path = `${parsed.pathname || '/'}${parsed.search || ''}`;
-  const hostHeader = (() => {
-    const isIpv6 = net.isIP(hostname) === 6;
-    if (parsed.port) {
-      return isIpv6 ? `[${hostname}]:${parsed.port}` : `${hostname}:${parsed.port}`;
-    }
-    return isIpv6 ? `[${hostname}]` : hostname;
-  })();
-  return {
-    hostname,
-    port,
-    path,
-    isHttps,
-    hostHeader
-  };
+  return parseProxyTargetUtil(req);
 }
 
 function isProxyAuthValid(req: http.IncomingMessage, authUser: string, authToken: string): boolean {
-  const header = req.headers['proxy-authorization'];
-  if (!header) {
-    return false;
-  }
-  const value = Array.isArray(header) ? header[0] : header;
-  const match = /^Basic\s+(.+)$/i.exec(value.trim());
-  if (!match) {
-    return false;
-  }
-  let decoded = '';
-  try {
-    decoded = Buffer.from(match[1], 'base64').toString('utf8');
-  } catch {
-    return false;
-  }
-  const separatorIndex = decoded.indexOf(':');
-  if (separatorIndex < 0) {
-    return false;
-  }
-  const user = decoded.slice(0, separatorIndex);
-  const pass = decoded.slice(separatorIndex + 1);
-  return user === authUser && pass === authToken;
+  return isProxyAuthValidUtil(req, authUser, authToken);
 }
 
 function respondProxyAuthRequired(res: http.ServerResponse): void {
@@ -6958,6 +6234,13 @@ function buildLocalProxyRuntimeState(
 async function resumeLocalProxyForRemoteSession(): Promise<void> {
   if (vscode.env.remoteName !== 'ssh-remote') {
     return;
+  }
+  if (!hasSessionE2EContext()) {
+    const remoteAlias = (resolveRemoteSshAlias() || '').trim();
+    const storedAlias = (getStoredConnectionState()?.alias || '').trim();
+    if (!remoteAlias || !storedAlias || remoteAlias !== storedAlias) {
+      return;
+    }
   }
   const cfg = getConfig();
   if (!cfg.localProxyEnabled) {
@@ -8328,6 +7611,113 @@ async function connectToHost(
   }
 }
 
+export async function __resetForTests(): Promise<void> {
+  cancelActiveConnectToken();
+  finalizeConnectToken(activeConnectToken);
+  connectionState = 'idle';
+  lastConnectionAlias = undefined;
+  lastConnectionSessionKey = undefined;
+  lastConnectionSessionMode = undefined;
+  lastConnectionLoginHost = undefined;
+  lastSshAuthPrompt = undefined;
+  testConnectToHostOverride = undefined;
+  testEnsureRemoteSshSettingsOverride = undefined;
+  testRemoteSshConfigPathOverride = undefined;
+  stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
+  if (extensionGlobalState) {
+    try {
+      await extensionGlobalState.update(CLUSTER_INFO_CACHE_KEY, undefined);
+      await extensionGlobalState.update(CLUSTER_UI_CACHE_KEY, undefined);
+      await extensionGlobalState.update(PROXY_OVERRIDE_RESET_KEY, undefined);
+    } catch {
+      // Ignore cleanup failures during tests.
+    }
+  }
+  if (extensionWorkspaceState) {
+    try {
+      await extensionWorkspaceState.update(CLUSTER_UI_CACHE_KEY, undefined);
+      await extensionWorkspaceState.update(PROXY_OVERRIDE_RESET_KEY, undefined);
+    } catch {
+      // Ignore cleanup failures during tests.
+    }
+  }
+  try {
+    await fs.unlink(resolveLogFilePath());
+  } catch {
+    // Ignore missing test log files.
+  }
+}
+
+export async function __runStartupMigrationsForTests(): Promise<void> {
+  await runStartupMigrations();
+}
+
+export async function __runProxyOverrideCleanupForTests(): Promise<void> {
+  if (extensionGlobalState) {
+    await extensionGlobalState.update(PROXY_OVERRIDE_RESET_KEY, undefined);
+  }
+  if (extensionWorkspaceState) {
+    await extensionWorkspaceState.update(PROXY_OVERRIDE_RESET_KEY, undefined);
+  }
+  await resetProxyOverridesToDefaults();
+}
+
+export async function __runNonInteractiveConnectForTests(
+  overrides: Partial<SlurmConnectConfig> = {},
+  options?: {
+    aliasOverride?: string;
+    connectResult?: boolean;
+    bypassRemoteSshSettings?: boolean;
+    remoteSshConfigPath?: string;
+  }
+): Promise<TestConnectResult> {
+  const finalOverrides: Partial<SlurmConnectConfig> = {
+    ...overrides,
+    openInNewWindow: true
+  };
+  const connectInvocations: TestConnectInvocation[] = [];
+  const previousConnectToHostOverride = testConnectToHostOverride;
+  const previousEnsureRemoteSshSettingsOverride = testEnsureRemoteSshSettingsOverride;
+  const previousRemoteSshConfigPathOverride = testRemoteSshConfigPathOverride;
+  testConnectToHostOverride = async (
+    alias: string,
+    openInNewWindow: boolean,
+    remoteWorkspacePath?: string
+  ): Promise<boolean> => {
+    connectInvocations.push({
+      alias,
+      openInNewWindow,
+      remoteWorkspacePath: remoteWorkspacePath?.trim() || undefined
+    });
+    return options?.connectResult ?? true;
+  };
+  testEnsureRemoteSshSettingsOverride = options?.bypassRemoteSshSettings
+    ? async () => undefined
+    : previousEnsureRemoteSshSettingsOverride;
+  testRemoteSshConfigPathOverride = options?.remoteSshConfigPath || previousRemoteSshConfigPathOverride;
+
+  try {
+    const didConnect = await connectCommand(finalOverrides, {
+      interactive: false,
+      aliasOverride: options?.aliasOverride
+    });
+    const cfg = getConfigWithOverrides(finalOverrides);
+    return {
+      didConnect,
+      alias: lastConnectionAlias,
+      sessionKey: lastConnectionSessionKey,
+      loginHost: lastConnectionLoginHost,
+      includeFilePath: resolveSlurmConnectIncludeFilePath(cfg),
+      logFilePath: resolveLogFilePath(),
+      connectInvocations
+    };
+  } finally {
+    testConnectToHostOverride = previousConnectToHostOverride;
+    testEnsureRemoteSshSettingsOverride = previousEnsureRemoteSshSettingsOverride;
+    testRemoteSshConfigPathOverride = previousRemoteSshConfigPathOverride;
+  }
+}
+
 async function disconnectFromHost(alias?: string): Promise<boolean> {
   const remoteExtension = vscode.extensions.getExtension('ms-vscode-remote.remote-ssh');
   if (!remoteExtension) {
@@ -8476,6 +7866,11 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     const cached = getCachedUiValue(cache, key);
     return cached !== undefined ? cached : fallback;
   };
+  const fromConfigOrCache = <T extends keyof UiValues>(
+    configKey: string,
+    cacheKey: T,
+    fallback: UiValues[T]
+  ): UiValues[T] => (hasConfigValue(configKey) ? fallback : fromCache(cacheKey, fallback));
   const hasDefaultPartition = hasValue('defaultPartition', 'defaultPartition');
   const hasDefaultNodes = hasValue('defaultNodes', 'defaultNodes');
   const hasDefaultTasksPerNode = hasValue('defaultTasksPerNode', 'defaultTasksPerNode');
@@ -8485,26 +7880,30 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
   const hasDefaultGpuType = hasValue('defaultGpuType', 'defaultGpuType');
   const hasDefaultGpuCount = hasValue('defaultGpuCount', 'defaultGpuCount');
   return {
-    loginHosts: fromCache('loginHosts', cfg.loginHosts.join('\n')),
-    loginHostsCommand: fromCache('loginHostsCommand', cfg.loginHostsCommand || ''),
-    loginHostsQueryHost: fromCache('loginHostsQueryHost', cfg.loginHostsQueryHost || ''),
-    partitionCommand: fromCache('partitionCommand', cfg.partitionCommand || ''),
-    partitionInfoCommand: fromCache('partitionInfoCommand', cfg.partitionInfoCommand || ''),
-    filterFreeResources: fromCache('filterFreeResources', cfg.filterFreeResources),
-    qosCommand: fromCache('qosCommand', cfg.qosCommand || ''),
-    accountCommand: fromCache('accountCommand', cfg.accountCommand || ''),
-    user: fromCache('user', cfg.user || ''),
-    identityFile: fromCache('identityFile', cfg.identityFile || ''),
-    preSshCommand: fromCache('preSshCommand', cfg.preSshCommand || ''),
-    preSshCheckCommand: fromCache('preSshCheckCommand', cfg.preSshCheckCommand || ''),
+    loginHosts: fromConfigOrCache('loginHosts', 'loginHosts', cfg.loginHosts.join('\n')),
+    loginHostsCommand: fromConfigOrCache('loginHostsCommand', 'loginHostsCommand', cfg.loginHostsCommand || ''),
+    loginHostsQueryHost: fromConfigOrCache('loginHostsQueryHost', 'loginHostsQueryHost', cfg.loginHostsQueryHost || ''),
+    partitionCommand: fromConfigOrCache('partitionCommand', 'partitionCommand', cfg.partitionCommand || ''),
+    partitionInfoCommand: fromConfigOrCache('partitionInfoCommand', 'partitionInfoCommand', cfg.partitionInfoCommand || ''),
+    filterFreeResources: fromConfigOrCache('filterFreeResources', 'filterFreeResources', cfg.filterFreeResources),
+    qosCommand: fromConfigOrCache('qosCommand', 'qosCommand', cfg.qosCommand || ''),
+    accountCommand: fromConfigOrCache('accountCommand', 'accountCommand', cfg.accountCommand || ''),
+    user: fromConfigOrCache('user', 'user', cfg.user || ''),
+    identityFile: fromConfigOrCache('identityFile', 'identityFile', cfg.identityFile || ''),
+    preSshCommand: fromConfigOrCache('preSshCommand', 'preSshCommand', cfg.preSshCommand || ''),
+    preSshCheckCommand: fromConfigOrCache('preSshCheckCommand', 'preSshCheckCommand', cfg.preSshCheckCommand || ''),
     autoInstallProxyScriptOnClusterInfo: cfg.autoInstallProxyScriptOnClusterInfo,
-    additionalSshOptions: fromCache('additionalSshOptions', formatAdditionalSshOptions(cfg.additionalSshOptions)),
-    moduleLoad: fromCache('moduleLoad', cfg.moduleLoad || ''),
-    startupCommand: fromCache('startupCommand', cfg.startupCommand || ''),
+    additionalSshOptions: fromConfigOrCache(
+      'additionalSshOptions',
+      'additionalSshOptions',
+      formatAdditionalSshOptions(cfg.additionalSshOptions)
+    ),
+    moduleLoad: fromConfigOrCache('moduleLoad', 'moduleLoad', cfg.moduleLoad || ''),
+    startupCommand: fromConfigOrCache('startupCommand', 'startupCommand', cfg.startupCommand || ''),
     moduleSelections: getCachedUiValue(cache, 'moduleSelections'),
     moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
-    proxyCommand: fromCache('proxyCommand', cfg.proxyCommand || ''),
-    proxyArgs: fromCache('proxyArgs', cfg.proxyArgs.join('\n')),
+    proxyCommand: fromConfigOrCache('proxyCommand', 'proxyCommand', cfg.proxyCommand || ''),
+    proxyArgs: fromConfigOrCache('proxyArgs', 'proxyArgs', cfg.proxyArgs.join('\n')),
     proxyDebugLogging: cfg.proxyDebugLogging,
     localProxyEnabled: cfg.localProxyEnabled,
     localProxyNoProxy: cfg.localProxyNoProxy.join('\n'),
@@ -8512,32 +7911,49 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     localProxyRemoteBind: cfg.localProxyRemoteBind || '',
     localProxyRemoteHost: cfg.localProxyRemoteHost || '',
     localProxyComputeTunnel: cfg.localProxyComputeTunnel,
-    extraSallocArgs: fromCache('extraSallocArgs', cfg.extraSallocArgs.join('\n')),
-    promptForExtraSallocArgs: fromCache('promptForExtraSallocArgs', cfg.promptForExtraSallocArgs),
-    sessionMode: fromCache('sessionMode', cfg.sessionMode || 'persistent'),
-    sessionKey: fromCache('sessionKey', cfg.sessionKey || ''),
-    sessionIdleTimeoutSeconds: fromCache(
+    extraSallocArgs: fromConfigOrCache('extraSallocArgs', 'extraSallocArgs', cfg.extraSallocArgs.join('\n')),
+    promptForExtraSallocArgs: fromConfigOrCache(
+      'promptForExtraSallocArgs',
+      'promptForExtraSallocArgs',
+      cfg.promptForExtraSallocArgs
+    ),
+    sessionMode: fromConfigOrCache('sessionMode', 'sessionMode', cfg.sessionMode || 'persistent'),
+    sessionKey: fromConfigOrCache('sessionKey', 'sessionKey', cfg.sessionKey || ''),
+    sessionIdleTimeoutSeconds: fromConfigOrCache(
+      'sessionIdleTimeoutSeconds',
       'sessionIdleTimeoutSeconds',
       String(cfg.sessionIdleTimeoutSeconds ?? 600)
     ),
     sessionStateDir: cfg.sessionStateDir || '',
-    defaultPartition: hasDefaultPartition ? fromCache('defaultPartition', cfg.defaultPartition || '') : '',
-    defaultNodes: hasDefaultNodes ? fromCache('defaultNodes', String(cfg.defaultNodes || '')) : '',
+    defaultPartition: hasDefaultPartition
+      ? fromConfigOrCache('defaultPartition', 'defaultPartition', cfg.defaultPartition || '')
+      : '',
+    defaultNodes: hasDefaultNodes
+      ? fromConfigOrCache('defaultNodes', 'defaultNodes', String(cfg.defaultNodes || ''))
+      : '',
     defaultTasksPerNode: hasDefaultTasksPerNode
-      ? fromCache('defaultTasksPerNode', String(cfg.defaultTasksPerNode || ''))
+      ? fromConfigOrCache('defaultTasksPerNode', 'defaultTasksPerNode', String(cfg.defaultTasksPerNode || ''))
       : '',
     defaultCpusPerTask: hasDefaultCpusPerTask
-      ? fromCache('defaultCpusPerTask', String(cfg.defaultCpusPerTask || ''))
+      ? fromConfigOrCache('defaultCpusPerTask', 'defaultCpusPerTask', String(cfg.defaultCpusPerTask || ''))
       : '',
-    defaultTime: hasDefaultTime ? fromCache('defaultTime', cfg.defaultTime || '') : '24:00:00',
-    defaultMemoryMb: hasDefaultMemoryMb ? fromCache('defaultMemoryMb', String(cfg.defaultMemoryMb || '')) : '',
-    defaultGpuType: hasDefaultGpuType ? fromCache('defaultGpuType', cfg.defaultGpuType || '') : '',
-    defaultGpuCount: hasDefaultGpuCount ? fromCache('defaultGpuCount', String(cfg.defaultGpuCount || '')) : '',
+    defaultTime: hasDefaultTime
+      ? fromConfigOrCache('defaultTime', 'defaultTime', cfg.defaultTime || '')
+      : '24:00:00',
+    defaultMemoryMb: hasDefaultMemoryMb
+      ? fromConfigOrCache('defaultMemoryMb', 'defaultMemoryMb', String(cfg.defaultMemoryMb || ''))
+      : '',
+    defaultGpuType: hasDefaultGpuType
+      ? fromConfigOrCache('defaultGpuType', 'defaultGpuType', cfg.defaultGpuType || '')
+      : '',
+    defaultGpuCount: hasDefaultGpuCount
+      ? fromConfigOrCache('defaultGpuCount', 'defaultGpuCount', String(cfg.defaultGpuCount || ''))
+      : '',
     sshHostPrefix: cfg.sshHostPrefix || '',
-    forwardAgent: fromCache('forwardAgent', cfg.forwardAgent),
-    requestTTY: fromCache('requestTTY', cfg.requestTTY),
-    openInNewWindow: fromCache('openInNewWindow', cfg.openInNewWindow),
-    remoteWorkspacePath: fromCache('remoteWorkspacePath', cfg.remoteWorkspacePath || ''),
+    forwardAgent: fromConfigOrCache('forwardAgent', 'forwardAgent', cfg.forwardAgent),
+    requestTTY: fromConfigOrCache('requestTTY', 'requestTTY', cfg.requestTTY),
+    openInNewWindow: fromConfigOrCache('openInNewWindow', 'openInNewWindow', cfg.openInNewWindow),
+    remoteWorkspacePath: fromConfigOrCache('remoteWorkspacePath', 'remoteWorkspacePath', cfg.remoteWorkspacePath || ''),
     temporarySshConfigPath: cfg.temporarySshConfigPath || '',
     sshQueryConfigPath: cfg.sshQueryConfigPath || ''
   };

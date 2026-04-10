@@ -75,7 +75,19 @@ The diagram above was inspired by the [VS Code Remote-SSH architecture diagram](
 
 **Contributing and development:**
 - Install dependencies: `npm install`
-- Compile: `npm run compile`
-- Test: `npm test`
+- Install Python test dependencies: `python3 -m pip install -r requirements-dev.txt`
+- Lint: `npm run lint`
+- Typecheck: `npm run typecheck`
+- Fast TS unit tests: `npm test`
+- TS unit tests with coverage gate: `npm run test:coverage`
+- VS Code smoke test: `npm run test:integration`
+- VS Code fixture integration test: `npm run test:integration:slurm`
+- Python proxy tests with coverage gate: `npm run test:python`
+- Full local pipeline: `npm run test:ci`
+- Real SSH/Slurm fixture startup: `npm run e2e:slurm:up`
+- Real SSH/Slurm smoke test: `npm run e2e:slurm:smoke`
+- Full Remote-SSH fixture session test: `npm run e2e:slurm:remote-session`
+- Fixture teardown: `npm run e2e:slurm:clean`
+- Slurm fixture docs: [docs/e2e-slurm-fixture.md](docs/e2e-slurm-fixture.md)
 - Optional UI screenshot refresh: `npm run screenshot:webview -- --out media/slurm-connect-ui.png`
 - Project metadata: [CHANGELOG.md](CHANGELOG.md), [LICENSE](LICENSE)

@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = "--cov=media --cov-report=term-missing --cov-fail-under=25"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+branch = true
+source = ["media"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 25
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = ["node_modules", "out", ".vscode-test"]

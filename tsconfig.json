@@ -15,8 +15,13 @@
       "vscode"
     ]
   },
+  "include": [
+    "src/**/*.ts"
+  ],
   "exclude": [
     "node_modules",
-    ".vscode-test"
+    ".vscode-test",
+    "out",
+    "src/test/unit/**/*.ts"
   ]
 }

@@ -1,6 +1,12 @@
 node_modules/
 out/
 .vscode-test/
+coverage/
+.coverage
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+.e2e/
 *.vsix
 
 .vscode/

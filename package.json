@@ -13,7 +13,8 @@
   ],
   "activationEvents": [
     "onCommand:slurmConnect.connect",
-    "onView:slurmConnect.connectView"
+    "onView:slurmConnect.connectView",
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "extensionKind": [
@@ -319,14 +320,42 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "typecheck": "tsc -p ./ --noEmit",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
-    "test": "npm run compile && node ./out/test/extension.test.js",
+    "lint:ts": "eslint src vitest.config.ts --ext .ts",
+    "lint:py": "python3 -m ruff check media/vscode-proxy.py tests/python",
+    "lint": "npm run lint:ts && npm run lint:py",
+    "test": "npm run test:unit",
+    "test:unit": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "npm run compile && node ./scripts/e2e/run-with-display.js node ./out/test/runTest.js",
+    "test:integration:slurm": "npm run compile && node ./scripts/e2e/run-with-display.js node ./out/test/runTest.js --slurm-fixture-e2e",
+    "test:python": "python3 -m pytest",
+    "test:ci": "npm run lint && npm run typecheck && npm run test:coverage && npm run test:integration && npm run test:python && node ./scripts/e2e/test-ci-slurm.js",
+    "e2e:slurm:prepare": "bash ./scripts/e2e/slurm-fixture.sh prepare",
+    "e2e:slurm:up": "bash ./scripts/e2e/slurm-fixture.sh up",
+    "e2e:slurm:status": "bash ./scripts/e2e/slurm-fixture.sh status",
+    "e2e:slurm:settings": "bash ./scripts/e2e/slurm-fixture.sh settings",
+    "e2e:slurm:smoke": "bash ./scripts/e2e/slurm-fixture.sh smoke",
+    "e2e:slurm:remote-session": "npm run compile && node ./scripts/e2e/run-with-display.js node ./scripts/e2e/vscode-remote-session.js",
+    "e2e:slurm:down": "bash ./scripts/e2e/slurm-fixture.sh down",
+    "e2e:slurm:clean": "bash ./scripts/e2e/slurm-fixture.sh clean",
     "screenshot:webview": "node ./scripts/capture-webview-screenshot.js"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^18.19.3",
     "@types/vscode": "^1.85.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.39.1",
+    "glob": "^11.0.3",
+    "globals": "^16.4.0",
+    "mocha": "^11.7.4",
+    "typescript-eslint": "^8.46.2",
+    "vitest": "^3.2.4",
     "typescript": "^5.3.3"
   }
 }

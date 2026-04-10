@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -186,6 +187,56 @@ def parse_hostname_marker(line: str, marker: str) -> Optional[str]:
     if not token or not HOSTNAME_VALUE_RE.match(token):
         return None
     return token
+
+
+def resolve_node_address(node_name: str, logger: logging.Logger) -> Optional[str]:
+    trimmed = (node_name or "").strip()
+    if not trimmed:
+        return None
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "node", "-o", trimmed],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        logger.debug("Failed to query node metadata for %s.", trimmed, exc_info=True)
+        return None
+    if result.returncode != 0:
+        return None
+    fields = parse_scontrol_fields(result.stdout or "")
+    for key in ("NodeAddr", "NodeHostName"):
+        value = (fields.get(key) or "").strip()
+        if value and value.lower() != "(null)":
+            return value
+    return None
+
+
+def is_resolvable_host(host: str) -> bool:
+    trimmed = (host or "").strip()
+    if not trimmed:
+        return False
+    try:
+        socket.getaddrinfo(trimmed, None)
+        return True
+    except socket.gaierror:
+        return False
+
+
+def resolve_connect_host(host: str, logger: logging.Logger) -> Optional[str]:
+    trimmed = (host or "").strip()
+    if not trimmed:
+        return None
+    if is_loopback_host(trimmed) or is_resolvable_host(trimmed):
+        return trimmed
+    resolved = resolve_node_address(trimmed, logger)
+    if resolved and resolved != trimmed:
+        logger.info("Resolved compute host %s -> %s via Slurm node metadata.", trimmed, resolved)
+        return resolved
+    return trimmed
 
 
 def parse_listening_on_line(line: str) -> Optional[ListeningInfo]:
@@ -1965,8 +2016,9 @@ def main() -> int:
                 "Unable to resolve session node; launching srun without --nodelist."
             )
         else:
+            chosen_host = resolve_connect_host(chosen_node, logger)
             with condition:
-                state.target_host = chosen_node
+                state.target_host = chosen_host or chosen_node
                 condition.notify_all()
         shell_cmd = ["/bin/bash", "-l"]
         if tunnel_config:
@@ -2135,9 +2187,10 @@ def main() -> int:
             if marker in line:
                 hostname = parse_hostname_marker(line, marker)
                 if hostname:
+                    resolved_host = resolve_connect_host(hostname, logger)
                     with condition:
                         if not state.target_host:
-                            state.target_host = hostname
+                            state.target_host = resolved_host or hostname
                             condition.notify_all()
                     maybe_start_proxy()
                 continue
@@ -2158,7 +2211,7 @@ def main() -> int:
                 listening_info = info
                 listening_line = line
                 with condition:
-                    if info.host and is_loopback_host(info.host):
+                    if info.host and is_loopback_host(info.host) and not state.target_host:
                         state.target_host = info.host
                     state.target_port = info.port
                     condition.notify_all()
@@ -2220,9 +2273,10 @@ def main() -> int:
             if marker in line:
                 hostname = parse_hostname_marker(line, marker)
                 if hostname:
+                    resolved_host = resolve_connect_host(hostname, logger)
                     with condition:
                         if not state.target_host:
-                            state.target_host = hostname
+                            state.target_host = resolved_host or hostname
                             condition.notify_all()
                     maybe_start_proxy()
                 continue
@@ -2246,7 +2300,7 @@ def main() -> int:
                 listening_info = info
                 listening_line = line
                 with condition:
-                    if info.host and is_loopback_host(info.host):
+                    if info.host and is_loopback_host(info.host) and not state.target_host:
                         state.target_host = info.host
                     state.target_port = info.port
                     condition.notify_all()
@@ -2307,7 +2361,14 @@ def main() -> int:
             if shutdown_event.is_set():
                 break
             if line == "":
-                request_shutdown("stdin closed")
+                # Remote-SSH can close stdin after it finishes the bootstrap
+                # handshake even though the websocket transport still needs the
+                # proxy and the remote shell to stay alive.
+                logger.info("stdin closed; closing remote stdin without shutting down proxy.")
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
                 break
             if tee_stdin is not None:
                 tee_stdin.write(line)
@@ -2320,10 +2381,6 @@ def main() -> int:
                 logger.error("Failed to write to remote shell stdin.", exc_info=True)
                 request_shutdown("stdin write failed")
                 break
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
 
     stdout_thread = threading.Thread(target=stdout_worker, daemon=True)
     stderr_thread = threading.Thread(target=stderr_worker, daemon=True)
