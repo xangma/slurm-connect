@@ -90,6 +90,30 @@ import {
 } from './connect/clusterQueries';
 import { runConnectFlow, type ConnectFlowRuntime } from './connect/flow';
 import type { ConnectFlowResult, LocalProxyPlan } from './connect/types';
+import {
+  createSshCommandRuntime,
+  type SshCommandRuntime,
+  type StoredSshAgentEnv as StoredSshAgentEnvRuntime
+} from './ssh/commands';
+import {
+  collectSshConfigHosts as collectSshConfigHostsSsh,
+  ensureSshIncludeInstalled as ensureSshIncludeInstalledSsh,
+  normalizeRemoteConfigPath as normalizeRemoteConfigPathSsh,
+  resolveRemoteConfigContext as resolveRemoteConfigContextSsh,
+  resolveSlurmConnectIncludeFilePath as resolveSlurmConnectIncludeFilePathSsh,
+  resolveSshHostFromConfig as resolveSshHostFromConfigSsh,
+  resolveSshHostsConfigPath as resolveSshHostsConfigPathSsh,
+  writeSlurmConnectIncludeFile as writeSlurmConnectIncludeFileSsh
+} from './ssh/config';
+import {
+  connectToHost as connectToHostRemoteSsh,
+  disconnectFromHost as disconnectFromHostRemoteSsh,
+  ensureRemoteSshSettings as ensureRemoteSshSettingsRemoteSsh,
+  migrateStaleRemoteSshConfigIfNeeded as migrateStaleRemoteSshConfigIfNeededRemoteSsh,
+  openRemoteSshLog as openRemoteSshLogRemoteSsh,
+  refreshRemoteSshHosts as refreshRemoteSshHostsRemoteSsh,
+  waitForRemoteConnectionOrTimeout as waitForRemoteConnectionOrTimeoutRemoteSsh
+} from './ssh/remoteSsh';
 import { SlurmConnectViewProvider } from './webview/provider';
 
 const execFileAsync = promisify(execFile);
@@ -163,6 +187,7 @@ let testConnectToHostOverride:
 let testEnsureRemoteSshSettingsOverride: ((cfg: SlurmConnectConfig) => Promise<void>) | undefined;
 let testRemoteSshConfigPathOverride: string | undefined;
 let sessionE2EStarted = false;
+let sshCommandRuntime: SshCommandRuntime | undefined;
 
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const LOG_TRUNCATE_KEEP_BYTES = 4 * 1024 * 1024;
@@ -236,6 +261,36 @@ const CONFIG_KEYS = [
   'sshHostKeyChecking',
   'sshConnectTimeoutSeconds'
 ];
+
+function getSshCommandRuntime(): SshCommandRuntime {
+  if (!sshCommandRuntime) {
+    sshCommandRuntime = createSshCommandRuntime({
+      getOutputChannel,
+      fileExists,
+      getStoredSshAgentEnv,
+      storeSshAgentEnv,
+      formatError,
+      refreshAgentStatus,
+      openSlurmConnectView,
+      ensurePreSshCommand,
+      runSshCommandInTerminal,
+      runSshAddInTerminal,
+      runSshKeygenPublicKeyInTerminal
+    });
+  }
+  return sshCommandRuntime;
+}
+
+function getSshConfigRuntime() {
+  const sshRuntime = getSshCommandRuntime();
+  return {
+    fileExists,
+    getOutputChannel,
+    resolveSshToolPath: (tool: 'ssh') => sshRuntime.resolveSshToolPath(tool),
+    normalizeSshErrorText: sshRuntime.normalizeSshErrorText,
+    pickSshErrorSummary: sshRuntime.pickSshErrorSummary
+  };
+}
 async function runStartupMigrations(): Promise<void> {
   await migrateLegacyState();
   await migrateLegacySettings();
@@ -765,19 +820,7 @@ async function openLogFile(): Promise<void> {
 }
 
 async function openRemoteSshLog(): Promise<void> {
-  try {
-    await vscode.commands.executeCommand('opensshremotes.showLog');
-    return;
-  } catch {
-    // Fall through to output channel fallback.
-  }
-  try {
-    await vscode.commands.executeCommand(
-      'workbench.action.output.show.extension-output-ms-vscode-remote.remote-ssh'
-    );
-  } catch {
-    void vscode.window.showWarningMessage('Unable to open Remote-SSH logs.');
-  }
+  await openRemoteSshLogRemoteSsh();
 }
 
 async function loadSshHosts(overrides?: Partial<SlurmConnectConfig>): Promise<{
@@ -787,7 +830,7 @@ async function loadSshHosts(overrides?: Partial<SlurmConnectConfig>): Promise<{
 }> {
   try {
     const cfg = getConfigWithOverrides(overrides);
-    const configPath = await resolveSshHostsConfigPath(cfg);
+    const configPath = await resolveSshHostsConfigPathSsh(cfg, getSshConfigRuntime());
     if (!configPath) {
       return {
         hosts: [],
@@ -795,7 +838,7 @@ async function loadSshHosts(overrides?: Partial<SlurmConnectConfig>): Promise<{
       };
     }
     return {
-      hosts: await collectSshConfigHosts(configPath),
+      hosts: await collectSshConfigHostsSsh(configPath, getSshConfigRuntime()),
       source: configPath
     };
   } catch (error) {
@@ -1474,10 +1517,12 @@ async function connectCommand(
 }
 
 function createClusterQueryRuntime(): ClusterQueryRuntime {
+  const sshRuntime = getSshCommandRuntime();
   return {
     getOutputChannel,
-    runSshCommand,
-    runSshCommandWithInput,
+    runSshCommand: (loginHost, cfg, command) => sshRuntime.runSshCommand(loginHost, cfg, command),
+    runSshCommandWithInput: (loginHost, cfg, command, input) =>
+      sshRuntime.runSshCommandWithInput(loginHost, cfg, command, input),
     formatError,
     showWarningMessage: (message) => {
       void vscode.window.showWarningMessage(message);
@@ -1489,13 +1534,15 @@ function createClusterQueryRuntime(): ClusterQueryRuntime {
 }
 
 function createClusterInfoMessageRuntime(): ClusterInfoMessageRuntime {
+  const sshRuntime = getSshCommandRuntime();
   return {
     ...createClusterQueryRuntime(),
     buildOverridesFromUi,
     getConfigWithOverrides,
     parseListInput,
-    maybePromptForSshAuthOnConnect,
-    buildAgentStatusMessage,
+    maybePromptForSshAuthOnConnect: (cfg, loginHost) =>
+      sshRuntime.maybePromptForSshAuthOnConnect(cfg, loginHost),
+    buildAgentStatusMessage: (identityFile) => sshRuntime.buildAgentStatusMessage(identityFile),
     showErrorMessage: (message) => {
       void vscode.window.showErrorMessage(message);
     }
@@ -1503,6 +1550,7 @@ function createClusterInfoMessageRuntime(): ClusterInfoMessageRuntime {
 }
 
 function createConnectFlowRuntime(): ConnectFlowRuntime {
+  const sshRuntime = getSshCommandRuntime();
   return {
     getOutputChannel,
     formatError,
@@ -1513,8 +1561,9 @@ function createConnectFlowRuntime(): ConnectFlowRuntime {
     showInputBox: (options) => vscode.window.showInputBox(options),
     showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
     withProgress: async (options, task) => await vscode.window.withProgress(options, () => task()),
-    runSshCommand,
-    maybePromptForSshAuthOnConnect,
+    runSshCommand: (loginHost, cfg, command) => sshRuntime.runSshCommand(loginHost, cfg, command),
+    maybePromptForSshAuthOnConnect: (cfg, loginHost) =>
+      sshRuntime.maybePromptForSshAuthOnConnect(cfg, loginHost),
     queryPartitions: (loginHost, cfg) => queryPartitionsConnect(createClusterQueryRuntime(), loginHost, cfg),
     querySimpleList: (loginHost, cfg, command) =>
       querySimpleListConnect(createClusterQueryRuntime(), loginHost, cfg, command),
@@ -1528,24 +1577,41 @@ function createConnectFlowRuntime(): ConnectFlowRuntime {
     getProxyInstallSnippet,
     normalizeLocalProxyTunnelMode,
     ensureRemoteSshSettings: (flowCfg) =>
-      (testEnsureRemoteSshSettingsOverride ?? ensureRemoteSshSettings)(flowCfg),
-    migrateStaleRemoteSshConfigIfNeeded,
-    resolveRemoteConfigContext,
+      testEnsureRemoteSshSettingsOverride
+        ? testEnsureRemoteSshSettingsOverride(flowCfg)
+        : ensureRemoteSshSettingsRemoteSsh(flowCfg, sshRuntime, fileExists, { formatError }),
+    migrateStaleRemoteSshConfigIfNeeded: () =>
+      migrateStaleRemoteSshConfigIfNeededRemoteSsh({ getOutputChannel }),
+    resolveRemoteConfigContext: (flowCfg) =>
+      resolveRemoteConfigContextSsh(
+        flowCfg,
+        { fileExists, getOutputChannel },
+        testRemoteSshConfigPathOverride ||
+          normalizeRemoteConfigPathSsh(vscode.workspace.getConfiguration('remote.SSH').get<string>('configFile'))
+      ),
     ensureLocalProxyPlan,
     buildRemoteCommand,
-    ensureSshAgentEnvForCurrentSsh,
-    resolveSshToolPath,
-    hasSshOption,
+    ensureSshAgentEnvForCurrentSsh: () => sshRuntime.ensureSshAgentEnvForCurrentSsh(),
+    resolveSshToolPath: (tool) => sshRuntime.resolveSshToolPath(tool),
+    hasSshOption: (options, key) => sshRuntime.hasSshOption(options, key),
     redactRemoteCommandForLog,
-    writeSlurmConnectIncludeFile,
-    ensureSshIncludeInstalled,
-    refreshRemoteSshHosts,
+    writeSlurmConnectIncludeFile: (entry, includePath) =>
+      writeSlurmConnectIncludeFileSsh(entry, includePath),
+    ensureSshIncludeInstalled: (baseConfigPath, includePath) =>
+      ensureSshIncludeInstalledSsh(baseConfigPath, includePath, { getOutputChannel }),
+    refreshRemoteSshHosts: () => refreshRemoteSshHostsRemoteSsh(),
     ensurePreSshCommand,
     connectToHost: (alias, openInNewWindow, remoteWorkspacePath) =>
-      (testConnectToHostOverride ?? connectToHost)(alias, openInNewWindow, remoteWorkspacePath),
+      testConnectToHostOverride
+        ? testConnectToHostOverride(alias, openInNewWindow, remoteWorkspacePath)
+        : connectToHostRemoteSsh(alias, openInNewWindow, remoteWorkspacePath, sshRuntime, {
+            getOutputChannel,
+            formatError
+          }),
     delay,
-    waitForRemoteConnectionOrTimeout,
-    resolveSshIdentityAgentOption,
+    waitForRemoteConnectionOrTimeout: (timeoutMs, pollMs) =>
+      waitForRemoteConnectionOrTimeoutRemoteSsh(timeoutMs, pollMs, { delay }),
+    resolveSshIdentityAgentOption: (sshPath) => sshRuntime.resolveSshIdentityAgentOption(sshPath),
     getCurrentLocalProxyPort: () => localProxyState?.port ?? 0,
     showOutput: () => {
       getOutputChannel().show(true);
@@ -1562,28 +1628,16 @@ async function resolveRemoteConfigContext(cfg: SlurmConnectConfig): Promise<{
   includePath: string;
   includeFilePath: string;
 }> {
-  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  const currentRemoteConfig =
-    testRemoteSshConfigPathOverride || normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
-  const baseConfigPath = normalizeSshPath(currentRemoteConfig || defaultSshConfigPath());
-  if (!currentRemoteConfig) {
-    try {
-      await fs.access(baseConfigPath);
-    } catch {
-      getOutputChannel().appendLine(`SSH config not found at ${baseConfigPath}; creating.`);
-    }
-  }
-  const includePath = resolveSlurmConnectIncludePath(cfg);
-  const includeFilePath = resolveSlurmConnectIncludeFilePath(cfg);
-  return { baseConfigPath, includePath, includeFilePath };
+  return await resolveRemoteConfigContextSsh(
+    cfg,
+    { fileExists, getOutputChannel },
+    testRemoteSshConfigPathOverride ||
+      normalizeRemoteConfigPath(vscode.workspace.getConfiguration('remote.SSH').get<string>('configFile'))
+  );
 }
 
 function resolveSshIdentityAgentOption(sshPath: string): string | undefined {
-  const sock = process.env.SSH_AUTH_SOCK || '';
-  if (!sock || !isGitSshPath(sshPath)) {
-    return undefined;
-  }
-  return sock;
+  return getSshCommandRuntime().resolveSshIdentityAgentOption(sshPath);
 }
 
 async function handleClusterInfoRequest(values: Partial<UiValues>, webview: vscode.Webview): Promise<void> {
@@ -1792,135 +1846,14 @@ async function resolveGitSshAgentPath(sshPath: string): Promise<string | undefin
 }
 
 async function ensureSshAgentEnvForCurrentSsh(identityPathRaw?: string): Promise<void> {
-  if (process.platform !== 'win32') {
-    return;
-  }
-  const log = getOutputChannel();
-  const sshPath = await resolveSshToolPath('ssh');
-  if (!isGitSshPath(sshPath)) {
-    const existingSock = process.env.SSH_AUTH_SOCK || '';
-    const existingPid = process.env.SSH_AGENT_PID || '';
-    if (existingSock) {
-      let keepSocket = false;
-      if (isWindowsNamedPipe(existingSock)) {
-        try {
-          const sshAdd = await resolveSshToolPath('ssh-add');
-          const probe = await probeSshAgentWithEnv(sshAdd, { sock: existingSock, pid: existingPid || undefined });
-          keepSocket = probe.status !== 'unavailable';
-        } catch {
-          keepSocket = false;
-        }
-      }
-      if (!keepSocket) {
-        log.appendLine(`Clearing SSH_AUTH_SOCK for Windows OpenSSH (${existingSock}).`);
-        delete process.env.SSH_AUTH_SOCK;
-        delete process.env.SSH_AGENT_PID;
-      }
-    } else if (existingPid) {
-      log.appendLine('Clearing SSH_AGENT_PID without SSH_AUTH_SOCK for Windows OpenSSH.');
-      delete process.env.SSH_AGENT_PID;
-    }
-    log.appendLine(`Skipping Git ssh-agent setup (SSH path: ${sshPath}).`);
-    return;
-  }
-  const sshAdd = await resolveSshToolPath('ssh-add');
-  const identityPath = identityPathRaw ? expandHome(identityPathRaw) : '';
-  const identityFingerprint = identityPath ? await getPublicKeyFingerprint(identityPath) : undefined;
-
-  const candidates: Array<{ sock: string; pid?: string; label: string }> = [];
-  const seen = new Set<string>();
-  const currentEnv = getSshAgentEnv();
-  if (currentEnv.sock && !seen.has(currentEnv.sock)) {
-    seen.add(currentEnv.sock);
-    candidates.push({ sock: currentEnv.sock, pid: currentEnv.pid, label: 'current' });
-  }
-  const storedEnv = getStoredSshAgentEnv();
-  if (storedEnv?.sock && !seen.has(storedEnv.sock)) {
-    seen.add(storedEnv.sock);
-    candidates.push({ sock: storedEnv.sock, pid: storedEnv.pid, label: 'stored' });
-  }
-  if (!seen.has(WINDOWS_OPENSSH_AGENT_PIPE)) {
-    seen.add(WINDOWS_OPENSSH_AGENT_PIPE);
-    candidates.push({ sock: WINDOWS_OPENSSH_AGENT_PIPE, label: 'windows' });
-  }
-
-  const probes: Array<{
-    candidate: { sock: string; pid?: string; label: string };
-    info: SshAgentInfo;
-    matchesIdentity: boolean;
-  }> = [];
-
-  for (const candidate of candidates) {
-    const info = await probeSshAgentWithEnv(sshAdd, candidate);
-    if (info.status === 'unavailable') {
-      continue;
-    }
-    const matchesIdentity = identityFingerprint ? info.output.includes(identityFingerprint) : false;
-    probes.push({ candidate, info, matchesIdentity });
-  }
-
-  if (probes.length > 0) {
-    const matched = probes.find((probe) => probe.matchesIdentity);
-    const available = probes.find((probe) => probe.info.status === 'available');
-    const fallback = probes.find((probe) => probe.info.status === 'empty');
-    const selected = matched ?? available ?? fallback;
-    if (selected) {
-      process.env.SSH_AUTH_SOCK = selected.candidate.sock;
-      if (selected.candidate.pid) {
-        process.env.SSH_AGENT_PID = selected.candidate.pid;
-      } else {
-        delete process.env.SSH_AGENT_PID;
-      }
-      if (selected.candidate.label === 'windows') {
-        log.appendLine(`Using Windows OpenSSH agent pipe for Git SSH: ${WINDOWS_OPENSSH_AGENT_PIPE}`);
-      } else if (selected.candidate.label === 'stored') {
-        log.appendLine(`Restored SSH agent socket from state: ${selected.candidate.sock}`);
-      }
-      if (selected.info.status === 'available') {
-        storeSshAgentEnv({ sock: selected.candidate.sock, pid: selected.candidate.pid });
-      }
-      return;
-    }
-  }
-
-  const agentPath = await resolveGitSshAgentPath(sshPath);
-  if (!agentPath) {
-    log.appendLine(`Git ssh-agent not found next to ${sshPath}.`);
-    return;
-  }
-  try {
-    log.appendLine(`Starting Git ssh-agent: ${agentPath}`);
-    const result = await execFileAsync(agentPath, ['-s']);
-    const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
-    const sockMatch = /SSH_AUTH_SOCK=([^;\r\n]+)/.exec(output);
-    const pidMatch = /SSH_AGENT_PID=([^;\r\n]+)/.exec(output);
-    if (sockMatch && sockMatch[1]) {
-      process.env.SSH_AUTH_SOCK = sockMatch[1].trim();
-    }
-    if (pidMatch && pidMatch[1]) {
-      process.env.SSH_AGENT_PID = pidMatch[1].trim();
-    }
-    if (process.env.SSH_AUTH_SOCK) {
-      log.appendLine(`Git SSH_AUTH_SOCK set to ${process.env.SSH_AUTH_SOCK}`);
-      storeSshAgentEnv({ sock: process.env.SSH_AUTH_SOCK, pid: process.env.SSH_AGENT_PID });
-    } else {
-      log.appendLine(`Git ssh-agent did not return SSH_AUTH_SOCK. Output: ${output.trim() || '(empty)'}`);
-    }
-  } catch {
-    log.appendLine('Failed to start Git ssh-agent.');
-    // Ignore agent startup failures; ssh-add will surface errors.
-  }
+  await getSshCommandRuntime().ensureSshAgentEnvForCurrentSsh(identityPathRaw);
 }
 
 function hasSshOption(
   options: Record<string, string> | undefined,
   key: string
 ): boolean {
-  if (!options) {
-    return false;
-  }
-  const target = key.toLowerCase();
-  return Object.keys(options).some((optionKey) => optionKey.toLowerCase() === target);
+  return getSshCommandRuntime().hasSshOption(options, key);
 }
 
 function resetSshToolCacheIfNeeded(): void {
@@ -2094,28 +2027,7 @@ async function resolveSshCommandPath(): Promise<string> {
 }
 
 async function resolveSshToolPath(tool: SshToolName): Promise<string> {
-  resetSshToolCacheIfNeeded();
-  const cached = sshToolPathCache[tool];
-  if (cached) {
-    return cached;
-  }
-  const sshPath = await resolveSshCommandPath();
-  sshToolPathCache.ssh = sshPath;
-  if (tool === 'ssh') {
-    return sshPath;
-  }
-  if (sshPath === 'ssh') {
-    sshToolPathCache[tool] = tool;
-    return tool;
-  }
-  const ext = path.extname(sshPath);
-  const candidate = path.join(path.dirname(sshPath), ext ? `${tool}${ext}` : tool);
-  if (await fileExists(candidate)) {
-    sshToolPathCache[tool] = candidate;
-    return candidate;
-  }
-  sshToolPathCache[tool] = candidate;
-  return candidate;
+  return await getSshCommandRuntime().resolveSshToolPath(tool as 'ssh' | 'ssh-add' | 'ssh-keygen');
 }
 
 function pickSshErrorSummary(text: string): string {
@@ -2777,41 +2689,7 @@ async function isSshKeyListedInAgentOutput(identityPath: string, output: string)
 }
 
 async function buildAgentStatusMessage(identityPathRaw: string): Promise<{ text: string; isError: boolean }> {
-  const agentInfo = await getSshAgentInfo(identityPathRaw);
-  const agentBase = agentInfo.status === 'available'
-    ? 'SSH agent running'
-    : agentInfo.status === 'empty'
-      ? 'SSH agent running (no keys loaded)'
-      : 'SSH agent unavailable';
-  if (!identityPathRaw) {
-    return { text: `${agentBase}. No identity file set (using SSH agent/config).`, isError: false };
-  }
-  const identityPath = expandHome(identityPathRaw);
-  const identityExists = await fileExists(identityPath);
-  if (!identityExists) {
-    return { text: `${agentBase}. Identity file not found.`, isError: true };
-  }
-  const pubExists = await hasPublicKeyFile(identityPath);
-  if (agentInfo.status === 'unavailable') {
-    return {
-      text: `SSH agent unavailable. Passphrase required for ${identityPath}.`,
-      isError: true
-    };
-  }
-  if (agentInfo.status === 'empty') {
-    return { text: 'SSH agent running, no keys loaded.', isError: true };
-  }
-  if (!pubExists) {
-    return {
-      text: `SSH agent running, public key file missing (${getPublicKeyPath(identityPath)}). Generate it to verify the loaded key.`,
-      isError: true
-    };
-  }
-  const keyLoaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
-  if (keyLoaded) {
-    return { text: 'SSH agent running, key loaded.', isError: false };
-  }
-  return { text: 'SSH agent running, key not loaded.', isError: true };
+  return await getSshCommandRuntime().buildAgentStatusMessage(identityPathRaw);
 }
 
 async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
@@ -3078,138 +2956,11 @@ async function maybePromptForSshAuth(
 }
 
 async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost: string): Promise<boolean> {
-  const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
-  if (!identityPath) {
-    return true;
-  }
-  const identityExists = await fileExists(identityPath);
-  const pubExists = identityExists ? await hasPublicKeyFile(identityPath) : false;
-  const agentInfo = identityExists ? await getSshAgentInfo(identityPath) : undefined;
-  if (identityExists && agentInfo?.status === 'available') {
-    const loaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
-    if (loaded) {
-      return true;
-    }
-  }
-  if (identityExists && agentInfo?.status === 'unavailable') {
-    // Remote-SSH will handle passphrase prompts during connect.
-    return true;
-  }
-
-  const now = Date.now();
-  if (lastSshAuthPrompt) {
-    const sameIdentity = lastSshAuthPrompt.identityPath === identityPath;
-    const recentlyPrompted = now - lastSshAuthPrompt.timestamp < 60_000;
-    if (sameIdentity && recentlyPrompted) {
-      return true;
-    }
-  }
-
-  const canAddToAgent = Boolean(identityExists && agentInfo?.status !== 'unavailable');
-
-  const actions: string[] = [];
-  if (canAddToAgent) {
-    actions.push('Add to Agent');
-  }
-  if (identityExists && !pubExists) {
-    actions.push('Generate Public Key');
-  }
-  if (!identityExists) {
-    actions.push('Open Slurm Connect');
-  }
-  actions.push('Dismiss');
-
-  const message = !identityExists
-    ? `SSH identity file ${identityPath} was not found. Update it in the Slurm Connect view.`
-    : !pubExists
-      ? `Public key file is missing for ${identityPath}; generate it to verify the agent key.`
-      : `SSH key is not loaded in the agent. Add ${identityPath} to avoid extra prompts.`;
-
-  const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
-  const mode: SshAuthMode = choice === 'Add to Agent' ? 'agent' : 'terminal';
-  lastSshAuthPrompt = { identityPath, timestamp: now, mode };
-
-  if (choice === 'Add to Agent' && canAddToAgent) {
-    try {
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: 'Waiting for ssh-add to complete',
-          cancellable: false
-        },
-        async () => await runSshAddInTerminal(identityPath)
-      );
-      await refreshAgentStatus(cfg.identityFile);
-    } catch (error) {
-      void vscode.window.showWarningMessage(`ssh-add failed: ${formatError(error)}`);
-    }
-    return true;
-  }
-
-  if (choice === 'Generate Public Key' && identityExists && !pubExists) {
-    try {
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: 'Generating public key',
-          cancellable: false
-        },
-        async () => await runSshKeygenPublicKeyInTerminal(identityPath)
-      );
-      await refreshAgentStatus(cfg.identityFile);
-    } catch (error) {
-      void vscode.window.showWarningMessage(`Failed to generate public key: ${formatError(error)}`);
-    }
-    return true;
-  }
-
-  if (choice === 'Open Slurm Connect') {
-    await openSlurmConnectView();
-    return false;
-  }
-  return true;
+  return await getSshCommandRuntime().maybePromptForSshAuthOnConnect(cfg, loginHost);
 }
 
 async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
-  await ensurePreSshCommand(cfg, `SSH query to ${host}`);
-  const args = buildSshArgs(host, cfg, command, { batchMode: true });
-  const sshPath = await resolveSshToolPath('ssh');
-
-  try {
-    const { stdout } = await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
-    return stdout.trim();
-  } catch (error) {
-    const errorText = normalizeSshErrorText(error);
-    const retry = await maybePromptForSshAuth(cfg, errorText);
-    if (retry?.kind === 'agent') {
-      try {
-        const { stdout } = await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
-        return stdout.trim();
-      } catch (retryError) {
-        const retryText = normalizeSshErrorText(retryError);
-        const retrySummary = pickSshErrorSummary(retryText);
-        throw new Error(retrySummary || 'SSH command failed');
-      }
-    }
-    if (retry?.kind === 'terminal') {
-      try {
-        return await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'Waiting for SSH passphrase in terminal',
-            cancellable: false
-          },
-          async () => await runSshCommandInTerminal(host, cfg, command)
-        );
-      } catch (retryError) {
-        const retryText = normalizeSshErrorText(retryError);
-        const retrySummary = pickSshErrorSummary(retryText);
-        throw new Error(retrySummary || 'SSH command failed');
-      }
-    }
-    const summary = pickSshErrorSummary(errorText);
-    throw new Error(summary || 'SSH command failed');
-  }
+  return await getSshCommandRuntime().runSshCommand(host, cfg, command);
 }
 
 async function runSshCommandWithInput(
@@ -3218,49 +2969,7 @@ async function runSshCommandWithInput(
   command: string,
   input: string
 ): Promise<string> {
-  await ensurePreSshCommand(cfg, `SSH query to ${host}`);
-  const args = buildSshArgs(host, cfg, command, { batchMode: true });
-  const sshPath = await resolveSshToolPath('ssh');
-  const timeoutMs = cfg.sshConnectTimeoutSeconds * 1000;
-
-  const runOnce = async (): Promise<string> => {
-    const { stdout } = await execSshWithInput(sshPath, args, input, timeoutMs);
-    return stdout.trim();
-  };
-
-  try {
-    return await runOnce();
-  } catch (error) {
-    const errorText = normalizeSshErrorText(error);
-    const retry = await maybePromptForSshAuth(cfg, errorText);
-    if (retry?.kind === 'agent') {
-      try {
-        return await runOnce();
-      } catch (retryError) {
-        const retryText = normalizeSshErrorText(retryError);
-        const retrySummary = pickSshErrorSummary(retryText);
-        throw new Error(retrySummary || 'SSH command failed');
-      }
-    }
-    if (retry?.kind === 'terminal') {
-      try {
-        return await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'Waiting for SSH passphrase in terminal',
-            cancellable: false
-          },
-          async () => await runSshCommandInTerminal(host, cfg, command, input)
-        );
-      } catch (retryError) {
-        const retryText = normalizeSshErrorText(retryError);
-        const retrySummary = pickSshErrorSummary(retryText);
-        throw new Error(retrySummary || 'SSH command failed');
-      }
-    }
-    const summary = pickSshErrorSummary(errorText);
-    throw new Error(summary || 'SSH command failed');
-  }
+  return await getSshCommandRuntime().runSshCommandWithInput(host, cfg, command, input);
 }
 
 function resolveSessionKey(cfg: SlurmConnectConfig, alias: string): string {
@@ -4705,43 +4414,7 @@ async function resolveSshHostFromConfig(
   host: string,
   cfg: SlurmConnectConfig
 ): Promise<ResolvedSshHostInfo> {
-  const configPath = await resolveSshHostsConfigPath(cfg);
-  const sshPath = await resolveSshToolPath('ssh');
-  const args: string[] = [];
-  if (configPath) {
-    args.push('-F', configPath);
-  }
-  args.push('-G', host);
-  try {
-    const { stdout } = await execFileAsync(sshPath, args);
-    const parsed = parseSshConfigOutput(stdout);
-    const hostname = pickFirstValue(parsed.hostname);
-    const port = pickFirstValue(parsed.port);
-    const explicit = await collectExplicitHostConfig(configPath, host);
-    const user = explicit.user;
-    const identityFile = explicit.identityFiles.length > 0
-      ? await pickFirstExistingPath(explicit.identityFiles)
-      : undefined;
-    const certificateFile = await pickFirstExistingPath(parsed.certificatefile);
-    const proxyCommand = pickFirstValue(parsed.proxycommand);
-    const proxyJump = pickFirstValue(parsed.proxyjump);
-    const hasProxyCommand = Boolean(proxyCommand && proxyCommand.toLowerCase() !== 'none');
-    const hasProxyJump = Boolean(proxyJump && proxyJump.toLowerCase() !== 'none');
-    return {
-      host,
-      hostname,
-      user,
-      port,
-      identityFile,
-      certificateFile,
-      hasProxyCommand,
-      hasProxyJump,
-      hasExplicitHost: explicit.hasExplicitHost
-    };
-  } catch (error) {
-    const summary = pickSshErrorSummary(normalizeSshErrorText(error));
-    throw new Error(summary || 'Failed to resolve SSH host.');
-  }
+  return await resolveSshHostFromConfigSsh(host, cfg, getSshConfigRuntime());
 }
 
 function replaceIncludeLineWithBlock(content: string, includePath: string, block: string): string {
@@ -4838,56 +4511,11 @@ async function backupSshConfigFile(baseConfigPath: string, content: string): Pro
 }
 
 async function ensureSshIncludeInstalled(baseConfigPath: string, includePath: string): Promise<'added' | 'updated' | 'already'> {
-  const resolvedBase = normalizeSshPath(baseConfigPath);
-  const resolvedInclude = normalizeSshPath(includePath);
-  if (resolvedBase === resolvedInclude) {
-    throw new Error('Slurm Connect include path must not be the same as the SSH config path.');
-  }
-  let content = '';
-  let fileExists = true;
-  try {
-    content = await fs.readFile(resolvedBase, 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error;
-    }
-    fileExists = false;
-  }
-  const lineEnding = detectLineEnding(content);
-  const block = buildSlurmConnectIncludeBlock(includePath).split('\n').join(lineEnding);
-  const hadInclude = sshConfigHasIncludePath(content, includePath);
-  const stripped = stripManagedIncludeBlock(content);
-  const withoutBlock = stripped.content;
-  const withoutTarget = removeIncludePathFromLines(withoutBlock, includePath);
-  const bom = withoutTarget.content.startsWith('\uFEFF') ? '\uFEFF' : '';
-  const bodyRaw = bom ? withoutTarget.content.slice(1) : withoutTarget.content;
-  const body = bodyRaw.replace(/^[\r\n]+/, '');
-  const combined = body ? `${bom}${block}${lineEnding}${lineEnding}${body}` : `${bom}${block}${lineEnding}`;
-  const next = ensureTrailingNewline(combined, lineEnding);
-  let status: 'added' | 'updated' | 'already' = 'already';
-  if (!stripped.removed && !hadInclude) {
-    status = 'added';
-  } else if (next === content) {
-    status = 'already';
-  } else {
-    status = 'updated';
-  }
-  if (next !== content) {
-    await fs.mkdir(path.dirname(resolvedBase), { recursive: true });
-    if (fileExists) {
-      await backupSshConfigFile(resolvedBase, content);
-    }
-    await fs.writeFile(resolvedBase, ensureTrailingNewline(next, lineEnding), 'utf8');
-  }
-  return status;
+  return await ensureSshIncludeInstalledSsh(baseConfigPath, includePath, { getOutputChannel });
 }
 
 async function writeSlurmConnectIncludeFile(entry: string, includePath: string): Promise<string> {
-  const dir = path.dirname(includePath);
-  await fs.mkdir(dir, { recursive: true });
-  const content = buildSlurmConnectIncludeContent(entry);
-  await fs.writeFile(includePath, content, 'utf8');
-  return includePath;
+  return await writeSlurmConnectIncludeFileSsh(entry, includePath);
 }
 
 function normalizeRemoteConfigPath(value: unknown): string | undefined {
@@ -4924,18 +4552,7 @@ async function guessPreviousConfigFromTempConfig(configPath: string): Promise<st
 }
 
 async function migrateStaleRemoteSshConfigIfNeeded(): Promise<void> {
-  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  const current = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
-  if (!current) {
-    return;
-  }
-  if (!(await isSlurmConnectTempConfigFile(current))) {
-    return;
-  }
-  const restored = await guessPreviousConfigFromTempConfig(current);
-  await remoteCfg.update('configFile', restored, vscode.ConfigurationTarget.Global);
-  const log = getOutputChannel();
-  log.appendLine(`Detected stale Slurm Connect temporary SSH config. Restored Remote.SSH configFile ${restored ? `to ${restored}` : 'to default'}.`);
+  await migrateStaleRemoteSshConfigIfNeededRemoteSsh({ getOutputChannel });
 }
 
 function resolveWindowsUserSettingsPath(): string | undefined {
@@ -5154,90 +4771,11 @@ async function ensureRemoteSshPathOnWindows(): Promise<void> {
 
 
 async function ensureRemoteSshSettings(cfg: SlurmConnectConfig): Promise<void> {
-  await ensureRemoteSshPathOnWindows();
-  await ensureSshAgentEnvForCurrentSsh();
-  await ensureLocalServerSetting();
-  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  const enableRemoteCommand = remoteCfg.get<boolean>('enableRemoteCommand', false);
-  if (!enableRemoteCommand) {
-    const enable = await vscode.window.showWarningMessage(
-      'Remote.SSH: Enable Remote Command is disabled. This is required for Slurm Connect.',
-      'Enable',
-      'Ignore'
-    );
-    if (enable === 'Enable') {
-      await remoteCfg.update('enableRemoteCommand', true, vscode.ConfigurationTarget.Global);
-    }
-  }
-
-  const lockfilesInTmp = remoteCfg.get<boolean>('lockfilesInTmp', false);
-  if (!lockfilesInTmp) {
-    const enable = await vscode.window.showWarningMessage(
-      'Remote.SSH: Lockfiles In Tmp is disabled. This is recommended on shared filesystems.',
-      'Enable',
-      'Ignore'
-    );
-    if (enable === 'Enable') {
-      await remoteCfg.update('lockfilesInTmp', true, vscode.ConfigurationTarget.Global);
-    }
-  }
-
-  const recommendedConnectTimeout = 300;
-  const connectTimeoutInspect = remoteCfg.inspect<number>('connectTimeout');
-  const configuredConnectTimeout = Number(
-    connectTimeoutInspect?.globalValue ??
-      connectTimeoutInspect?.workspaceValue ??
-      connectTimeoutInspect?.workspaceFolderValue ??
-      connectTimeoutInspect?.defaultValue ??
-      0
-  );
-  const effectiveConnectTimeout = Number.isFinite(configuredConnectTimeout) ? configuredConnectTimeout : 0;
-  if (effectiveConnectTimeout > 0 && effectiveConnectTimeout < recommendedConnectTimeout) {
-    const raise = await vscode.window.showWarningMessage(
-      `Remote.SSH: Connect Timeout is ${effectiveConnectTimeout}s. First-time connections may need longer to download/start the VS Code server. Set it to ${recommendedConnectTimeout}s?`,
-      `Set to ${recommendedConnectTimeout}s`,
-      'Ignore'
-    );
-    if (raise === `Set to ${recommendedConnectTimeout}s`) {
-      try {
-        await remoteCfg.update('connectTimeout', recommendedConnectTimeout, vscode.ConfigurationTarget.Global);
-      } catch (error) {
-        void vscode.window.showWarningMessage(
-          `Failed to update user settings with remote.SSH.connectTimeout: ${formatError(error)}`
-        );
-      }
-    }
-  }
-
-  const tunnelMode = normalizeLocalProxyTunnelMode(cfg.localProxyTunnelMode || 'remoteSsh');
-  const useExecServer = remoteCfg.get<boolean>('useExecServer', true);
-  if (useExecServer && cfg.localProxyEnabled && tunnelMode === 'remoteSsh') {
-    const disable = await vscode.window.showWarningMessage(
-      'Remote.SSH: Use Exec Server opens a second SSH connection, which breaks the single-connection local proxy. Disable it?',
-      'Disable',
-      'Ignore'
-    );
-    if (disable === 'Disable') {
-      await remoteCfg.update('useExecServer', false, vscode.ConfigurationTarget.Global);
-    }
-  }
-
+  await ensureRemoteSshSettingsRemoteSsh(cfg, getSshCommandRuntime(), fileExists, { formatError });
 }
 
 async function refreshRemoteSshHosts(): Promise<void> {
-  const commands = [
-    'opensshremotes.refresh',
-    'opensshremotes.refreshExplorer',
-    'remote-ssh.refresh'
-  ];
-  for (const command of commands) {
-    try {
-      await vscode.commands.executeCommand(command);
-      return;
-    } catch {
-      // ignore
-    }
-  }
+  await refreshRemoteSshHostsRemoteSsh();
 }
 
 async function connectToHost(
@@ -5245,114 +4783,10 @@ async function connectToHost(
   openInNewWindow: boolean,
   remoteWorkspacePath?: string
 ): Promise<boolean> {
-  const remoteExtension = vscode.extensions.getExtension('ms-vscode-remote.remote-ssh');
-  if (!remoteExtension) {
-    return false;
-  }
-  const log = getOutputChannel();
-  await ensureSshAgentEnvForCurrentSsh();
-  if (process.platform === 'win32') {
-    const sshPath = await resolveSshToolPath('ssh');
-    if (isGitSshPath(sshPath) && !process.env.SSH_AUTH_SOCK) {
-      log.appendLine('Git SSH agent socket is not set; Remote-SSH may prompt for a passphrase.');
-    }
-  }
-  await remoteExtension.activate();
-  const availableCommands = await vscode.commands.getCommands(true);
-  const sshCommands = availableCommands.filter((command) => /ssh|openssh/i.test(command));
-
-  const trimmedPath = remoteWorkspacePath?.trim();
-  if (trimmedPath) {
-    const normalizedPath = trimmedPath.startsWith('/') ? trimmedPath : `/${trimmedPath}`;
-    try {
-      const remoteUri = vscode.Uri.from({
-        scheme: 'vscode-remote',
-        authority: `ssh-remote+${encodeURIComponent(alias)}`,
-        path: normalizedPath
-      });
-      log.appendLine(`Opening remote folder: ${remoteUri.toString()}`);
-      await vscode.commands.executeCommand('vscode.openFolder', remoteUri, openInNewWindow);
-      return true;
-    } catch (error) {
-      log.appendLine(`Failed to open folder via vscode.openFolder: ${formatError(error)}`);
-      // Fall through to connect without a folder.
-    }
-  }
-
-  const hostArg = { host: alias };
-  const openEmptyOnly = !trimmedPath;
-
-  if (openInNewWindow) {
-    const commandCandidates: Array<[string, unknown]> = [
-      ['opensshremotes.openEmptyWindow', hostArg],
-      ['remote-ssh.openEmptyWindow', alias],
-      ['opensshremotes.openEmptyWindowInCurrentWindow', hostArg],
-      ['remote-ssh.openEmptyWindowInCurrentWindow', alias]
-    ];
-    if (!openEmptyOnly) {
-      commandCandidates.push(
-        ['remote-ssh.connectToHost', alias],
-        ['opensshremotes.connectToHost', hostArg]
-      );
-    } else {
-      log.appendLine('Remote folder not set; opening an empty remote window only.');
-    }
-    for (const [command, args] of commandCandidates) {
-      try {
-        log.appendLine(`Trying command: ${command}`);
-        await vscode.commands.executeCommand(command, args);
-        log.appendLine(`Command succeeded: ${command}`);
-        return true;
-      } catch (error) {
-        log.appendLine(`Command failed: ${command} -> ${formatError(error)}`);
-        // try next command
-      }
-    }
-    log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
-    if (openEmptyOnly) {
-      void vscode.window.showWarningMessage(
-        'Could not open an empty Remote-SSH window. Configure a remote folder to open or update Remote-SSH.'
-      );
-    }
-    return false;
-  }
-
-  try {
-    const commandCandidates: Array<[string, unknown]> = [
-      ['opensshremotes.openEmptyWindowInCurrentWindow', hostArg],
-      ['remote-ssh.openEmptyWindowInCurrentWindow', alias],
-      ['opensshremotes.openEmptyWindow', hostArg],
-      ['remote-ssh.openEmptyWindow', alias]
-    ];
-    if (!openEmptyOnly) {
-      commandCandidates.push(
-        ['remote-ssh.connectToHost', alias],
-        ['opensshremotes.connectToHost', hostArg]
-      );
-    } else {
-      log.appendLine('Remote folder not set; opening an empty remote window only.');
-    }
-    for (const [command, args] of commandCandidates) {
-      try {
-        log.appendLine(`Trying command: ${command}`);
-        await vscode.commands.executeCommand(command, args);
-        log.appendLine(`Command succeeded: ${command}`);
-        return true;
-      } catch (error) {
-        log.appendLine(`Command failed: ${command} -> ${formatError(error)}`);
-        // try next command
-      }
-    }
-    log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
-    if (openEmptyOnly) {
-      void vscode.window.showWarningMessage(
-        'Could not open an empty Remote-SSH window. Configure a remote folder to open or update Remote-SSH.'
-      );
-    }
-    return false;
-  } finally {
-    // No-op
-  }
+  return await connectToHostRemoteSsh(alias, openInNewWindow, remoteWorkspacePath, getSshCommandRuntime(), {
+    getOutputChannel,
+    formatError
+  });
 }
 
 export async function __resetForTests(): Promise<void> {
@@ -5364,6 +4798,7 @@ export async function __resetForTests(): Promise<void> {
   lastConnectionSessionMode = undefined;
   lastConnectionLoginHost = undefined;
   lastSshAuthPrompt = undefined;
+  sshCommandRuntime?.resetState();
   testConnectToHostOverride = undefined;
   testEnsureRemoteSshSettingsOverride = undefined;
   testRemoteSshConfigPathOverride = undefined;
@@ -5451,7 +4886,7 @@ export async function __runNonInteractiveConnectForTests(
       alias: lastConnectionAlias,
       sessionKey: lastConnectionSessionKey,
       loginHost: lastConnectionLoginHost,
-      includeFilePath: resolveSlurmConnectIncludeFilePath(cfg),
+      includeFilePath: resolveSlurmConnectIncludeFilePathSsh(cfg),
       logFilePath: resolveLogFilePath(),
       connectInvocations
     };
@@ -5463,106 +4898,14 @@ export async function __runNonInteractiveConnectForTests(
 }
 
 async function disconnectFromHost(alias?: string): Promise<boolean> {
-  const remoteExtension = vscode.extensions.getExtension('ms-vscode-remote.remote-ssh');
-  if (!remoteExtension) {
-    return false;
-  }
-  const log = getOutputChannel();
-  await remoteExtension.activate();
-  const availableCommands = await vscode.commands.getCommands(true);
-  const sshCommands = availableCommands.filter((command) => /ssh|openssh|remote\.close/i.test(command));
-  const ensureRemoteSessionClosed = async (): Promise<boolean> => {
-    if (vscode.env.remoteName !== 'ssh-remote') {
-      return true;
+  return await disconnectFromHostRemoteSsh(alias, {
+    getOutputChannel,
+    formatError,
+    delay,
+    stopLocalProxyServer: () => {
+      stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
     }
-    const timeoutMs = 5000;
-    const pollMs = 100;
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < timeoutMs) {
-      if (vscode.env.remoteName !== 'ssh-remote') {
-        return true;
-      }
-      await delay(pollMs);
-    }
-    return vscode.env.remoteName !== 'ssh-remote';
-  };
-  const finalizeDisconnect = async (): Promise<boolean> => {
-    const closed = await ensureRemoteSessionClosed();
-    if (!closed) {
-      log.appendLine('Disconnect command completed but remote session is still active.');
-      return false;
-    }
-    stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
-    return true;
-  };
-
-  if (vscode.env.remoteName === 'ssh-remote') {
-    const directCommands = [
-      'workbench.action.remote.close',
-      'workbench.action.remote.closeRemoteConnection'
-    ];
-    for (const command of directCommands) {
-      if (!availableCommands.includes(command)) {
-        continue;
-      }
-      try {
-        log.appendLine(`Trying disconnect command: ${command}`);
-        await vscode.commands.executeCommand(command);
-        const closed = await finalizeDisconnect();
-        if (closed) {
-          log.appendLine(`Disconnect command succeeded: ${command}`);
-          return true;
-        }
-        log.appendLine(`Disconnect command did not close remote session: ${command}`);
-      } catch (error) {
-        log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
-      }
-    }
-  }
-
-  const candidates: Array<[string, unknown]> = [];
-  if (alias) {
-    candidates.push(
-      ['opensshremotes.closeRemote', { host: alias }],
-      ['opensshremotes.closeRemote', alias],
-      ['opensshremotes.disconnect', { host: alias }],
-      ['opensshremotes.disconnect', alias],
-      ['opensshremotes.close', { host: alias }],
-      ['opensshremotes.close', alias],
-      ['remote-ssh.disconnectFromHost', alias],
-      ['remote-ssh.disconnectFromHost', { host: alias }]
-    );
-  }
-  candidates.push(
-    ['opensshremotes.closeRemote', undefined],
-    ['opensshremotes.disconnect', undefined],
-    ['opensshremotes.close', undefined],
-    ['remote-ssh.closeRemote', undefined],
-    ['remote-ssh.closeRemoteConnection', undefined],
-    ['remote-ssh.disconnect', undefined],
-    ['workbench.action.remote.close', undefined],
-    ['workbench.action.remote.closeRemoteConnection', undefined]
-  );
-
-  for (const [command, args] of candidates) {
-    if (!availableCommands.includes(command)) {
-      continue;
-    }
-    try {
-      log.appendLine(`Trying disconnect command: ${command}`);
-      await vscode.commands.executeCommand(command, args);
-      const closed = await finalizeDisconnect();
-      if (closed) {
-        log.appendLine(`Disconnect command succeeded: ${command}`);
-        return true;
-      }
-      log.appendLine(`Disconnect command did not close remote session: ${command}`);
-    } catch (error) {
-      log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
-    }
-  }
-  log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
-  return false;
+  });
 }
 
 function getUiValuesFromStorage(): UiValues {
@@ -5938,14 +5281,7 @@ async function getProxyInstallSnippet(cfg: SlurmConnectConfig): Promise<string |
 }
 
 async function waitForRemoteConnectionOrTimeout(timeoutMs: number, pollMs: number): Promise<boolean> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    if (vscode.env.remoteName === 'ssh-remote') {
-      return true;
-    }
-    await delay(pollMs);
-  }
-  return vscode.env.remoteName === 'ssh-remote';
+  return await waitForRemoteConnectionOrTimeoutRemoteSsh(timeoutMs, pollMs, { delay });
 }
 
 function parseListInput(input: string): string[] {
