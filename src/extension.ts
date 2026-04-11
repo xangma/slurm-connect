@@ -46,76 +46,59 @@ import {
   buildClusterInfoCommandSet as buildClusterInfoCommandSetUtil,
   computeFreeResourceSummary as computeFreeResourceSummaryUtil,
 } from './utils/slurmResources';
+import type {
+  LocalProxyTunnelMode,
+  ResolvedSshHostInfo,
+  SessionMode,
+  SlurmConnectConfig,
+  SshHostKeyCheckingMode
+} from './config/types';
+import {
+  cancelActiveConnectToken as cancelActiveConnectTokenState,
+  createConnectToken as createConnectTokenState,
+  finalizeConnectToken as finalizeConnectTokenState,
+  isConnectCancelled,
+  type ConnectToken,
+  type ConnectTokenState,
+  type ConnectionState
+} from './state/connectionState';
+import type {
+  ClusterUiCache,
+  ProfileResourceSummary,
+  ProfileStore,
+  ProfileSummary,
+  ProfileValues,
+  UiValues
+} from './state/types';
+import {
+  buildProfileSummaryMap as buildProfileSummaryMapState,
+  getActiveProfileName as getActiveProfileNameState,
+  getProfileStore as getProfileStoreState,
+  getProfileSummaries as getProfileSummariesState,
+  getProfileValues as getProfileValuesState,
+  setActiveProfileName as setActiveProfileNameState,
+  updateProfileStore as updateProfileStoreState
+} from './state/profiles';
+import {
+  buildWebviewValues as buildWebviewValuesState,
+  filterProfileValues as filterProfileValuesState,
+  getClusterUiCache as getClusterUiCacheState,
+  getMergedClusterUiCache as getMergedClusterUiCacheState,
+  getUiValuesFromConfig as getUiValuesFromConfigState,
+  mergeUiValuesWithDefaults as mergeUiValuesWithDefaultsState,
+  pickProfileValues as pickProfileValuesState,
+  resolvePreferredSaveTarget as resolvePreferredSaveTargetState,
+  updateClusterUiCache as updateClusterUiCacheState
+} from './state/uiCache';
+import { SlurmConnectViewProvider } from './webview/provider';
 
 const execFileAsync = promisify(execFile);
-
-interface SlurmConnectConfig {
-  loginHosts: string[];
-  loginHostsCommand: string;
-  loginHostsQueryHost: string;
-  partitionCommand: string;
-  partitionInfoCommand: string;
-  filterFreeResources: boolean;
-  qosCommand: string;
-  accountCommand: string;
-  user: string;
-  identityFile: string;
-  preSshCommand: string;
-  preSshCheckCommand: string;
-  autoInstallProxyScriptOnClusterInfo: boolean;
-  forwardAgent: boolean;
-  requestTTY: boolean;
-  moduleLoad: string;
-  startupCommand: string;
-  proxyCommand: string;
-  proxyArgs: string[];
-  proxyDebugLogging: boolean;
-  localProxyEnabled: boolean;
-  localProxyNoProxy: string[];
-  localProxyPort: number;
-  localProxyRemoteBind: string;
-  localProxyRemoteHost: string;
-  localProxyComputeTunnel: boolean;
-  localProxyTunnelMode: LocalProxyTunnelMode;
-  extraSallocArgs: string[];
-  promptForExtraSallocArgs: boolean;
-  sessionMode: SessionMode;
-  sessionKey: string;
-  sessionIdleTimeoutSeconds: number;
-  sessionStateDir: string;
-  defaultPartition: string;
-  defaultNodes: number;
-  defaultTasksPerNode: number;
-  defaultCpusPerTask: number;
-  defaultTime: string;
-  defaultMemoryMb: number;
-  defaultGpuType: string;
-  defaultGpuCount: number;
-  sshHostPrefix: string;
-  openInNewWindow: boolean;
-  remoteWorkspacePath: string;
-  temporarySshConfigPath: string;
-  additionalSshOptions: Record<string, string>;
-  sshQueryConfigPath: string;
-  sshHostKeyChecking: SshHostKeyCheckingMode;
-  sshConnectTimeoutSeconds: number;
-}
 
 interface PartitionResult {
   partitions: string[];
   defaultPartition?: string;
 }
-
-type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
 type SshAuthMode = 'agent' | 'terminal';
-type SessionMode = 'ephemeral' | 'persistent';
-type LocalProxyTunnelMode = 'remoteSsh' | 'dedicated';
-type SshHostKeyCheckingMode = 'accept-new' | 'ask' | 'yes' | 'no';
-
-interface ConnectToken {
-  id: number;
-  cancelled: boolean;
-}
 
 interface SessionSummary {
   sessionKey: string;
@@ -131,18 +114,6 @@ interface SessionSummary {
   lastSeenEpoch?: number;
   idleRemainingSeconds?: number;
   idleTimeoutSeconds?: number;
-}
-
-interface ResolvedSshHostInfo {
-  host: string;
-  hostname?: string;
-  user?: string;
-  identityFile?: string;
-  port?: string;
-  certificateFile?: string;
-  hasProxyCommand: boolean;
-  hasProxyJump: boolean;
-  hasExplicitHost: boolean;
 }
 
 interface LocalProxyState {
@@ -209,14 +180,13 @@ let extensionStoragePath: string | undefined;
 let extensionRootPath: string | undefined;
 let extensionGlobalState: vscode.Memento | undefined;
 let extensionWorkspaceState: vscode.Memento | undefined;
-let activeWebview: vscode.Webview | undefined;
+let viewProvider: SlurmConnectViewProvider | undefined;
 let connectionState: ConnectionState = 'idle';
 let lastConnectionAlias: string | undefined;
 let lastConnectionSessionKey: string | undefined;
 let lastConnectionSessionMode: SessionMode | undefined;
 let lastConnectionLoginHost: string | undefined;
-let activeConnectToken: ConnectToken | undefined;
-let connectTokenCounter = 0;
+const connectTokenState: ConnectTokenState = { connectTokenCounter: 0 };
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let preSshCommandInFlight: Promise<void> | undefined;
 let logWriteQueue: Promise<void> = Promise.resolve();
@@ -233,7 +203,6 @@ let sessionE2EStarted = false;
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const LOG_TRUNCATE_KEEP_BYTES = 4 * 1024 * 1024;
 let clusterInfoRequestInFlight = false;
-let sshHostsRequestInFlight = false;
 const SETTINGS_SECTION = 'slurmConnect';
 const LEGACY_SETTINGS_SECTION = 'sciamaSlurm';
 const PROFILE_STORE_KEY = 'slurmConnect.profiles';
@@ -323,7 +292,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   void migrateStaleRemoteSshConfigIfNeeded();
 
-  const viewProvider = new SlurmConnectViewProvider(context);
+  viewProvider = new SlurmConnectViewProvider(context, {
+    getWebviewHtml,
+    syncConnectionStateFromEnvironment,
+    getReadyPayload,
+    getActiveProfileName,
+    getProfileStore,
+    getProfileSummaries,
+    buildProfileSummaryMap,
+    getUiGlobalDefaults,
+    getProfileValues,
+    resolvePreferredSaveTarget,
+    firstLoginHostFromInput,
+    getCachedClusterInfo,
+    pickProfileValues,
+    setActiveProfileName,
+    updateProfileStore,
+    buildOverridesFromUi,
+    updateConfigFromUi,
+    resolveSshHostFromConfig,
+    getConfigWithOverrides,
+    buildAgentStatusMessage,
+    handleConnectMessage,
+    handleCancelConnectMessage,
+    handleDisconnectMessage,
+    handleCancelSessionMessage,
+    handleClusterInfoRequest,
+    loadSshHosts,
+    openLogs: openLogFile,
+    openRemoteSshLog,
+    openSettings: () => {
+      void vscode.commands.executeCommand('workbench.action.openSettings', SETTINGS_SECTION);
+    },
+    formatError
+  });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('slurmConnect.connectView', viewProvider)
   );
@@ -814,233 +816,59 @@ async function openRemoteSshLog(): Promise<void> {
   }
 }
 
-interface UiValues {
-  loginHosts: string;
-  loginHostsCommand: string;
-  loginHostsQueryHost: string;
-  partitionCommand: string;
-  partitionInfoCommand: string;
-  filterFreeResources: boolean;
-  qosCommand: string;
-  accountCommand: string;
-  user: string;
-  identityFile: string;
-  preSshCommand: string;
-  preSshCheckCommand: string;
-  autoInstallProxyScriptOnClusterInfo: boolean;
-  additionalSshOptions: string;
-  moduleLoad: string;
-  startupCommand: string;
-  moduleSelections?: string[];
-  moduleCustomCommand?: string;
-  proxyCommand: string;
-  proxyArgs: string;
-  proxyDebugLogging: boolean;
-  localProxyEnabled: boolean;
-  localProxyNoProxy: string;
-  localProxyPort: string;
-  localProxyRemoteBind: string;
-  localProxyRemoteHost: string;
-  localProxyComputeTunnel: boolean;
-  extraSallocArgs: string;
-  promptForExtraSallocArgs: boolean;
-  sessionMode: string;
-  sessionKey: string;
-  sessionIdleTimeoutSeconds: string;
-  sessionStateDir: string;
-  defaultPartition: string;
-  defaultNodes: string;
-  defaultTasksPerNode: string;
-  defaultCpusPerTask: string;
-  defaultTime: string;
-  defaultMemoryMb: string;
-  defaultGpuType: string;
-  defaultGpuCount: string;
-  sshHostPrefix: string;
-  forwardAgent: boolean;
-  requestTTY: boolean;
-  temporarySshConfigPath: string;
-  sshQueryConfigPath: string;
-  openInNewWindow: boolean;
-  remoteWorkspacePath: string;
-}
-
-const PROFILE_UI_KEYS = [
-  'loginHosts',
-  'loginHostsCommand',
-  'loginHostsQueryHost',
-  'partitionCommand',
-  'partitionInfoCommand',
-  'filterFreeResources',
-  'qosCommand',
-  'accountCommand',
-  'user',
-  'identityFile',
-  'preSshCommand',
-  'preSshCheckCommand',
-  'additionalSshOptions',
-  'moduleLoad',
-  'startupCommand',
-  'moduleSelections',
-  'moduleCustomCommand',
-  'extraSallocArgs',
-  'promptForExtraSallocArgs',
-  'sessionMode',
-  'sessionKey',
-  'sessionIdleTimeoutSeconds',
-  'defaultPartition',
-  'defaultNodes',
-  'defaultTasksPerNode',
-  'defaultCpusPerTask',
-  'defaultTime',
-  'defaultMemoryMb',
-  'defaultGpuType',
-  'defaultGpuCount',
-  'forwardAgent',
-  'requestTTY',
-  'openInNewWindow',
-  'remoteWorkspacePath'
-] as const;
-
-type ProfileUiKey = typeof PROFILE_UI_KEYS[number];
-type ProfileValues = { [K in ProfileUiKey]?: UiValues[K] };
-type ClusterUiCache = Partial<UiValues>;
-
-const PROFILE_UI_KEY_SET = new Set<keyof UiValues>(PROFILE_UI_KEYS);
-const OPTIONAL_NUMERIC_PROFILE_UI_KEYS = new Set<ProfileUiKey>([
-  'sessionIdleTimeoutSeconds',
-  'defaultNodes',
-  'defaultTasksPerNode',
-  'defaultCpusPerTask',
-  'defaultMemoryMb',
-  'defaultGpuCount'
-]);
-
-interface ProfileEntry {
-  name: string;
-  values: ProfileValues;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface ProfileSummary {
-  name: string;
-  updatedAt: string;
-}
-
-type ProfileStore = Record<string, ProfileEntry>;
-
-interface ProfileOverrideDetail {
-  label: string;
-  value: string;
-}
-
-interface ProfileResourceSummary {
-  host?: string;
-  partition?: string;
-  nodes?: number;
-  tasksPerNode?: number;
-  cpusPerTask?: number;
-  memoryMb?: number;
-  gpuType?: string;
-  gpuCount?: number;
-  time?: string;
-  totalCpu?: number;
-  totalMemoryMb?: number;
-  totalGpu?: number;
-  overrides?: ProfileOverrideDetail[];
-}
-
-function postToWebview(message: unknown): void {
-  if (!activeWebview) {
-    return;
-  }
-  void activeWebview.postMessage(message);
-}
-
-async function loadSshHostsForWebview(overrides?: Partial<SlurmConnectConfig>): Promise<void> {
-  if (!activeWebview || sshHostsRequestInFlight) {
-    return;
-  }
-  sshHostsRequestInFlight = true;
+async function loadSshHosts(overrides?: Partial<SlurmConnectConfig>): Promise<{
+  hosts: string[];
+  source?: string;
+  error?: string;
+}> {
   try {
     const cfg = getConfigWithOverrides(overrides);
     const configPath = await resolveSshHostsConfigPath(cfg);
     if (!configPath) {
-      postToWebview({
-        command: 'sshHosts',
+      return {
         hosts: [],
         error: 'SSH config not found.'
-      });
-      return;
+      };
     }
-    const hosts = await collectSshConfigHosts(configPath);
-    postToWebview({
-      command: 'sshHosts',
-      hosts,
+    return {
+      hosts: await collectSshConfigHosts(configPath),
       source: configPath
-    });
+    };
   } catch (error) {
-    postToWebview({
-      command: 'sshHosts',
+    return {
       hosts: [],
       error: formatError(error)
-    });
-  } finally {
-    sshHostsRequestInFlight = false;
+    };
   }
+}
+
+async function loadSshHostsForWebview(overrides?: Partial<SlurmConnectConfig>): Promise<void> {
+  await viewProvider?.loadSshHostsForWebview(overrides);
 }
 
 async function openSlurmConnectView(): Promise<void> {
-  try {
-    await vscode.commands.executeCommand('workbench.view.extension.slurmConnect');
-  } catch {
-    // Ignore if the view cannot be opened.
-  }
+  await viewProvider?.openView();
 }
 
 async function refreshAgentStatus(identityFile: string): Promise<void> {
-  if (!activeWebview) {
-    return;
-  }
-  const agentStatus = await buildAgentStatusMessage(identityFile);
-  postToWebview({
-    command: 'agentStatus',
-    agentStatus: agentStatus.text,
-    agentStatusError: agentStatus.isError
-  });
+  await viewProvider?.refreshAgentStatus(identityFile);
 }
 
 function setConnectionState(state: ConnectionState): void {
   connectionState = state;
-  postToWebview({
-    command: 'connectionState',
-    state,
-    sessionMode: lastConnectionSessionMode
-  });
+  void viewProvider?.setConnectionState(state, lastConnectionSessionMode);
 }
 
 function createConnectToken(): ConnectToken {
-  const token = { id: connectTokenCounter + 1, cancelled: false };
-  connectTokenCounter += 1;
-  activeConnectToken = token;
-  return token;
+  return createConnectTokenState(connectTokenState);
 }
 
 function cancelActiveConnectToken(): void {
-  if (activeConnectToken) {
-    activeConnectToken.cancelled = true;
-  }
-}
-
-function isConnectCancelled(token?: ConnectToken): boolean {
-  return Boolean(token?.cancelled);
+  cancelActiveConnectTokenState(connectTokenState);
 }
 
 function finalizeConnectToken(token?: ConnectToken): void {
-  if (token && activeConnectToken === token) {
-    activeConnectToken = undefined;
-  }
+  finalizeConnectTokenState(connectTokenState, token);
 }
 
 function resolveRemoteAuthority(): string | undefined {
@@ -1246,306 +1074,92 @@ function syncConnectionStateFromEnvironment(): void {
 }
 
 function mergeUiValuesWithDefaults(values?: Partial<UiValues>, defaults?: UiValues): UiValues {
-  const base = defaults ?? getUiValuesFromStorage();
-  if (!values) {
-    return base;
-  }
-  return {
-    ...base,
-    ...values
-  } as UiValues;
+  return mergeUiValuesWithDefaultsState(values, defaults ?? getUiValuesFromStorage());
 }
 
 function pickProfileValues(values: Partial<UiValues>): ProfileValues {
-  const picked: ProfileValues = {};
-  const target = picked as Record<ProfileUiKey, UiValues[ProfileUiKey]>;
-  for (const key of PROFILE_UI_KEY_SET) {
-    if (Object.prototype.hasOwnProperty.call(values, key)) {
-      const typedKey = key as ProfileUiKey;
-      const value = values[typedKey];
-      if (OPTIONAL_NUMERIC_PROFILE_UI_KEYS.has(typedKey) && typeof value === 'string' && value.trim().length === 0) {
-        continue;
-      }
-      target[typedKey] = value as UiValues[ProfileUiKey];
-    }
-  }
-  return picked;
+  return pickProfileValuesState(values);
 }
 
 function buildWebviewValues(values: UiValues): Partial<UiValues> {
-  return {
-    ...pickProfileValues(values),
-    proxyDebugLogging: values.proxyDebugLogging,
-    localProxyEnabled: values.localProxyEnabled,
-    localProxyNoProxy: values.localProxyNoProxy,
-    localProxyPort: values.localProxyPort,
-    localProxyRemoteBind: values.localProxyRemoteBind,
-    localProxyRemoteHost: values.localProxyRemoteHost,
-    localProxyComputeTunnel: values.localProxyComputeTunnel
-  };
+  return buildWebviewValuesState(values);
 }
 
 function filterProfileValues(values: Partial<UiValues>): { next: ProfileValues; changed: boolean } {
-  const next: ProfileValues = {};
-  let changed = false;
-  for (const [key, value] of Object.entries(values)) {
-    if (PROFILE_UI_KEY_SET.has(key as keyof UiValues)) {
-      (next as Record<string, unknown>)[key] = value;
-    } else {
-      changed = true;
-    }
-  }
-  return { next, changed };
+  return filterProfileValuesState(values);
 }
 
 function getClusterUiCache(state?: vscode.Memento): ClusterUiCache | undefined {
-  if (!state) {
-    return undefined;
-  }
-  return state.get<ClusterUiCache>(CLUSTER_UI_CACHE_KEY);
+  return getClusterUiCacheState(state, CLUSTER_UI_CACHE_KEY);
 }
 
 function getMergedClusterUiCache(): ClusterUiCache | undefined {
-  const globalCache = getClusterUiCache(extensionGlobalState) || {};
-  const hasWorkspace = Boolean(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
-  const workspaceCache = hasWorkspace ? getClusterUiCache(extensionWorkspaceState) || {} : {};
-  const merged = { ...globalCache, ...workspaceCache };
-  return Object.keys(merged).length > 0 ? merged : undefined;
+  return getMergedClusterUiCacheState({
+    globalState: extensionGlobalState,
+    workspaceState: extensionWorkspaceState,
+    hasWorkspace: Boolean(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0),
+    cacheKey: CLUSTER_UI_CACHE_KEY
+  });
 }
 
 function resolvePreferredSaveTarget(): 'global' | 'workspace' {
-  if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
-    return 'global';
-  }
-  const workspaceCache = getClusterUiCache(extensionWorkspaceState);
-  if (workspaceCache && Object.keys(workspaceCache).length > 0) {
-    return 'workspace';
-  }
-  return 'global';
+  return resolvePreferredSaveTargetState({
+    workspaceFolders: vscode.workspace.workspaceFolders,
+    workspaceState: extensionWorkspaceState,
+    cacheKey: CLUSTER_UI_CACHE_KEY
+  });
 }
 
 async function updateClusterUiCache(values: ProfileValues, target: vscode.ConfigurationTarget): Promise<void> {
-  const hasWorkspace = Boolean(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
-  const useWorkspace =
-    hasWorkspace &&
-    (target === vscode.ConfigurationTarget.Workspace || target === vscode.ConfigurationTarget.WorkspaceFolder);
-  const state = useWorkspace ? extensionWorkspaceState : extensionGlobalState;
-  if (!state) {
-    return;
-  }
-  await state.update(CLUSTER_UI_CACHE_KEY, pickProfileValues(values));
+  await updateClusterUiCacheState({
+    values,
+    target,
+    globalState: extensionGlobalState,
+    workspaceState: extensionWorkspaceState,
+    workspaceFolders: vscode.workspace.workspaceFolders,
+    cacheKey: CLUSTER_UI_CACHE_KEY
+  });
 }
 
 function getProfileStore(): ProfileStore {
-  if (!extensionGlobalState) {
-    return {};
-  }
-  return extensionGlobalState.get<ProfileStore>(PROFILE_STORE_KEY) || {};
+  return getProfileStoreState(extensionGlobalState, PROFILE_STORE_KEY);
+}
+
+async function updateProfileStore(store: ProfileStore): Promise<void> {
+  await updateProfileStoreState(extensionGlobalState, PROFILE_STORE_KEY, store);
 }
 
 function getActiveProfileName(): string | undefined {
-  if (!extensionGlobalState) {
-    return undefined;
-  }
-  const name = extensionGlobalState.get<string>(ACTIVE_PROFILE_KEY);
-  return name || undefined;
+  return getActiveProfileNameState(extensionGlobalState, ACTIVE_PROFILE_KEY);
 }
 
 async function setActiveProfileName(name?: string): Promise<void> {
-  if (!extensionGlobalState) {
-    return;
-  }
-  await extensionGlobalState.update(ACTIVE_PROFILE_KEY, name);
+  await setActiveProfileNameState(extensionGlobalState, ACTIVE_PROFILE_KEY, name);
 }
 
 function getProfileSummaries(store: ProfileStore): ProfileSummary[] {
-  return Object.values(store)
-    .map((profile) => ({ name: profile.name, updatedAt: profile.updatedAt }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+  return getProfileSummariesState(store);
 }
 
 function getProfileValues(name: string): UiValues | undefined {
-  const store = getProfileStore();
-  const entry = store[name];
-  if (!entry) {
-    return undefined;
-  }
-  return mergeUiValuesWithDefaults(pickProfileValues(entry.values), getUiGlobalDefaults());
-}
-
-function normalizeWhitespace(value: string | undefined | null): string {
-  if (!value) {
-    return '';
-  }
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function normalizeList(values: string[] | undefined): string[] {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-  return values.map((entry) => entry.trim()).filter(Boolean);
-}
-
-function listsEqual(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  for (let i = 0; i < a.length; i += 1) {
-    if (a[i] !== b[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOverrideDetail[] {
-  const overrides: ProfileOverrideDetail[] = [];
-  const add = (label: string, value: string): void => {
-    const normalized = normalizeWhitespace(value);
-    if (normalized) {
-      overrides.push({ label, value: normalized });
-    }
-  };
-  const diffString = (value: string, fallback: string): boolean => {
-    const normalized = normalizeWhitespace(value);
-    if (!normalized) {
-      return false;
-    }
-    return normalized !== normalizeWhitespace(fallback);
-  };
-  const diffBool = (value: boolean, fallback: boolean): boolean => value !== fallback;
-
-  const loginHostsValue = normalizeWhitespace(values.loginHosts);
-  const loginHostTokens = loginHostsValue.split(/[,\s]+/).filter(Boolean);
-  if (loginHostTokens.length > 1 && diffString(values.loginHosts, defaults.loginHosts)) {
-    add('Login hosts', values.loginHosts);
-  }
-  if (diffString(values.user, defaults.user)) add('User', values.user);
-  if (diffString(values.identityFile, defaults.identityFile)) add('Identity file', values.identityFile);
-  if (diffString(values.preSshCommand, defaults.preSshCommand)) {
-    add('Pre-SSH command', values.preSshCommand);
-  }
-  if (diffString(values.preSshCheckCommand, defaults.preSshCheckCommand)) {
-    add('Pre-SSH check command', values.preSshCheckCommand);
-  }
-  if (diffString(values.startupCommand, defaults.startupCommand)) {
-    add('Startup command', values.startupCommand);
-  }
-  if (diffString(values.additionalSshOptions, defaults.additionalSshOptions)) {
-    add('Additional SSH options', values.additionalSshOptions);
-  }
-  if (diffString(values.remoteWorkspacePath, defaults.remoteWorkspacePath)) {
-    add('Remote folder', values.remoteWorkspacePath);
-  }
-  if (diffBool(values.openInNewWindow, defaults.openInNewWindow)) {
-    add('Open in new window', values.openInNewWindow ? 'Yes' : 'No');
-  }
-  if (diffBool(values.filterFreeResources, defaults.filterFreeResources)) {
-    add('Free-resource filter', values.filterFreeResources ? 'On' : 'Off');
-  }
-
-  const selections = normalizeList(values.moduleSelections);
-  const defaultSelections = normalizeList(defaults.moduleSelections);
-  const custom = normalizeWhitespace(values.moduleCustomCommand || '');
-  const defaultCustom = normalizeWhitespace(defaults.moduleCustomCommand || '');
-  const moduleLoad = normalizeWhitespace(values.moduleLoad || '');
-  const defaultModuleLoad = normalizeWhitespace(defaults.moduleLoad || '');
-  if (selections.length > 0 && !listsEqual(selections, defaultSelections)) {
-    add('Modules', selections.join(', '));
-  } else if (custom && custom !== defaultCustom) {
-    add('Module command', custom);
-  } else if (moduleLoad && moduleLoad !== defaultModuleLoad) {
-    add('Module load', moduleLoad);
-  }
-
-  if (diffString(values.extraSallocArgs, defaults.extraSallocArgs)) add('Extra salloc args', values.extraSallocArgs);
-  if (diffBool(values.promptForExtraSallocArgs, defaults.promptForExtraSallocArgs)) {
-    add('Prompt for extra args', values.promptForExtraSallocArgs ? 'Yes' : 'No');
-  }
-
-  if (diffString(values.sessionMode, defaults.sessionMode)) add('Session mode', values.sessionMode);
-  if (diffString(values.sessionKey, defaults.sessionKey)) add('Session key', values.sessionKey);
-  if (diffString(values.sessionIdleTimeoutSeconds, defaults.sessionIdleTimeoutSeconds)) {
-    add('Session idle timeout', values.sessionIdleTimeoutSeconds + 's');
-  }
-
-  if (diffString(values.loginHostsCommand, defaults.loginHostsCommand)) {
-    add('Login hosts command', values.loginHostsCommand);
-  }
-  if (diffString(values.loginHostsQueryHost, defaults.loginHostsQueryHost)) {
-    add('Login hosts query host', values.loginHostsQueryHost);
-  }
-  if (diffString(values.partitionInfoCommand, defaults.partitionInfoCommand)) {
-    add('Partition info command', values.partitionInfoCommand);
-  }
-  if (diffString(values.partitionCommand, defaults.partitionCommand)) {
-    add('Partition list command', values.partitionCommand);
-  }
-  if (diffString(values.qosCommand, defaults.qosCommand)) add('QoS command', values.qosCommand);
-  if (diffString(values.accountCommand, defaults.accountCommand)) add('Account command', values.accountCommand);
-
-  if (diffBool(values.forwardAgent, defaults.forwardAgent)) {
-    add('Forward agent', values.forwardAgent ? 'Enabled' : 'Disabled');
-  }
-  if (diffBool(values.requestTTY, defaults.requestTTY)) {
-    add('Request TTY', values.requestTTY ? 'Enabled' : 'Disabled');
-  }
-
-  return overrides;
-}
-
-function buildProfileResourceSummary(values: UiValues, defaults: UiValues): ProfileResourceSummary {
-  const host = firstLoginHostFromInput(values.loginHosts);
-  const partition = values.defaultPartition.trim() || undefined;
-  const nodesRaw = values.defaultNodes.trim();
-  const tasksRaw = values.defaultTasksPerNode.trim();
-  const cpusRaw = values.defaultCpusPerTask.trim();
-  const memoryRaw = values.defaultMemoryMb.trim();
-  const gpuCountRaw = values.defaultGpuCount.trim();
-  const gpuType = values.defaultGpuType.trim() || undefined;
-  const time = values.defaultTime.trim() || undefined;
-
-  const nodes = nodesRaw ? parsePositiveNumberInput(nodesRaw) || undefined : undefined;
-  const tasksPerNode = tasksRaw ? parsePositiveNumberInput(tasksRaw) || undefined : undefined;
-  const cpusPerTask = cpusRaw ? parsePositiveNumberInput(cpusRaw) || undefined : undefined;
-  const memoryMb = memoryRaw ? parseNonNegativeNumberInput(memoryRaw) || undefined : undefined;
-  const gpuCount = gpuCountRaw ? parseNonNegativeNumberInput(gpuCountRaw) : undefined;
-
-  const totalCpu =
-    nodes && (tasksPerNode || cpusPerTask)
-      ? nodes * (tasksPerNode || 1) * (cpusPerTask || 1)
-      : undefined;
-  const totalMemoryMb = nodes && memoryMb ? nodes * memoryMb : undefined;
-  const totalGpu = nodes && gpuCount !== undefined ? nodes * gpuCount : undefined;
-
-  return {
-    host,
-    partition,
-    nodes,
-    tasksPerNode,
-    cpusPerTask,
-    memoryMb,
-    gpuType,
-    gpuCount,
-    time,
-    totalCpu,
-    totalMemoryMb,
-    totalGpu,
-    overrides: buildProfileOverrides(values, defaults)
-  };
+  return getProfileValuesState(
+    name,
+    getProfileStore(),
+    mergeUiValuesWithDefaults,
+    pickProfileValues,
+    getUiGlobalDefaults()
+  );
 }
 
 function buildProfileSummaryMap(
   store: ProfileStore,
   defaults: UiValues
 ): Record<string, ProfileResourceSummary> {
-  const summaries: Record<string, ProfileResourceSummary> = {};
-  Object.entries(store).forEach(([name, entry]) => {
-    const merged = mergeUiValuesWithDefaults(pickProfileValues(entry.values), defaults);
-    summaries[name] = buildProfileResourceSummary(merged, defaults);
+  return buildProfileSummaryMapState(store, defaults, mergeUiValuesWithDefaults, pickProfileValues, {
+    firstLoginHostFromInput,
+    parsePositiveNumberInput,
+    parseNonNegativeNumberInput
   });
-  return summaries;
 }
 
 function getConfigFromSettings(): SlurmConnectConfig {
@@ -1691,435 +1305,169 @@ function getConfigWithOverrides(overrides?: Partial<SlurmConnectConfig>): SlurmC
   };
 }
 
-class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
-  private view?: vscode.WebviewView;
+async function getReadyPayload(): Promise<{
+  values: Partial<UiValues>;
+  defaults: Partial<UiValues>;
+  profiles: ProfileSummary[];
+  profileSummaries: Record<string, ProfileResourceSummary>;
+  activeProfile?: string;
+  connectionState: ConnectionState;
+  connectionSessionMode?: SessionMode;
+  remoteActive: boolean;
+  saveTarget: 'global' | 'workspace';
+}> {
+  const defaults = getUiValuesFromStorage();
+  return {
+    values: buildWebviewValues(defaults),
+    defaults: buildWebviewValues(getUiDefaultsFromConfig()),
+    profiles: getProfileSummaries(getProfileStore()),
+    profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
+    activeProfile: getActiveProfileName(),
+    connectionState,
+    connectionSessionMode: lastConnectionSessionMode,
+    remoteActive: vscode.env.remoteName === 'ssh-remote',
+    saveTarget: resolvePreferredSaveTarget()
+  };
+}
 
-  constructor(private readonly context: vscode.ExtensionContext) {}
-
-  resolveWebviewView(view: vscode.WebviewView): void {
-    this.view = view;
-    const webview = view.webview;
-    activeWebview = webview;
-    view.onDidDispose(() => {
-      if (activeWebview === webview) {
-        activeWebview = undefined;
-      }
+async function handleConnectMessage(
+  uiValues: Partial<UiValues>,
+  target: vscode.ConfigurationTarget,
+  sessionSelection?: string
+): Promise<void> {
+  const normalizedSelection = sessionSelection?.trim() || '';
+  await updateConfigFromUi(uiValues, target);
+  if (
+    connectionState === 'connecting' &&
+    connectTokenState.activeConnectToken &&
+    !connectTokenState.activeConnectToken.cancelled
+  ) {
+    return;
+  }
+  const token = createConnectToken();
+  setConnectionState('connecting');
+  const overrides = buildOverridesFromUi(uiValues);
+  if (normalizedSelection) {
+    overrides.sessionMode = 'persistent';
+    overrides.sessionKey = normalizedSelection;
+  }
+  let connected = false;
+  try {
+    connected = await connectCommand(overrides, {
+      interactive: false,
+      aliasOverride: normalizedSelection,
+      token
     });
-    webview.options = {
-      enableScripts: true,
-      localResourceRoots: [this.context.extensionUri]
-    };
+  } catch (error) {
+    getOutputChannel().appendLine(`Connect failed: ${formatError(error)}`);
+  }
+  if (!isConnectCancelled(token)) {
+    const expectedAlias = (lastConnectionAlias || '').trim();
+    const currentRemoteAlias = (resolveRemoteSshAlias() || '').trim();
+    const aliasMatchesCurrentWindow =
+      !expectedAlias || (currentRemoteAlias.length > 0 && currentRemoteAlias === expectedAlias);
+    if (connected && vscode.env.remoteName === 'ssh-remote' && !aliasMatchesCurrentWindow) {
+      getOutputChannel().appendLine(
+        `Connect state check mismatch: expected alias "${expectedAlias || '(none)'}", current remote alias "${currentRemoteAlias || '(none)'}".`
+      );
+    }
+    const connectedInCurrentWindow = connected && vscode.env.remoteName === 'ssh-remote' && aliasMatchesCurrentWindow;
+    setConnectionState(connectedInCurrentWindow ? 'connected' : 'idle');
+  }
+  finalizeConnectToken(token);
+}
 
-    webview.html = getWebviewHtml(webview);
-    webview.onDidReceiveMessage(async (message) => {
-      switch (message.command) {
-        case 'ready': {
-          syncConnectionStateFromEnvironment();
-          let activeProfile = getActiveProfileName();
-          const defaults = getUiValuesFromStorage();
-          const values = buildWebviewValues(defaults);
-          if (activeProfile && !getProfileValues(activeProfile)) {
-            activeProfile = undefined;
-          }
-          const agentStatus = await buildAgentStatusMessage(defaults.identityFile);
-          const host = firstLoginHostFromInput(defaults.loginHosts);
-          const cached = host ? getCachedClusterInfo(host) : undefined;
-          webview.postMessage({
-            command: 'load',
-            values,
-            defaults: buildWebviewValues(getUiDefaultsFromConfig()),
-            clusterInfo: cached?.info,
-            clusterInfoCachedAt: cached?.fetchedAt,
-            sessions: [],
-            profiles: getProfileSummaries(getProfileStore()),
-            profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
-            activeProfile,
-            connectionState,
-            connectionSessionMode: lastConnectionSessionMode,
-            agentStatus: agentStatus.text,
-            agentStatusError: agentStatus.isError,
-            remoteActive: vscode.env.remoteName === 'ssh-remote',
-            saveTarget: resolvePreferredSaveTarget()
-          });
-          void loadSshHostsForWebview(buildOverridesFromUi(pickProfileValues(values)));
-          break;
-        }
-        case 'connect': {
-          const target = message.target === 'workspace'
-            ? vscode.ConfigurationTarget.Workspace
-            : vscode.ConfigurationTarget.Global;
-          const uiValues = message.values as Partial<UiValues>;
-          const sessionSelection =
-            typeof message.sessionSelection === 'string' ? message.sessionSelection.trim() : '';
-          await updateConfigFromUi(uiValues, target);
-          if (connectionState === 'connecting' && activeConnectToken && !activeConnectToken.cancelled) {
-            break;
-          }
-          const token = createConnectToken();
-          setConnectionState('connecting');
-          const overrides = buildOverridesFromUi(uiValues);
-          if (sessionSelection) {
-            overrides.sessionMode = 'persistent';
-            overrides.sessionKey = sessionSelection;
-          }
-          let connected = false;
-          try {
-            connected = await connectCommand(overrides, {
-              interactive: false,
-              aliasOverride: sessionSelection,
-              token
-            });
-          } catch (error) {
-            getOutputChannel().appendLine(`Connect failed: ${formatError(error)}`);
-          }
-          if (!isConnectCancelled(token)) {
-            const expectedAlias = (lastConnectionAlias || '').trim();
-            const currentRemoteAlias = (resolveRemoteSshAlias() || '').trim();
-            const aliasMatchesCurrentWindow =
-              !expectedAlias || (currentRemoteAlias.length > 0 && currentRemoteAlias === expectedAlias);
-            if (connected && vscode.env.remoteName === 'ssh-remote' && !aliasMatchesCurrentWindow) {
-              getOutputChannel().appendLine(
-                `Connect state check mismatch: expected alias "${expectedAlias || '(none)'}", current remote alias "${currentRemoteAlias || '(none)'}".`
-              );
-            }
-            const connectedInCurrentWindow =
-              connected && vscode.env.remoteName === 'ssh-remote' && aliasMatchesCurrentWindow;
-            setConnectionState(connectedInCurrentWindow ? 'connected' : 'idle');
-          }
-          finalizeConnectToken(token);
-          break;
-        }
-        case 'cancelConnect': {
-          cancelActiveConnectToken();
-          stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: false });
-          setConnectionState('idle');
-          break;
-        }
-        case 'saveSettings': {
-          const target = message.target === 'workspace'
-            ? vscode.ConfigurationTarget.Workspace
-            : vscode.ConfigurationTarget.Global;
-          const uiValues = message.values as Partial<UiValues>;
-          await updateConfigFromUi(uiValues, target);
-          break;
-        }
-        case 'resolveSshHost': {
-          const host = typeof message.host === 'string' ? message.host.trim() : '';
-          if (!host) {
-            break;
-          }
-          const uiValues = message.values as Partial<UiValues> | undefined;
-          const overrides = uiValues ? buildOverridesFromUi(uiValues) : undefined;
-          try {
-            const cfg = getConfigWithOverrides(overrides);
-            const resolved = await resolveSshHostFromConfig(host, cfg);
-            webview.postMessage({
-              command: 'sshHostResolved',
-              ...resolved
-            });
-          } catch (error) {
-            webview.postMessage({
-              command: 'sshHostResolved',
-              host,
-              error: formatError(error)
-            });
-          }
-          break;
-        }
-        case 'refreshAgentStatus': {
-          const identityFile = typeof message.identityFile === 'string' ? message.identityFile : '';
-          const agentStatus = await buildAgentStatusMessage(identityFile);
-          webview.postMessage({
-            command: 'agentStatus',
-            agentStatus: agentStatus.text,
-            agentStatusError: agentStatus.isError
-          });
-          break;
-        }
-        case 'pickIdentityFile': {
-          const result = await vscode.window.showOpenDialog({
-            title: 'Select identity file',
-            canSelectFiles: true,
-            canSelectFolders: false,
-            canSelectMany: false
-          });
-          if (result && result[0]) {
-            webview.postMessage({
-              command: 'pickedPath',
-              field: 'identityFile',
-              value: result[0].fsPath
-            });
-          }
-          break;
-        }
-        case 'disconnect': {
-          setConnectionState('disconnecting');
-          const disconnected = await disconnectFromHost(lastConnectionAlias);
-          if (disconnected) {
-            lastConnectionSessionKey = undefined;
-            lastConnectionSessionMode = undefined;
-            lastConnectionLoginHost = undefined;
-          }
-          setConnectionState(disconnected ? 'idle' : 'connected');
-          break;
-        }
-        case 'cancelSession': {
-          if (lastConnectionSessionMode !== 'persistent') {
-            void vscode.window.showWarningMessage('No persistent Slurm session is active to cancel.');
-            break;
-          }
-          getOutputChannel().appendLine(
-            `Cancel job requested. remoteName=${vscode.env.remoteName || 'local'}, alias=${lastConnectionAlias || '(none)'}, sessionKey=${lastConnectionSessionKey || '(none)'}, loginHost=${lastConnectionLoginHost || '(none)'}`
-          );
-          const label = lastConnectionSessionKey || lastConnectionAlias || 'current session';
-          const choice = await vscode.window.showWarningMessage(
-            `Cancel job "${label}"? This will end the allocation and close the remote connection. Close this dialog to keep it running.`,
-            { modal: true },
-            'Cancel job'
-          );
-          if (choice !== 'Cancel job') {
-            break;
-          }
-          const cfg = getConfig();
-          const aliasFromRemote = resolveRemoteSshAlias();
-          const stored = getStoredConnectionState();
-          const aliasForSession = lastConnectionAlias || stored?.alias || aliasFromRemote || '';
-          const sessionKey =
-            lastConnectionSessionKey ||
-            stored?.sessionKey ||
-            (aliasForSession ? resolveSessionKey(cfg, aliasForSession) : '');
-          let loginHost =
-            lastConnectionLoginHost ||
-            stored?.loginHost ||
-            (cfg.loginHosts.length > 0 ? cfg.loginHosts[0] : undefined);
-          if (!loginHost && aliasForSession) {
-            try {
-              const resolved = await resolveSshHostFromConfig(aliasForSession, cfg);
-              loginHost = resolved.hostname || resolved.host || loginHost;
-            } catch {
-              // Ignore; we'll fall back to the existing value.
-            }
-          }
-          const isRemoteSession = vscode.env.remoteName === 'ssh-remote';
-          getOutputChannel().appendLine(
-            `Cancel job resolved. alias=${aliasForSession || '(none)'}, sessionKey=${sessionKey || '(none)'}, loginHost=${loginHost || '(none)'}, remote=${isRemoteSession}`
-          );
-          if (!sessionKey) {
-            getOutputChannel().appendLine(
-              'Cancel job: session key unavailable; will rely on SLURM_JOB_ID in the remote terminal.'
-            );
-          }
-          let cancelSent = false;
-          if (loginHost || isRemoteSession) {
-            cancelSent = await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
-              useTerminal: true
-            });
-          } else {
-            getOutputChannel().appendLine(
-              'Cancel job failed to resolve login host or session key; cannot proceed.'
-            );
-            void vscode.window.showWarningMessage(
-              'Unable to resolve the login host or session key to cancel the Slurm job.'
-            );
-          }
-          if (!cancelSent) {
-            break;
-          }
-          setConnectionState('disconnecting');
-          const disconnected = await disconnectFromHost(aliasForSession || lastConnectionAlias);
-          if (disconnected) {
-            lastConnectionSessionKey = undefined;
-            lastConnectionSessionMode = undefined;
-            lastConnectionLoginHost = undefined;
-            setConnectionState('idle');
-          } else {
-            setConnectionState('connected');
-            void vscode.window.showWarningMessage(
-              'Job cancel command was sent, but the Remote-SSH window stayed connected. Disconnect manually if needed.'
-            );
-          }
-          break;
-        }
-        case 'saveProfile': {
-          const uiValues = message.values as Partial<UiValues>;
-          const suggestedRaw = typeof message.suggestedName === 'string' ? message.suggestedName : '';
-          const suggestedName = suggestedRaw.trim();
-          const nameInput = await vscode.window.showInputBox({
-            title: 'Profile name',
-            prompt: 'Enter a profile name',
-            value: suggestedName || undefined
-          });
-          if (nameInput === undefined) {
-            webview.postMessage({
-              command: 'profiles',
-              profiles: getProfileSummaries(getProfileStore()),
-              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
-              activeProfile: getActiveProfileName(),
-              profileStatus: 'Profile save cancelled.'
-            });
-            break;
-          }
-          const name = nameInput.trim();
-          if (!name) {
-            webview.postMessage({
-              command: 'profiles',
-              profiles: getProfileSummaries(getProfileStore()),
-              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
-              activeProfile: getActiveProfileName(),
-              profileStatus: 'Enter a profile name before saving.',
-              profileError: true
-            });
-            break;
-          }
-          const store = getProfileStore();
-          const existing = store[name];
-          const now = new Date().toISOString();
-          store[name] = {
-            name,
-            values: pickProfileValues(uiValues),
-            createdAt: existing?.createdAt ?? now,
-            updatedAt: now
-          };
-          if (extensionGlobalState) {
-            await extensionGlobalState.update(PROFILE_STORE_KEY, store);
-            await setActiveProfileName(name);
-          }
-          webview.postMessage({
-            command: 'profiles',
-            profiles: getProfileSummaries(store),
-            profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
-            activeProfile: name,
-            profileStatus: existing ? `Profile "${name}" updated.` : `Profile "${name}" saved.`
-          });
-          break;
-        }
-        case 'loadProfile': {
-          const rawName = typeof message.name === 'string' ? message.name : '';
-          const name = rawName.trim();
-          if (!name) {
-            webview.postMessage({
-              command: 'profiles',
-              profiles: getProfileSummaries(getProfileStore()),
-              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
-              activeProfile: getActiveProfileName(),
-              profileStatus: 'Select a profile to load.',
-              profileError: true
-            });
-            break;
-          }
-          const store = getProfileStore();
-          const profile = store[name];
-          if (!profile) {
-            webview.postMessage({
-              command: 'profiles',
-              profiles: getProfileSummaries(store),
-              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
-              activeProfile: getActiveProfileName(),
-              profileStatus: `Profile "${name}" not found.`,
-              profileError: true
-            });
-            break;
-          }
-          await setActiveProfileName(name);
-          syncConnectionStateFromEnvironment();
-          const resolved = getProfileValues(name);
-          if (!resolved) {
-            webview.postMessage({
-              command: 'profiles',
-              profiles: getProfileSummaries(store),
-              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
-              activeProfile: getActiveProfileName(),
-              profileStatus: `Profile "${name}" not found.`,
-              profileError: true
-            });
-            break;
-          }
-          const host = firstLoginHostFromInput(resolved.loginHosts);
-          const cached = host ? getCachedClusterInfo(host) : undefined;
-          webview.postMessage({
-            command: 'load',
-            values: pickProfileValues(resolved),
-            clusterInfo: cached?.info,
-            clusterInfoCachedAt: cached?.fetchedAt,
-            profiles: getProfileSummaries(store),
-            profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
-            activeProfile: name,
-            connectionState,
-            remoteActive: vscode.env.remoteName === 'ssh-remote',
-            profileStatus: `Loaded profile "${name}".`,
-            saveTarget: resolvePreferredSaveTarget()
-          });
-          break;
-        }
-        case 'deleteProfile': {
-          const rawName = typeof message.name === 'string' ? message.name : '';
-          const name = rawName.trim();
-          const store = getProfileStore();
-          if (!name || !store[name]) {
-            webview.postMessage({
-              command: 'profiles',
-              profiles: getProfileSummaries(store),
-              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
-              activeProfile: getActiveProfileName(),
-              profileStatus: 'Select a profile to delete.',
-              profileError: true
-            });
-            break;
-          }
-          const confirmDelete = await vscode.window.showWarningMessage(
-            `Delete profile "${name}"?`,
-            { modal: true },
-            'Delete'
-          );
-          if (confirmDelete !== 'Delete') {
-            webview.postMessage({
-              command: 'profiles',
-              profiles: getProfileSummaries(store),
-              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
-              activeProfile: getActiveProfileName(),
-              profileStatus: 'Profile deletion cancelled.'
-            });
-            break;
-          }
-          delete store[name];
-          if (extensionGlobalState) {
-            await extensionGlobalState.update(PROFILE_STORE_KEY, store);
-          }
-          let activeProfile = getActiveProfileName();
-          if (activeProfile === name) {
-            activeProfile = undefined;
-            await setActiveProfileName(undefined);
-          }
-          webview.postMessage({
-            command: 'profiles',
-            profiles: getProfileSummaries(store),
-            profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
-            activeProfile,
-            profileStatus: `Profile "${name}" deleted.`
-          });
-          break;
-        }
-        case 'getClusterInfo': {
-          const uiValues = message.values as Partial<UiValues>;
-          await handleClusterInfoRequest(uiValues, webview);
-          break;
-        }
-        case 'openSettings': {
-          void vscode.commands.executeCommand('workbench.action.openSettings', SETTINGS_SECTION);
-          break;
-        }
-        case 'openLogs': {
-          await openLogFile();
-          break;
-        }
-        case 'openRemoteSshLog': {
-          await openRemoteSshLog();
-          break;
-        }
-        default:
-          break;
-      }
+function handleCancelConnectMessage(): void {
+  cancelActiveConnectToken();
+  stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: false });
+  setConnectionState('idle');
+}
+
+async function handleDisconnectMessage(): Promise<void> {
+  setConnectionState('disconnecting');
+  const disconnected = await disconnectFromHost(lastConnectionAlias);
+  if (disconnected) {
+    lastConnectionSessionKey = undefined;
+    lastConnectionSessionMode = undefined;
+    lastConnectionLoginHost = undefined;
+  }
+  setConnectionState(disconnected ? 'idle' : 'connected');
+}
+
+async function handleCancelSessionMessage(): Promise<void> {
+  if (lastConnectionSessionMode !== 'persistent') {
+    void vscode.window.showWarningMessage('No persistent Slurm session is active to cancel.');
+    return;
+  }
+  getOutputChannel().appendLine(
+    `Cancel job requested. remoteName=${vscode.env.remoteName || 'local'}, alias=${lastConnectionAlias || '(none)'}, sessionKey=${lastConnectionSessionKey || '(none)'}, loginHost=${lastConnectionLoginHost || '(none)'}`
+  );
+  const label = lastConnectionSessionKey || lastConnectionAlias || 'current session';
+  const choice = await vscode.window.showWarningMessage(
+    `Cancel job "${label}"? This will end the allocation and close the remote connection. Close this dialog to keep it running.`,
+    { modal: true },
+    'Cancel job'
+  );
+  if (choice !== 'Cancel job') {
+    return;
+  }
+  const cfg = getConfig();
+  const aliasFromRemote = resolveRemoteSshAlias();
+  const stored = getStoredConnectionState();
+  const aliasForSession = lastConnectionAlias || stored?.alias || aliasFromRemote || '';
+  const sessionKey =
+    lastConnectionSessionKey ||
+    stored?.sessionKey ||
+    (aliasForSession ? resolveSessionKey(cfg, aliasForSession) : '');
+  let loginHost =
+    lastConnectionLoginHost ||
+    stored?.loginHost ||
+    (cfg.loginHosts.length > 0 ? cfg.loginHosts[0] : undefined);
+  if (!loginHost && aliasForSession) {
+    try {
+      const resolved = await resolveSshHostFromConfig(aliasForSession, cfg);
+      loginHost = resolved.hostname || resolved.host || loginHost;
+    } catch {
+      // Ignore; we'll fall back to the existing value.
+    }
+  }
+  const isRemoteSession = vscode.env.remoteName === 'ssh-remote';
+  getOutputChannel().appendLine(
+    `Cancel job resolved. alias=${aliasForSession || '(none)'}, sessionKey=${sessionKey || '(none)'}, loginHost=${loginHost || '(none)'}, remote=${isRemoteSession}`
+  );
+  if (!sessionKey) {
+    getOutputChannel().appendLine(
+      'Cancel job: session key unavailable; will rely on SLURM_JOB_ID in the remote terminal.'
+    );
+  }
+  let cancelSent = false;
+  if (loginHost || isRemoteSession) {
+    cancelSent = await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
+      useTerminal: true
     });
+  } else {
+    getOutputChannel().appendLine(
+      'Cancel job failed to resolve login host or session key; cannot proceed.'
+    );
+    void vscode.window.showWarningMessage(
+      'Unable to resolve the login host or session key to cancel the Slurm job.'
+    );
+  }
+  if (!cancelSent) {
+    return;
+  }
+  setConnectionState('disconnecting');
+  const disconnected = await disconnectFromHost(aliasForSession || lastConnectionAlias);
+  if (disconnected) {
+    lastConnectionSessionKey = undefined;
+    lastConnectionSessionMode = undefined;
+    lastConnectionLoginHost = undefined;
+    setConnectionState('idle');
+  } else {
+    setConnectionState('connected');
+    void vscode.window.showWarningMessage(
+      'Job cancel command was sent, but the Remote-SSH window stayed connected. Disconnect manually if needed.'
+    );
   }
 }
 
@@ -7613,7 +6961,7 @@ async function connectToHost(
 
 export async function __resetForTests(): Promise<void> {
   cancelActiveConnectToken();
-  finalizeConnectToken(activeConnectToken);
+  finalizeConnectToken(connectTokenState.activeConnectToken);
   connectionState = 'idle';
   lastConnectionAlias = undefined;
   lastConnectionSessionKey = undefined;
@@ -7821,20 +7169,6 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
   return false;
 }
 
-function hasCachedUiValue(cache: ClusterUiCache | undefined, key: keyof UiValues): boolean {
-  return Boolean(cache && Object.prototype.hasOwnProperty.call(cache, key));
-}
-
-function getCachedUiValue<T extends keyof UiValues>(
-  cache: ClusterUiCache | undefined,
-  key: T
-): UiValues[T] | undefined {
-  if (!hasCachedUiValue(cache, key)) {
-    return undefined;
-  }
-  return cache?.[key];
-}
-
 function getUiValuesFromStorage(): UiValues {
   return getUiValuesFromConfig(getConfigFromSettings(), getMergedClusterUiCache());
 }
@@ -7860,103 +7194,12 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
       inspected.globalValue !== undefined
     );
   };
-  const hasValue = (key: string, cacheKey?: keyof UiValues): boolean =>
-    hasConfigValue(key) || (cacheKey ? hasCachedUiValue(cache, cacheKey) : false);
-  const fromCache = <T extends keyof UiValues>(key: T, fallback: UiValues[T]): UiValues[T] => {
-    const cached = getCachedUiValue(cache, key);
-    return cached !== undefined ? cached : fallback;
-  };
-  const fromConfigOrCache = <T extends keyof UiValues>(
-    configKey: string,
-    cacheKey: T,
-    fallback: UiValues[T]
-  ): UiValues[T] => (hasConfigValue(configKey) ? fallback : fromCache(cacheKey, fallback));
-  const hasDefaultPartition = hasValue('defaultPartition', 'defaultPartition');
-  const hasDefaultNodes = hasValue('defaultNodes', 'defaultNodes');
-  const hasDefaultTasksPerNode = hasValue('defaultTasksPerNode', 'defaultTasksPerNode');
-  const hasDefaultCpusPerTask = hasValue('defaultCpusPerTask', 'defaultCpusPerTask');
-  const hasDefaultTime = hasValue('defaultTime', 'defaultTime');
-  const hasDefaultMemoryMb = hasValue('defaultMemoryMb', 'defaultMemoryMb');
-  const hasDefaultGpuType = hasValue('defaultGpuType', 'defaultGpuType');
-  const hasDefaultGpuCount = hasValue('defaultGpuCount', 'defaultGpuCount');
-  return {
-    loginHosts: fromConfigOrCache('loginHosts', 'loginHosts', cfg.loginHosts.join('\n')),
-    loginHostsCommand: fromConfigOrCache('loginHostsCommand', 'loginHostsCommand', cfg.loginHostsCommand || ''),
-    loginHostsQueryHost: fromConfigOrCache('loginHostsQueryHost', 'loginHostsQueryHost', cfg.loginHostsQueryHost || ''),
-    partitionCommand: fromConfigOrCache('partitionCommand', 'partitionCommand', cfg.partitionCommand || ''),
-    partitionInfoCommand: fromConfigOrCache('partitionInfoCommand', 'partitionInfoCommand', cfg.partitionInfoCommand || ''),
-    filterFreeResources: fromConfigOrCache('filterFreeResources', 'filterFreeResources', cfg.filterFreeResources),
-    qosCommand: fromConfigOrCache('qosCommand', 'qosCommand', cfg.qosCommand || ''),
-    accountCommand: fromConfigOrCache('accountCommand', 'accountCommand', cfg.accountCommand || ''),
-    user: fromConfigOrCache('user', 'user', cfg.user || ''),
-    identityFile: fromConfigOrCache('identityFile', 'identityFile', cfg.identityFile || ''),
-    preSshCommand: fromConfigOrCache('preSshCommand', 'preSshCommand', cfg.preSshCommand || ''),
-    preSshCheckCommand: fromConfigOrCache('preSshCheckCommand', 'preSshCheckCommand', cfg.preSshCheckCommand || ''),
-    autoInstallProxyScriptOnClusterInfo: cfg.autoInstallProxyScriptOnClusterInfo,
-    additionalSshOptions: fromConfigOrCache(
-      'additionalSshOptions',
-      'additionalSshOptions',
-      formatAdditionalSshOptions(cfg.additionalSshOptions)
-    ),
-    moduleLoad: fromConfigOrCache('moduleLoad', 'moduleLoad', cfg.moduleLoad || ''),
-    startupCommand: fromConfigOrCache('startupCommand', 'startupCommand', cfg.startupCommand || ''),
-    moduleSelections: getCachedUiValue(cache, 'moduleSelections'),
-    moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
-    proxyCommand: fromConfigOrCache('proxyCommand', 'proxyCommand', cfg.proxyCommand || ''),
-    proxyArgs: fromConfigOrCache('proxyArgs', 'proxyArgs', cfg.proxyArgs.join('\n')),
-    proxyDebugLogging: cfg.proxyDebugLogging,
-    localProxyEnabled: cfg.localProxyEnabled,
-    localProxyNoProxy: cfg.localProxyNoProxy.join('\n'),
-    localProxyPort: String(cfg.localProxyPort ?? 0),
-    localProxyRemoteBind: cfg.localProxyRemoteBind || '',
-    localProxyRemoteHost: cfg.localProxyRemoteHost || '',
-    localProxyComputeTunnel: cfg.localProxyComputeTunnel,
-    extraSallocArgs: fromConfigOrCache('extraSallocArgs', 'extraSallocArgs', cfg.extraSallocArgs.join('\n')),
-    promptForExtraSallocArgs: fromConfigOrCache(
-      'promptForExtraSallocArgs',
-      'promptForExtraSallocArgs',
-      cfg.promptForExtraSallocArgs
-    ),
-    sessionMode: fromConfigOrCache('sessionMode', 'sessionMode', cfg.sessionMode || 'persistent'),
-    sessionKey: fromConfigOrCache('sessionKey', 'sessionKey', cfg.sessionKey || ''),
-    sessionIdleTimeoutSeconds: fromConfigOrCache(
-      'sessionIdleTimeoutSeconds',
-      'sessionIdleTimeoutSeconds',
-      String(cfg.sessionIdleTimeoutSeconds ?? 600)
-    ),
-    sessionStateDir: cfg.sessionStateDir || '',
-    defaultPartition: hasDefaultPartition
-      ? fromConfigOrCache('defaultPartition', 'defaultPartition', cfg.defaultPartition || '')
-      : '',
-    defaultNodes: hasDefaultNodes
-      ? fromConfigOrCache('defaultNodes', 'defaultNodes', String(cfg.defaultNodes || ''))
-      : '',
-    defaultTasksPerNode: hasDefaultTasksPerNode
-      ? fromConfigOrCache('defaultTasksPerNode', 'defaultTasksPerNode', String(cfg.defaultTasksPerNode || ''))
-      : '',
-    defaultCpusPerTask: hasDefaultCpusPerTask
-      ? fromConfigOrCache('defaultCpusPerTask', 'defaultCpusPerTask', String(cfg.defaultCpusPerTask || ''))
-      : '',
-    defaultTime: hasDefaultTime
-      ? fromConfigOrCache('defaultTime', 'defaultTime', cfg.defaultTime || '')
-      : '24:00:00',
-    defaultMemoryMb: hasDefaultMemoryMb
-      ? fromConfigOrCache('defaultMemoryMb', 'defaultMemoryMb', String(cfg.defaultMemoryMb || ''))
-      : '',
-    defaultGpuType: hasDefaultGpuType
-      ? fromConfigOrCache('defaultGpuType', 'defaultGpuType', cfg.defaultGpuType || '')
-      : '',
-    defaultGpuCount: hasDefaultGpuCount
-      ? fromConfigOrCache('defaultGpuCount', 'defaultGpuCount', String(cfg.defaultGpuCount || ''))
-      : '',
-    sshHostPrefix: cfg.sshHostPrefix || '',
-    forwardAgent: fromConfigOrCache('forwardAgent', 'forwardAgent', cfg.forwardAgent),
-    requestTTY: fromConfigOrCache('requestTTY', 'requestTTY', cfg.requestTTY),
-    openInNewWindow: fromConfigOrCache('openInNewWindow', 'openInNewWindow', cfg.openInNewWindow),
-    remoteWorkspacePath: fromConfigOrCache('remoteWorkspacePath', 'remoteWorkspacePath', cfg.remoteWorkspacePath || ''),
-    temporarySshConfigPath: cfg.temporarySshConfigPath || '',
-    sshQueryConfigPath: cfg.sshQueryConfigPath || ''
-  };
+  return getUiValuesFromConfigState({
+    cfg,
+    cache,
+    hasConfigValue,
+    formatAdditionalSshOptions
+  });
 }
 
 async function updateConfigFromUi(values: Partial<UiValues>, target: vscode.ConfigurationTarget): Promise<void> {
