@@ -19,12 +19,7 @@ import {
   SLURM_CONNECT_INCLUDE_END,
   SLURM_CONNECT_INCLUDE_START
 } from './utils/sshConfig';
-import {
-  ClusterInfo,
-  getMaxFieldCount,
-  hasMeaningfulClusterInfo,
-  parsePartitionInfoOutput
-} from './utils/clusterInfo';
+import { ClusterInfo } from './utils/clusterInfo';
 import { isShellOperatorToken, joinShellCommand, quoteShellArg, splitShellArgs } from './utils/shellArgs';
 import {
   buildLocalProxyControlPath as buildLocalProxyControlPathUtil,
@@ -39,13 +34,6 @@ import {
   resolveRemoteBindConnectHost as resolveRemoteBindConnectHostUtil,
   splitHostPort as splitHostPortUtil
 } from './utils/localProxy';
-import { parseModulesOutput as parseModulesOutputUtil } from './utils/moduleOutput';
-import { applySessionIdleInfo as applySessionIdleInfoUtil, parseSessionListOutput as parseSessionListOutputUtil } from './utils/sessionInfo';
-import {
-  applyFreeResourceSummary as applyFreeResourceSummaryUtil,
-  buildClusterInfoCommandSet as buildClusterInfoCommandSetUtil,
-  computeFreeResourceSummary as computeFreeResourceSummaryUtil,
-} from './utils/slurmResources';
 import type {
   LocalProxyTunnelMode,
   ResolvedSshHostInfo,
@@ -90,31 +78,22 @@ import {
   resolvePreferredSaveTarget as resolvePreferredSaveTargetState,
   updateClusterUiCache as updateClusterUiCacheState
 } from './state/uiCache';
+import {
+  buildClusterInfoWebviewMessage,
+  queryPartitions as queryPartitionsConnect,
+  querySimpleList as querySimpleListConnect,
+  resolveDefaultPartitionForHost as resolveDefaultPartitionForHostConnect,
+  resolvePartitionDefaultTimeForHost as resolvePartitionDefaultTimeForHostConnect,
+  validateGpuRequestAgainstCachedClusterInfo as validateGpuRequestAgainstCachedClusterInfoConnect,
+  type ClusterInfoMessageRuntime,
+  type ClusterQueryRuntime
+} from './connect/clusterQueries';
+import { runConnectFlow, type ConnectFlowRuntime } from './connect/flow';
+import type { ConnectFlowResult, LocalProxyPlan } from './connect/types';
 import { SlurmConnectViewProvider } from './webview/provider';
 
 const execFileAsync = promisify(execFile);
-
-interface PartitionResult {
-  partitions: string[];
-  defaultPartition?: string;
-}
 type SshAuthMode = 'agent' | 'terminal';
-
-interface SessionSummary {
-  sessionKey: string;
-  jobId: string;
-  state: string;
-  jobName?: string;
-  createdAt?: string;
-  partition?: string;
-  nodes?: number;
-  cpus?: number;
-  timeLimit?: string;
-  clients?: number;
-  lastSeenEpoch?: number;
-  idleRemainingSeconds?: number;
-  idleTimeoutSeconds?: number;
-}
 
 interface LocalProxyState {
   server: http.Server;
@@ -136,21 +115,6 @@ interface LocalProxyTunnelState {
   configKey: string;
   controlPath: string;
   target: string;
-}
-
-interface LocalProxyPlan {
-  enabled: boolean;
-  proxyUrl?: string;
-  noProxy?: string;
-  sshOptions?: string[];
-  computeTunnel?: {
-    loginHost: string;
-    loginUser?: string;
-    port: number;
-    authUser: string;
-    authToken: string;
-    noProxy?: string;
-  };
 }
 
 interface LocalProxyEnv {
@@ -1476,902 +1440,150 @@ async function connectCommand(
   options?: { interactive?: boolean; aliasOverride?: string; token?: ConnectToken }
 ): Promise<boolean> {
   const cfg = getConfigWithOverrides(overrides);
-  const interactive = options?.interactive !== false;
-  const connectToken = options?.token;
-  const log = getOutputChannel();
-  log.clear();
-  log.appendLine('Slurm Connect started.');
-
-  let didConnect = false;
-  const wasCancelled = (): boolean => isConnectCancelled(connectToken);
-  const cancelAndReturn = (): boolean => {
-    if (!wasCancelled()) {
-      return false;
-    }
-    log.appendLine('Connect cancelled by user.');
-    stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: false });
-    return true;
-  };
-
-  if (wasCancelled()) {
-    return false;
+  const result = await runConnectFlow(createConnectFlowRuntime(), cfg, options);
+  const alias = result.alias?.trim() || undefined;
+  if (alias) {
+    lastConnectionAlias = alias;
   }
-
-  const loginHosts = await resolveLoginHosts(cfg, { interactive });
-  log.appendLine(`Login hosts resolved: ${loginHosts.join(', ') || '(none)'}`);
-  if (cancelAndReturn()) {
-    return false;
-  }
-  if (loginHosts.length === 0) {
-    void vscode.window.showErrorMessage('No login hosts available. Configure slurmConnect.loginHosts or loginHostsCommand.');
-    return false;
-  }
-
-  let loginHost: string | undefined;
-  if (loginHosts.length === 1) {
-    loginHost = loginHosts[0];
-  } else if (interactive) {
-    loginHost = await pickFromList('Select login host', loginHosts, true);
-  } else {
-    loginHost = loginHosts[0];
-    log.appendLine(`Using first login host: ${loginHost}`);
-  }
-  if (!loginHost) {
-    return false;
-  }
-  if (cancelAndReturn()) {
-    return false;
-  }
-
-  const proceed = await maybePromptForSshAuthOnConnect(cfg, loginHost);
-  if (!proceed) {
-    return false;
-  }
-  if (cancelAndReturn()) {
-    return false;
-  }
-
-  let partition: string | undefined;
-  let qos: string | undefined;
-  let account: string | undefined;
-
-  if (interactive) {
-    const { partitions, defaultPartition } = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: 'Querying Slurm resources',
-        cancellable: false
-      },
-      async () => {
-        const partitionResult = await queryPartitions(loginHost, cfg);
-        return partitionResult;
+  if (result.didConnect) {
+    lastConnectionSessionKey = result.sessionKey;
+    lastConnectionSessionMode = result.sessionMode;
+    lastConnectionLoginHost = result.loginHost;
+    storeConnectionState({
+      alias: lastConnectionAlias,
+      sessionKey: lastConnectionSessionKey,
+      sessionMode: lastConnectionSessionMode,
+      loginHost: lastConnectionLoginHost
+    });
+    if (result.loginHost) {
+      const cachedHome = getCachedRemoteHome(result.loginHost);
+      if (!cachedHome) {
+        void fetchRemoteHomeNoPrompt(result.loginHost, cfg).then((home) => {
+          if (home) {
+            storeRemoteHome(result.loginHost || '', home);
+          }
+        });
       }
-    );
-
-    const partitionPick = await pickPartition(partitions, cfg.defaultPartition || defaultPartition);
-    if (partitionPick === null) {
-      return false;
     }
-    partition = partitionPick;
-    if (cancelAndReturn()) {
-      return false;
+  } else if (result.clearSessionState) {
+    lastConnectionSessionKey = undefined;
+    lastConnectionSessionMode = undefined;
+    lastConnectionLoginHost = undefined;
+  }
+  return result.didConnect;
+}
+
+function createClusterQueryRuntime(): ClusterQueryRuntime {
+  return {
+    getOutputChannel,
+    runSshCommand,
+    runSshCommandWithInput,
+    formatError,
+    showWarningMessage: (message) => {
+      void vscode.window.showWarningMessage(message);
+    },
+    getCachedClusterInfo,
+    cacheClusterInfo,
+    wrapPythonScriptCommand
+  };
+}
+
+function createClusterInfoMessageRuntime(): ClusterInfoMessageRuntime {
+  return {
+    ...createClusterQueryRuntime(),
+    buildOverridesFromUi,
+    getConfigWithOverrides,
+    parseListInput,
+    maybePromptForSshAuthOnConnect,
+    buildAgentStatusMessage,
+    showErrorMessage: (message) => {
+      void vscode.window.showErrorMessage(message);
     }
+  };
+}
 
-    qos = await pickOptionalValue('Select QoS (optional)', await querySimpleList(loginHost, cfg, cfg.qosCommand));
-    account = await pickOptionalValue(
-      'Select account (optional)',
-      await querySimpleList(loginHost, cfg, cfg.accountCommand)
-    );
-    if (cancelAndReturn()) {
-      return false;
+function createConnectFlowRuntime(): ConnectFlowRuntime {
+  return {
+    getOutputChannel,
+    formatError,
+    showErrorMessage: (message) => {
+      void vscode.window.showErrorMessage(message);
+    },
+    showWarningMessage: (message, ...items) => vscode.window.showWarningMessage(message, ...items),
+    showInputBox: (options) => vscode.window.showInputBox(options),
+    showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
+    withProgress: async (options, task) => await vscode.window.withProgress(options, () => task()),
+    runSshCommand,
+    maybePromptForSshAuthOnConnect,
+    queryPartitions: (loginHost, cfg) => queryPartitionsConnect(createClusterQueryRuntime(), loginHost, cfg),
+    querySimpleList: (loginHost, cfg, command) =>
+      querySimpleListConnect(createClusterQueryRuntime(), loginHost, cfg, command),
+    resolveDefaultPartitionForHost: (loginHost, cfg) =>
+      resolveDefaultPartitionForHostConnect(createClusterQueryRuntime(), loginHost, cfg),
+    resolvePartitionDefaultTimeForHost: (loginHost, partition, cfg) =>
+      resolvePartitionDefaultTimeForHostConnect(createClusterQueryRuntime(), loginHost, partition, cfg),
+    validateGpuRequestAgainstCachedClusterInfo: (loginHost, partition, gpuCount, gpuType) =>
+      validateGpuRequestAgainstCachedClusterInfoConnect(createClusterQueryRuntime(), loginHost, partition, gpuCount, gpuType),
+    resolveSessionKey,
+    getProxyInstallSnippet,
+    normalizeLocalProxyTunnelMode,
+    ensureRemoteSshSettings: (flowCfg) =>
+      (testEnsureRemoteSshSettingsOverride ?? ensureRemoteSshSettings)(flowCfg),
+    migrateStaleRemoteSshConfigIfNeeded,
+    resolveRemoteConfigContext,
+    ensureLocalProxyPlan,
+    buildRemoteCommand,
+    ensureSshAgentEnvForCurrentSsh,
+    resolveSshToolPath,
+    hasSshOption,
+    redactRemoteCommandForLog,
+    writeSlurmConnectIncludeFile,
+    ensureSshIncludeInstalled,
+    refreshRemoteSshHosts,
+    ensurePreSshCommand,
+    connectToHost: (alias, openInNewWindow, remoteWorkspacePath) =>
+      (testConnectToHostOverride ?? connectToHost)(alias, openInNewWindow, remoteWorkspacePath),
+    delay,
+    waitForRemoteConnectionOrTimeout,
+    resolveSshIdentityAgentOption,
+    getCurrentLocalProxyPort: () => localProxyState?.port ?? 0,
+    showOutput: () => {
+      getOutputChannel().show(true);
+    },
+    isConnectCancelled,
+    stopLocalProxyServer: () => {
+      stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: false });
     }
-  } else {
-    partition = cfg.defaultPartition || undefined;
-  }
+  };
+}
 
-  let nodes = cfg.defaultNodes;
-  let tasksPerNode = cfg.defaultTasksPerNode;
-  let cpusPerTask = cfg.defaultCpusPerTask;
-  let time = cfg.defaultTime;
-  let memoryMb = cfg.defaultMemoryMb;
-  let gpuType = cfg.defaultGpuType;
-  let gpuCount = cfg.defaultGpuCount;
-
-  if (interactive) {
-    const nodesInput = await promptNumber('Nodes', cfg.defaultNodes, 1);
-    if (nodesInput === undefined) {
-      return false;
-    }
-    nodes = nodesInput;
-    if (cancelAndReturn()) {
-      return false;
-    }
-
-    const tasksInput = await promptNumber('Tasks per node', cfg.defaultTasksPerNode, 1);
-    if (tasksInput === undefined) {
-      return false;
-    }
-    tasksPerNode = tasksInput;
-    if (cancelAndReturn()) {
-      return false;
-    }
-
-    const cpusInput = await promptNumber('CPUs per task', cfg.defaultCpusPerTask, 1);
-    if (cpusInput === undefined) {
-      return false;
-    }
-    cpusPerTask = cpusInput;
-    if (cancelAndReturn()) {
-      return false;
-    }
-
-    const timeInput = await promptTime('Wall time', cfg.defaultTime || '24:00:00');
-    if (timeInput === undefined) {
-      return false;
-    }
-    time = timeInput;
-    if (cancelAndReturn()) {
-      return false;
-    }
-  }
-
-  if (!partition || partition.trim().length === 0) {
-    const resolvedPartition = await resolveDefaultPartitionForHost(loginHost, cfg);
-    if (resolvedPartition) {
-      partition = resolvedPartition;
-      log.appendLine(`Using default partition: ${partition}`);
-    }
-  }
-  if (cancelAndReturn()) {
-    return false;
-  }
-
-  if (!time || time.trim().length === 0) {
-    const resolvedTime = await resolvePartitionDefaultTimeForHost(loginHost, partition, cfg);
-    if (resolvedTime) {
-      time = resolvedTime;
-      log.appendLine(`Using partition default time: ${time}`);
-    } else {
-      time = '24:00:00';
-      log.appendLine(`No partition default time found; using fallback wall time: ${time}`);
-    }
-  }
-  if (cancelAndReturn()) {
-    return false;
-  }
-
-  let extraArgs: string[] = [];
-  if (interactive && cfg.promptForExtraSallocArgs) {
-    const extra = await vscode.window.showInputBox({
-      title: 'Extra salloc args (optional)',
-      prompt: 'Example: --gres=gpu:1 --mem=32G',
-      placeHolder: '--gres=gpu:1'
-    });
-    if (extra && extra.trim().length > 0) {
-      extraArgs = splitArgs(extra.trim());
-    }
-  }
-  if (cancelAndReturn()) {
-    return false;
-  }
-
-  const gpuValidation = validateGpuRequestAgainstCachedClusterInfo(loginHost, partition, gpuCount, gpuType);
-  if (gpuValidation.note) {
-    log.appendLine(gpuValidation.note);
-  }
-  if (gpuValidation.blocked) {
-    const message = gpuValidation.message || 'GPU request is incompatible with the selected partition.';
-    log.appendLine(message);
-    void vscode.window.showErrorMessage(message);
-    return false;
-  }
-
-  const sallocArgs = buildSallocArgs({
-    partition,
-    nodes,
-    tasksPerNode,
-    cpusPerTask,
-    time,
-    memoryMb,
-    gpuType,
-    gpuCount,
-    qos,
-    account
-  });
-
-  const defaultAlias = buildDefaultAlias(cfg.sshHostPrefix || 'slurm', loginHost, partition, nodes, cpusPerTask);
-  const aliasOverride = options?.aliasOverride ? options.aliasOverride.trim() : '';
-  let alias = aliasOverride || defaultAlias;
-  if (interactive && !aliasOverride) {
-    const aliasInput = await vscode.window.showInputBox({
-      title: 'SSH host alias',
-      value: defaultAlias,
-      prompt: 'This name will appear in your SSH config and Remote-SSH hosts list.',
-      validateInput: (value) => (value.trim().length === 0 ? 'Alias is required.' : undefined)
-    });
-    if (!aliasInput) {
-      return false;
-    }
-    alias = aliasInput.trim();
-  }
-  if (cancelAndReturn()) {
-    return false;
-  }
-  if (!alias) {
-    alias = defaultAlias;
-  }
-
-  lastConnectionAlias = alias.trim();
-
-  const sessionKey = resolveSessionKey(cfg, alias.trim());
-  const clientId = vscode.env.sessionId || '';
-  const installSnippet = await getProxyInstallSnippet(cfg);
-  const tunnelMode = normalizeLocalProxyTunnelMode(cfg.localProxyTunnelMode || 'remoteSsh');
-  const shouldRetryProxyPort = cfg.localProxyEnabled && tunnelMode === 'remoteSsh';
-  const maxProxyPortAttempts = shouldRetryProxyPort ? 3 : 1;
-  let proxyPortCandidates: number[] = [];
-  let localProxyPlan: LocalProxyPlan = { enabled: false };
-
-  const ensureRemoteSshSettingsFn = testEnsureRemoteSshSettingsOverride ?? ensureRemoteSshSettings;
-  await ensureRemoteSshSettingsFn(cfg);
-  if (cancelAndReturn()) {
-    return false;
-  }
-  await migrateStaleRemoteSshConfigIfNeeded();
-  if (cancelAndReturn()) {
-    return false;
-  }
+async function resolveRemoteConfigContext(cfg: SlurmConnectConfig): Promise<{
+  baseConfigPath: string;
+  includePath: string;
+  includeFilePath: string;
+}> {
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  const currentRemoteConfig = testRemoteSshConfigPathOverride || normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
+  const currentRemoteConfig =
+    testRemoteSshConfigPathOverride || normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
   const baseConfigPath = normalizeSshPath(currentRemoteConfig || defaultSshConfigPath());
   if (!currentRemoteConfig) {
     try {
       await fs.access(baseConfigPath);
     } catch {
-      log.appendLine(`SSH config not found at ${baseConfigPath}; creating.`);
+      getOutputChannel().appendLine(`SSH config not found at ${baseConfigPath}; creating.`);
     }
   }
   const includePath = resolveSlurmConnectIncludePath(cfg);
   const includeFilePath = resolveSlurmConnectIncludeFilePath(cfg);
-  if (normalizeSshPath(baseConfigPath) === includeFilePath) {
-    const message = 'Slurm Connect include file path must not be the same as the SSH config path.';
-    log.appendLine(message);
-    void vscode.window.showErrorMessage(message);
-    return false;
-  }
-  if (cancelAndReturn()) {
-    return false;
-  }
-
-  let preSshReady = false;
-  let connected = false;
-  for (let attempt = 0; attempt < maxProxyPortAttempts; attempt += 1) {
-    if (cancelAndReturn()) {
-      return false;
-    }
-    const overridePort =
-      shouldRetryProxyPort && proxyPortCandidates.length > 0 ? proxyPortCandidates[attempt] : undefined;
-    try {
-      localProxyPlan = await ensureLocalProxyPlan(cfg, loginHost, { remotePortOverride: overridePort });
-    } catch (error) {
-      if (!wasCancelled()) {
-        const message = `Failed to start local proxy: ${formatError(error)}`;
-        log.appendLine(message);
-        void vscode.window.showErrorMessage(message);
-      }
-      return false;
-    }
-    if (cancelAndReturn()) {
-      return false;
-    }
-    if (shouldRetryProxyPort && proxyPortCandidates.length === 0) {
-      const basePort = localProxyState?.port ?? 0;
-      proxyPortCandidates = buildLocalProxyRemotePortCandidates(basePort, maxProxyPortAttempts);
-    }
-    const localProxyEnv =
-      localProxyPlan.enabled && localProxyPlan.proxyUrl && !localProxyPlan.computeTunnel
-        ? { proxyUrl: localProxyPlan.proxyUrl, noProxy: localProxyPlan.noProxy }
-        : undefined;
-    const remoteCommand = buildRemoteCommand(
-      cfg,
-      [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs],
-      sessionKey,
-      clientId,
-      installSnippet,
-      localProxyEnv,
-      localProxyPlan
-    );
-    if (!remoteCommand) {
-      if (!wasCancelled()) {
-        void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
-      }
-      return false;
-    }
-    if (cancelAndReturn()) {
-      return false;
-    }
-
-    await ensureSshAgentEnvForCurrentSsh();
-    const additionalSshOptions: Record<string, string> = { ...(cfg.additionalSshOptions || {}) };
-    if (process.platform === 'win32') {
-      const sshPath = await resolveSshToolPath('ssh');
-      const sock = process.env.SSH_AUTH_SOCK || '';
-      if (sock && isGitSshPath(sshPath) && !hasSshOption(additionalSshOptions, 'IdentityAgent')) {
-        additionalSshOptions.IdentityAgent = sock;
-      }
-    }
-
-    const hostEntry = buildHostEntry(
-      alias.trim(),
-      loginHost,
-      { ...cfg, additionalSshOptions, extraSshOptions: localProxyPlan.sshOptions },
-      remoteCommand
-    );
-    log.appendLine('Generated SSH host entry:');
-    log.appendLine(redactRemoteCommandForLog(hostEntry));
-
-    try {
-      await writeSlurmConnectIncludeFile(hostEntry, includeFilePath);
-      const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
-      log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
-    } catch (error) {
-      if (!wasCancelled()) {
-        const message = `Failed to install SSH Include block: ${formatError(error)}`;
-        log.appendLine(message);
-        void vscode.window.showErrorMessage(message);
-      }
-      return false;
-    }
-    if (cancelAndReturn()) {
-      return false;
-    }
-    await delay(300);
-    await refreshRemoteSshHosts();
-    if (cancelAndReturn()) {
-      return false;
-    }
-
-    if (!preSshReady) {
-      try {
-        await ensurePreSshCommand(cfg, `Remote-SSH connect to ${alias.trim()}`);
-      } catch (error) {
-        if (!wasCancelled()) {
-          const message = `Pre-SSH command failed: ${formatError(error)}`;
-          log.appendLine(message);
-          void vscode.window.showErrorMessage(message);
-        }
-        return false;
-      }
-      preSshReady = true;
-    }
-    if (cancelAndReturn()) {
-      return false;
-    }
-
-    const connectToHostFn = testConnectToHostOverride ?? connectToHost;
-    connected = await connectToHostFn(
-      alias.trim(),
-      cfg.openInNewWindow,
-      cfg.remoteWorkspacePath
-    );
-    if (cancelAndReturn()) {
-      return false;
-    }
-    if (connected) {
-      break;
-    }
-    if (shouldRetryProxyPort && attempt < maxProxyPortAttempts - 1) {
-      const nextPort = proxyPortCandidates[attempt + 1];
-      const message = nextPort
-        ? `Remote-SSH connect failed; retrying local proxy forward on port ${nextPort}.`
-        : 'Remote-SSH connect failed; retrying with an alternate local proxy port.';
-      log.appendLine(message);
-    }
-  }
-  didConnect = connected;
-    if (connected) {
-      lastConnectionSessionKey = sessionKey || undefined;
-      lastConnectionSessionMode = cfg.sessionMode;
-      lastConnectionLoginHost = loginHost;
-      storeConnectionState({
-        alias: lastConnectionAlias,
-        sessionKey: lastConnectionSessionKey,
-        sessionMode: lastConnectionSessionMode,
-        loginHost: lastConnectionLoginHost
-      });
-      if (loginHost) {
-        const cachedHome = getCachedRemoteHome(loginHost);
-        if (!cachedHome) {
-          void fetchRemoteHomeNoPrompt(loginHost, cfg).then((home) => {
-            if (home) {
-              storeRemoteHome(loginHost, home);
-            }
-          });
-        }
-      }
-    } else {
-      lastConnectionSessionKey = undefined;
-      lastConnectionSessionMode = undefined;
-      lastConnectionLoginHost = undefined;
-    }
-  if (!connected) {
-    if (!wasCancelled()) {
-      void vscode.window.showWarningMessage(
-        `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
-        'Show Output'
-      ).then((selection) => {
-        if (selection === 'Show Output') {
-          getOutputChannel().show(true);
-        }
-      });
-    }
-    return didConnect;
-  }
-  if (cfg.openInNewWindow) {
-    return didConnect;
-  }
-  await waitForRemoteConnectionOrTimeout(30_000, 500);
-
-  return didConnect;
+  return { baseConfigPath, includePath, includeFilePath };
 }
 
-async function resolveLoginHosts(
-  cfg: SlurmConnectConfig,
-  options?: { interactive?: boolean }
-): Promise<string[]> {
-  const interactive = options?.interactive !== false;
-  const log = getOutputChannel();
-  let hosts = cfg.loginHosts.slice();
-  if (cfg.loginHostsCommand) {
-    let queryHost: string | undefined = cfg.loginHostsQueryHost || hosts[0];
-    if (!queryHost && interactive) {
-      queryHost = await vscode.window.showInputBox({
-        title: 'Login host for discovery',
-        prompt: 'Enter a login host to run the loginHostsCommand on.'
-      });
-    }
-    if (!queryHost && !interactive) {
-      log.appendLine('Login host discovery skipped (no query host and prompts disabled).');
-    }
-    if (queryHost) {
-      try {
-        const output = await runSshCommand(queryHost, cfg, cfg.loginHostsCommand);
-        const discovered = parseSimpleList(output);
-        if (discovered.length > 0) {
-          hosts = discovered;
-        }
-      } catch (error) {
-        void vscode.window.showWarningMessage(`Failed to query login hosts: ${formatError(error)}`);
-      }
-    }
-  }
-
-  hosts = uniqueList(hosts);
-  if (hosts.length === 0 && interactive) {
-    const manual = await vscode.window.showInputBox({
-      title: 'Login host',
-      prompt: 'Enter a login host'
-    });
-    if (manual) {
-      hosts = [manual.trim()];
-    }
-  }
-  if (hosts.length === 0 && !interactive) {
-    log.appendLine('No login hosts available and prompts are disabled.');
-  }
-  return hosts;
-}
-
-async function queryPartitions(loginHost: string, cfg: SlurmConnectConfig): Promise<PartitionResult> {
-  if (!cfg.partitionCommand) {
-    return { partitions: [] };
-  }
-  try {
-    const output = await runSshCommand(loginHost, cfg, cfg.partitionCommand);
-    return parsePartitionOutput(output);
-  } catch (error) {
-    void vscode.window.showWarningMessage(`Failed to query partitions: ${formatError(error)}`);
-    return { partitions: [] };
-  }
-}
-
-async function querySimpleList(loginHost: string, cfg: SlurmConnectConfig, command: string): Promise<string[]> {
-  if (!command) {
-    return [];
-  }
-  try {
-    const output = await runSshCommand(loginHost, cfg, command);
-    return parseSimpleList(output);
-  } catch (error) {
-    void vscode.window.showWarningMessage(`Failed to query resources: ${formatError(error)}`);
-    return [];
-  }
-}
-
-async function queryAvailableModules(loginHost: string, cfg: SlurmConnectConfig): Promise<string[]> {
-  const log = getOutputChannel();
-  const commands = [
-    'module -t avail 2>&1',
-    'bash -lc "module -t avail 2>&1"'
-  ];
-
-  for (const command of commands) {
-    try {
-      log.appendLine(`Module list command: ${command}`);
-      const output = await runSshCommand(loginHost, cfg, command);
-      const modules = parseModulesOutput(output);
-      if (modules.length > 0) {
-        return modules;
-      }
-    } catch (error) {
-      log.appendLine(`Module list command failed: ${formatError(error)}`);
-    }
-  }
-  return [];
-}
-
-type PartitionDefaults = {
-  defaultTime?: string;
-  defaultNodes?: number;
-  defaultTasksPerNode?: number;
-  defaultCpusPerTask?: number;
-  defaultMemoryMb?: number;
-  defaultGpuType?: string;
-  defaultGpuCount?: number;
-};
-
-function mergePartitionDefaults(
-  base: Record<string, PartitionDefaults>,
-  incoming: Record<string, PartitionDefaults>
-): Record<string, PartitionDefaults> {
-  const merged: Record<string, PartitionDefaults> = { ...base };
-  for (const [name, defaults] of Object.entries(incoming)) {
-    if (!merged[name]) {
-      merged[name] = { ...defaults };
-      continue;
-    }
-    const existing = merged[name] as Record<string, unknown>;
-    for (const [key, value] of Object.entries(defaults)) {
-      if (value !== undefined) {
-        existing[key] = value;
-      }
-    }
-  }
-  return merged;
-}
-
-function applyPartitionDefaultTimes(info: ClusterInfo, defaults: Record<string, PartitionDefaults>): void {
-  if (!info.partitions || info.partitions.length === 0) {
-    return;
-  }
-  for (const partition of info.partitions) {
-    const entry = defaults[partition.name];
-    if (!entry) {
-      continue;
-    }
-    if (entry.defaultTime) {
-      partition.defaultTime = entry.defaultTime;
-    }
-    if (entry.defaultNodes !== undefined) {
-      partition.defaultNodes = entry.defaultNodes;
-    }
-    if (entry.defaultTasksPerNode !== undefined) {
-      partition.defaultTasksPerNode = entry.defaultTasksPerNode;
-    }
-    if (entry.defaultCpusPerTask !== undefined) {
-      partition.defaultCpusPerTask = entry.defaultCpusPerTask;
-    }
-    if (entry.defaultMemoryMb !== undefined) {
-      partition.defaultMemoryMb = entry.defaultMemoryMb;
-    }
-    if (entry.defaultGpuType !== undefined) {
-      partition.defaultGpuType = entry.defaultGpuType;
-    }
-    if (entry.defaultGpuCount !== undefined) {
-      partition.defaultGpuCount = entry.defaultGpuCount;
-    }
-  }
-}
-
-function resolveDefaultPartitionName(info: ClusterInfo): string | undefined {
-  if (info.defaultPartition) {
-    return info.defaultPartition;
-  }
-  const flagged = info.partitions.find((partition) => partition.isDefault);
-  return flagged ? flagged.name : undefined;
-}
-
-function resolvePartitionDefaultTime(info: ClusterInfo, partition?: string): string | undefined {
-  const effective = partition || resolveDefaultPartitionName(info);
-  if (!effective) {
+function resolveSshIdentityAgentOption(sshPath: string): string | undefined {
+  const sock = process.env.SSH_AUTH_SOCK || '';
+  if (!sock || !isGitSshPath(sshPath)) {
     return undefined;
   }
-  const match = info.partitions.find((item) => item.name === effective);
-  return match?.defaultTime;
-}
-
-async function resolveDefaultPartitionForHost(
-  loginHost: string,
-  cfg: SlurmConnectConfig
-): Promise<string | undefined> {
-  const cached = getCachedClusterInfo(loginHost)?.info;
-  if (cached) {
-    const cachedPartition = resolveDefaultPartitionName(cached);
-    if (cachedPartition) {
-      return cachedPartition;
-    }
-  }
-  try {
-    const info = await fetchClusterInfo(loginHost, cfg);
-    cacheClusterInfo(loginHost, info);
-    return resolveDefaultPartitionName(info);
-  } catch (error) {
-    getOutputChannel().appendLine(`Failed to resolve default partition: ${formatError(error)}`);
-    return undefined;
-  }
-}
-
-async function resolvePartitionDefaultTimeForHost(
-  loginHost: string,
-  partition: string | undefined,
-  cfg: SlurmConnectConfig
-): Promise<string | undefined> {
-  const cached = getCachedClusterInfo(loginHost)?.info;
-  if (cached) {
-    const cachedTime = resolvePartitionDefaultTime(cached, partition);
-    if (cachedTime) {
-      return cachedTime;
-    }
-  }
-  try {
-    const info = await fetchClusterInfo(loginHost, cfg);
-    cacheClusterInfo(loginHost, info);
-    return resolvePartitionDefaultTime(info, partition);
-  } catch (error) {
-    getOutputChannel().appendLine(`Failed to resolve partition default time: ${formatError(error)}`);
-    return undefined;
-  }
-}
-
-interface CachedGpuValidationResult {
-  blocked: boolean;
-  message?: string;
-  note?: string;
-}
-
-function validateGpuRequestAgainstCachedClusterInfo(
-  loginHost: string,
-  partition: string | undefined,
-  gpuCount: number,
-  gpuType?: string
-): CachedGpuValidationResult {
-  if (!Number.isFinite(gpuCount) || gpuCount <= 0) {
-    return { blocked: false };
-  }
-  const cachedInfo = getCachedClusterInfo(loginHost)?.info;
-  if (!cachedInfo || !Array.isArray(cachedInfo.partitions) || cachedInfo.partitions.length === 0) {
-    return {
-      blocked: false,
-      note: `GPU validation skipped for ${loginHost}: no cached cluster info.`
-    };
-  }
-  const requestedPartition = (partition || '').trim();
-  const effectivePartition = requestedPartition || resolveDefaultPartitionName(cachedInfo);
-  if (!effectivePartition) {
-    return {
-      blocked: false,
-      note: `GPU validation skipped for ${loginHost}: partition is not set and no default partition was found in cache.`
-    };
-  }
-  const partitionInfo = cachedInfo.partitions.find((entry) => entry.name === effectivePartition);
-  if (!partitionInfo) {
-    return {
-      blocked: false,
-      note: `GPU validation skipped for ${loginHost}: partition "${effectivePartition}" not found in cached cluster info.`
-    };
-  }
-  if (partitionInfo.gpuMax > 0) {
-    return { blocked: false };
-  }
-  const requestedType = (gpuType || '').trim();
-  const resourceText = requestedType ? `GPU type "${requestedType}"` : 'GPU resources';
-  return {
-    blocked: true,
-    message:
-      `Partition "${effectivePartition}" does not advertise GPUs in cached cluster info, ` +
-      `but this request asks for ${gpuCount} ${resourceText}. ` +
-      'Set GPU count to 0 or choose a GPU partition.'
-  };
-}
-
-async function fetchExistingSessions(loginHost: string, cfg: SlurmConnectConfig): Promise<SessionSummary[]> {
-  const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
-  const command = buildSessionQueryCommand(stateDir);
-  const output = await runSshCommand(loginHost, cfg, command);
-  const sessions = parseSessionListOutput(output);
-  return applySessionIdleInfo(sessions);
-}
-
-async function fetchClusterInfoWithSessions(
-  loginHost: string,
-  cfg: SlurmConnectConfig
-): Promise<{ info: ClusterInfo; sessions: SessionSummary[] }> {
-  const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg);
-  const log = getOutputChannel();
-  const sessionsScript = buildSessionQueryScript(cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR);
-  const combinedScript = buildCombinedClusterInfoScript(commands, sessionsScript);
-  log.appendLine(`Cluster info single-call (with sessions) script bytes: ${combinedScript.length}`);
-  const output = await runSshCommandWithInput(loginHost, cfg, 'bash -s', combinedScript);
-  const { commandOutputs, modulesOutput, sessionsOutput } = parseCombinedClusterInfoOutput(output, commands.length);
-  const info = buildClusterInfoFromOutputs(commandOutputs, modulesOutput, freeResourceIndexes);
-  const sessions = applySessionIdleInfo(parseSessionListOutput(sessionsOutput));
-  return { info, sessions };
-}
-
-function buildSessionQueryScript(stateDir: string): string {
-  const dirLiteral = JSON.stringify(stateDir);
-  return [
-    'import json, os, subprocess, sys, re, time',
-    `state_dir = os.path.expanduser(${dirLiteral})`,
-    'sessions_dir = os.path.join(state_dir, "sessions")',
-    'if not os.path.isdir(sessions_dir):',
-    '    print("[]")',
-    '    sys.exit(0)',
-    'session_key_re = re.compile(r"[^A-Za-z0-9_.-]+")',
-    'def sanitize(value):',
-    '    trimmed = (value or "").strip()',
-    '    if not trimmed:',
-    '        return "default"',
-    '    sanitized = session_key_re.sub("-", trimmed).strip(".-")',
-    '    return sanitized[:64] if sanitized else "default"',
-    'try:',
-    '    user = os.environ.get("USER") or subprocess.check_output(["id", "-un"], text=True).strip()',
-    'except Exception:',
-    '    user = None',
-    'safe_user = sanitize(user or "unknown")',
-    'state_map = {}',
-    'job_ids = []',
-    'try:',
-    '    cmd = ["squeue", "-h", "-o", "%i|%T|%j"]',
-    '    if user:',
-    '        cmd[2:2] = ["-u", user]',
-    '    output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)',
-    '    for line in output.splitlines():',
-    '        parts = line.split("|", 2)',
-    '        if len(parts) >= 2:',
-    '            job_id = parts[0].strip()',
-    '            state = parts[1].strip()',
-    '            job_name = parts[2].strip() if len(parts) > 2 else ""',
-    '            if job_id:',
-    '                state_map[job_id] = {"state": state, "jobName": job_name}',
-    '                job_ids.append(job_id)',
-    'except Exception:',
-    '    pass',
-    'job_details = {}',
-    'if job_ids:',
-    '    try:',
-    '        detail_out = subprocess.check_output(["scontrol", "show", "job", "-o"] + job_ids, text=True, stderr=subprocess.DEVNULL)',
-    '        for line in detail_out.splitlines():',
-    '            fields = {}',
-    '            for token in line.split():',
-    '                if "=" not in token:',
-    '                    continue',
-    '                key, value = token.split("=", 1)',
-    '                fields[key] = value',
-    '            job_id = fields.get("JobId") or fields.get("JobID")',
-    '            if not job_id:',
-    '                continue',
-    '            detail = {}',
-    '            if fields.get("Partition"):',
-    '                detail["partition"] = fields.get("Partition")',
-    '            if fields.get("NumNodes"):',
-    '                detail["nodes"] = fields.get("NumNodes")',
-    '            if fields.get("NumCPUs"):',
-    '                detail["cpus"] = fields.get("NumCPUs")',
-    '            if fields.get("TimeLimit"):',
-    '                detail["timeLimit"] = fields.get("TimeLimit")',
-    '            if detail:',
-    '                job_details[job_id] = detail',
-    '    except Exception:',
-    '        pass',
-    'session_dirs = []',
-    'user_root = os.path.join(sessions_dir, safe_user)',
-    'if os.path.isdir(user_root):',
-    '    for entry in sorted(os.listdir(user_root)):',
-    '        session_dirs.append((entry, os.path.join(user_root, entry)))',
-    'for entry in sorted(os.listdir(sessions_dir)):',
-    '    path = os.path.join(sessions_dir, entry)',
-    '    job_path = os.path.join(path, "job.json")',
-    '    if not os.path.isfile(job_path):',
-    '        continue',
-    '    session_dirs.append((entry, path))',
-    'sessions = []',
-    'seen_job_ids = set()',
-    'for entry, session_dir in session_dirs:',
-    '    job_path = os.path.join(session_dir, "job.json")',
-    '    if not os.path.isfile(job_path):',
-    '        continue',
-    '    try:',
-    '        with open(job_path, "r") as handle:',
-    '            data = json.load(handle)',
-    '    except Exception:',
-    '        continue',
-    '    job_id = str(data.get("job_id", "")).strip()',
-    '    if not job_id:',
-    '        continue',
-    '    if job_id in seen_job_ids:',
-    '        continue',
-    '    info = state_map.get(job_id)',
-    '    if not info:',
-    '        continue',
-    '    seen_job_ids.add(job_id)',
-    '    detail = job_details.get(job_id, {})',
-    '    clients_dir = os.path.join(session_dir, "clients")',
-    '    client_ids = set()',
-    '    now = time.time()',
-    '    try:',
-    '        raw_stale = data.get("stale_seconds")',
-    '        stale_seconds = int(raw_stale) if raw_stale is not None else 90',
-    '    except Exception:',
-    '        stale_seconds = 90',
-    '    try:',
-    '        if os.path.isdir(clients_dir):',
-    '            for name in os.listdir(clients_dir):',
-    '                path = os.path.join(clients_dir, name)',
-    '                if not os.path.isfile(path):',
-    '                    continue',
-    '                if stale_seconds > 0:',
-    '                    try:',
-    '                        age = now - os.path.getmtime(path)',
-    '                        if age > stale_seconds:',
-    '                            continue',
-    '                    except Exception:',
-    '                        pass',
-    '                client_key = name',
-    '                if name.startswith("client-"):',
-    '                    prefix = name.split(".", 1)[0]',
-    '                    client_key = prefix[7:] if len(prefix) > 7 else name',
-    '                client_ids.add(client_key)',
-    '    except Exception:',
-    '        client_ids = set()',
-    '    last_seen = ""',
-    '    last_seen_path = os.path.join(session_dir, "last_seen")',
-    '    if os.path.isfile(last_seen_path):',
-    '        try:',
-    '            with open(last_seen_path, "r") as handle:',
-    '                last_seen = handle.read().strip()',
-    '        except Exception:',
-    '            last_seen = ""',
-    '    sessions.append({',
-    '        "sessionKey": str(data.get("session_key") or entry),',
-    '        "jobId": job_id,',
-    '        "state": info.get("state", ""),',
-    '        "jobName": (info.get("jobName") or data.get("job_name") or ""),',
-    '        "createdAt": str(data.get("created_at") or ""),',
-    '        "clients": len(client_ids),',
-    '        "lastSeen": last_seen,',
-    '        "idleTimeoutSeconds": data.get("idle_timeout_seconds", ""),',
-    '        "partition": detail.get("partition", ""),',
-    '        "nodes": detail.get("nodes", ""),',
-    '        "cpus": detail.get("cpus", ""),',
-    '        "timeLimit": detail.get("timeLimit", "")',
-    '    })',
-    'print(json.dumps(sessions))'
-  ].join('\n');
-}
-
-function buildSessionQueryCommand(stateDir: string): string {
-  const script = buildSessionQueryScript(stateDir);
-  const encodedScript = Buffer.from(script, 'utf8').toString('base64');
-  return wrapPythonScriptCommand(encodedScript, '"[]"');
-}
-
-function parseSessionListOutput(output: string): SessionSummary[] {
-  return parseSessionListOutputUtil(output);
-}
-
-function applySessionIdleInfo(sessions: SessionSummary[]): SessionSummary[] {
-  return applySessionIdleInfoUtil(sessions);
+  return sock;
 }
 
 async function handleClusterInfoRequest(values: Partial<UiValues>, webview: vscode.Webview): Promise<void> {
@@ -2379,331 +1591,12 @@ async function handleClusterInfoRequest(values: Partial<UiValues>, webview: vsco
     return;
   }
   clusterInfoRequestInFlight = true;
-  const overrides = buildOverridesFromUi(values);
-  const cfg = getConfigWithOverrides(overrides);
-  const loginHosts = parseListInput(String(values.loginHosts ?? ''));
-  const log = getOutputChannel();
-  let sessions: SessionSummary[] = [];
-
   try {
-    if (loginHosts.length === 0) {
-      const message = 'Enter a login host before fetching cluster info.';
-      void vscode.window.showErrorMessage(message);
-      const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
-      webview.postMessage({
-        command: 'clusterInfoError',
-        message,
-        sessions: [],
-        agentStatus: agentStatus.text,
-        agentStatusError: agentStatus.isError
-      });
-      return;
-    }
-
-    const loginHost = loginHosts[0];
-    log.appendLine(`Fetching cluster info from ${loginHost}...`);
-    const proceed = await maybePromptForSshAuthOnConnect(cfg, loginHost);
-    if (!proceed) {
-      const message = 'Set an SSH identity file in the Slurm Connect view, then retry.';
-      const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
-      webview.postMessage({
-        command: 'clusterInfoError',
-        message,
-        sessions: [],
-        agentStatus: agentStatus.text,
-        agentStatusError: agentStatus.isError
-      });
-      return;
-    }
-
-    let info: ClusterInfo;
-    try {
-      const result = await fetchClusterInfoWithSessions(loginHost, cfg);
-      info = result.info;
-      sessions = result.sessions;
-    } catch (error) {
-      log.appendLine(`Single-call cluster info failed, falling back. ${formatError(error)}`);
-      info = await fetchClusterInfo(loginHost, cfg);
-    }
-    cacheClusterInfo(loginHost, info);
-    const cached = getCachedClusterInfo(loginHost);
-    const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
-    webview.postMessage({
-      command: 'clusterInfo',
-      info,
-      sessions,
-      fetchedAt: cached?.fetchedAt,
-      agentStatus: agentStatus.text,
-      agentStatusError: agentStatus.isError
-    });
-  } catch (error) {
-    const message = formatError(error);
-    void vscode.window.showErrorMessage(`Failed to fetch cluster info: ${message}`);
-    const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
-    webview.postMessage({
-      command: 'clusterInfoError',
-      message,
-      sessions,
-      agentStatus: agentStatus.text,
-      agentStatusError: agentStatus.isError
-    });
+    const message = await buildClusterInfoWebviewMessage(createClusterInfoMessageRuntime(), values);
+    await webview.postMessage(message);
   } finally {
     clusterInfoRequestInFlight = false;
   }
-}
-
-async function fetchClusterInfo(loginHost: string, cfg: SlurmConnectConfig): Promise<ClusterInfo> {
-  const { commands, freeResourceIndexes } = buildClusterInfoCommandSet(cfg);
-
-  const log = getOutputChannel();
-  let info: ClusterInfo | undefined;
-  try {
-    info = await fetchClusterInfoSingleCall(loginHost, cfg, commands, freeResourceIndexes);
-  } catch (error) {
-    log.appendLine(`Single-call cluster info failed, falling back. ${formatError(error)}`);
-  }
-
-  if (!info) {
-    let lastInfo: ClusterInfo = { partitions: [] };
-    let bestInfo: ClusterInfo | undefined;
-    let partitionDefaults: Record<string, PartitionDefaults> = {};
-    let defaultPartitionFromScontrol: string | undefined;
-    const fallbackCommands = commands.slice(0, freeResourceIndexes.infoCommandCount);
-    for (const command of fallbackCommands) {
-      log.appendLine(`Cluster info command: ${command}`);
-      const output = await runSshCommand(loginHost, cfg, command);
-      const defaultsResult = parsePartitionDefaultTimesOutput(output);
-      if (Object.keys(defaultsResult.defaults).length > 0 || defaultsResult.defaultPartition) {
-        partitionDefaults = mergePartitionDefaults(partitionDefaults, defaultsResult.defaults);
-        if (!defaultPartitionFromScontrol && defaultsResult.defaultPartition) {
-          defaultPartitionFromScontrol = defaultsResult.defaultPartition;
-        }
-        continue;
-      }
-      const parsed = parsePartitionInfoOutput(output);
-      lastInfo = parsed;
-      const maxFields = getMaxFieldCount(output);
-      const outputHasGpu = output.includes('gpu:');
-      const hasGpu = parsed.partitions.some((partition) => partition.gpuMax > 0);
-      log.appendLine(
-        `Cluster info fields: ${maxFields}, partitions: ${parsed.partitions.length}, outputHasGpu: ${outputHasGpu}, hasGpu: ${hasGpu}`
-      );
-      if (outputHasGpu && !hasGpu) {
-        log.appendLine('GPU data present but parse yielded none; trying next command.');
-        continue;
-      }
-      if (maxFields < 5) {
-        continue;
-      }
-      if (hasMeaningfulClusterInfo(parsed)) {
-        bestInfo = parsed;
-        break;
-      }
-    }
-    info = bestInfo ?? lastInfo;
-    const modules = await queryAvailableModules(loginHost, cfg);
-    info.modules = modules;
-    if (defaultPartitionFromScontrol && !info.defaultPartition) {
-      info.defaultPartition = defaultPartitionFromScontrol;
-    }
-    applyPartitionDefaultTimes(info, partitionDefaults);
-    if (cfg.filterFreeResources) {
-      log.appendLine('Free resource filtering skipped because cluster info used the multi-call fallback.');
-    }
-  }
-
-  return info;
-}
-
-const CLUSTER_CMD_START = '__SC_CMD_START__';
-const CLUSTER_CMD_END = '__SC_CMD_END__';
-const CLUSTER_MODULES_START = '__SC_MODULES_START__';
-const CLUSTER_MODULES_END = '__SC_MODULES_END__';
-const CLUSTER_SESSIONS_START = '__SC_SESSIONS_START__';
-const CLUSTER_SESSIONS_END = '__SC_SESSIONS_END__';
-
-function buildCombinedClusterInfoScript(
-  commands: string[],
-  sessionsScript?: string
-): string {
-  const encodedCommands = commands.map((command) => Buffer.from(command, 'utf8').toString('base64'));
-  const commandArray = encodedCommands.map((encoded) => `'${encoded}'`).join(' ');
-  const sessionLines: string[] = [];
-  if (sessionsScript) {
-    const encodedSessions = Buffer.from(sessionsScript, 'utf8').toString('base64');
-    sessionLines.push(`echo "${CLUSTER_SESSIONS_START}"`);
-    sessionLines.push('PYTHON=$(command -v python3 || command -v python || true)');
-    sessionLines.push('if [ -z "$PYTHON" ]; then');
-    sessionLines.push('  echo "[]"');
-    sessionLines.push('else');
-    sessionLines.push(`  printf %s ${encodedSessions} | base64 -d | "$PYTHON" -`);
-    sessionLines.push('fi');
-    sessionLines.push(`echo "${CLUSTER_SESSIONS_END}"`);
-  }
-  const script = [
-    'set +e',
-    `cmds=(${commandArray})`,
-    'i=0',
-    'for b64 in "${cmds[@]}"; do',
-    `  echo "${CLUSTER_CMD_START}\${i}__"`,
-    '  cmd=$(printf %s "$b64" | base64 -d)',
-    '  eval "$cmd"',
-    `  echo "${CLUSTER_CMD_END}\${i}__"`,
-    '  i=$((i+1))',
-    'done',
-    ...sessionLines,
-    `echo "${CLUSTER_MODULES_START}"`,
-    'modules=$(module -t avail 2>&1)',
-    'status=$?',
-    'if [ $status -ne 0 ] || echo "$modules" | grep -qi "command not found\\|module: not found"; then',
-    '  modules=$(bash -lc "module -t avail 2>&1")',
-    'fi',
-    'printf "%s\\n" "$modules"',
-    `echo "${CLUSTER_MODULES_END}"`
-  ].join('\n');
-
-  return script;
-}
-
-function parseCombinedClusterInfoOutput(
-  output: string,
-  commandCount: number
-): { commandOutputs: string[]; modulesOutput: string; sessionsOutput: string } {
-  const commandOutputs: string[] = Array.from({ length: commandCount }, () => '');
-  let currentIndex: number | null = null;
-  let inModules = false;
-  let inSessions = false;
-  const moduleLines: string[] = [];
-  const sessionLines: string[] = [];
-  const lines = output.split(/\r?\n/);
-
-  for (const line of lines) {
-    if (line === CLUSTER_SESSIONS_START) {
-      inSessions = true;
-      currentIndex = null;
-      continue;
-    }
-    if (line === CLUSTER_SESSIONS_END) {
-      inSessions = false;
-      continue;
-    }
-    if (line === CLUSTER_MODULES_START) {
-      inModules = true;
-      currentIndex = null;
-      continue;
-    }
-    if (line === CLUSTER_MODULES_END) {
-      inModules = false;
-      continue;
-    }
-    if (line.startsWith(CLUSTER_CMD_START)) {
-      const raw = line.slice(CLUSTER_CMD_START.length);
-      const match = raw.match(/^(\d+)__$/);
-      currentIndex = match ? Number(match[1]) : null;
-      continue;
-    }
-    if (line.startsWith(CLUSTER_CMD_END)) {
-      currentIndex = null;
-      continue;
-    }
-    if (inModules) {
-      moduleLines.push(line);
-      continue;
-    }
-    if (inSessions) {
-      sessionLines.push(line);
-      continue;
-    }
-    if (currentIndex !== null && currentIndex >= 0 && currentIndex < commandOutputs.length) {
-      commandOutputs[currentIndex] += line + '\n';
-    }
-  }
-
-  return {
-    commandOutputs: commandOutputs.map((text) => text.trim()),
-    modulesOutput: moduleLines.join('\n').trim(),
-    sessionsOutput: sessionLines.join('\n').trim()
-  };
-}
-
-function parseModulesOutput(output: string): string[] {
-  return parseModulesOutputUtil(output);
-}
-
-async function fetchClusterInfoSingleCall(
-  loginHost: string,
-  cfg: SlurmConnectConfig,
-  commands: string[],
-  freeResourceIndexes?: FreeResourceCommandIndexes
-): Promise<ClusterInfo> {
-  const log = getOutputChannel();
-  const combinedScript = buildCombinedClusterInfoScript(commands);
-  log.appendLine(`Cluster info single-call script bytes: ${combinedScript.length}`);
-  const output = await runSshCommandWithInput(loginHost, cfg, 'bash -s', combinedScript);
-  const { commandOutputs, modulesOutput } = parseCombinedClusterInfoOutput(output, commands.length);
-  return buildClusterInfoFromOutputs(commandOutputs, modulesOutput, freeResourceIndexes);
-}
-
-function buildClusterInfoFromOutputs(
-  commandOutputs: string[],
-  modulesOutput: string,
-  freeResourceIndexes?: FreeResourceCommandIndexes
-): ClusterInfo {
-  const log = getOutputChannel();
-  let lastInfo: ClusterInfo = { partitions: [] };
-  let bestInfo: ClusterInfo | undefined;
-  let partitionDefaults: Record<string, PartitionDefaults> = {};
-  let defaultPartitionFromScontrol: string | undefined;
-  const infoCommandCount = freeResourceIndexes ? freeResourceIndexes.infoCommandCount : commandOutputs.length;
-  for (let i = 0; i < infoCommandCount; i += 1) {
-    const cmdOutput = commandOutputs[i];
-    if (!cmdOutput) {
-      continue;
-    }
-    const defaultsResult = parsePartitionDefaultTimesOutput(cmdOutput);
-    if (Object.keys(defaultsResult.defaults).length > 0 || defaultsResult.defaultPartition) {
-      partitionDefaults = mergePartitionDefaults(partitionDefaults, defaultsResult.defaults);
-      if (!defaultPartitionFromScontrol && defaultsResult.defaultPartition) {
-        defaultPartitionFromScontrol = defaultsResult.defaultPartition;
-      }
-      continue;
-    }
-    const info = parsePartitionInfoOutput(cmdOutput);
-    lastInfo = info;
-    const maxFields = getMaxFieldCount(cmdOutput);
-    const outputHasGpu = cmdOutput.includes('gpu:');
-    const hasGpu = info.partitions.some((partition) => partition.gpuMax > 0);
-    log.appendLine(
-      `Cluster info fields: ${maxFields}, partitions: ${info.partitions.length}, outputHasGpu: ${outputHasGpu}, hasGpu: ${hasGpu}`
-    );
-    if (outputHasGpu && !hasGpu) {
-      log.appendLine('GPU data present but parse yielded none; trying next command.');
-      continue;
-    }
-    if (maxFields < 5) {
-      continue;
-    }
-    if (hasMeaningfulClusterInfo(info)) {
-      bestInfo = info;
-      break;
-    }
-  }
-
-  const info = bestInfo ?? lastInfo;
-  info.modules = parseModulesOutput(modulesOutput);
-  if (defaultPartitionFromScontrol && !info.defaultPartition) {
-    info.defaultPartition = defaultPartitionFromScontrol;
-  }
-  applyPartitionDefaultTimes(info, partitionDefaults);
-  if (freeResourceIndexes) {
-    const nodeOutput = commandOutputs[freeResourceIndexes.nodeIndex] || '';
-    const jobOutput = commandOutputs[freeResourceIndexes.jobIndex] || '';
-    const freeSummary = computeFreeResourceSummary(nodeOutput, jobOutput);
-    if (freeSummary) {
-      applyFreeResourceSummary(info, freeSummary);
-    }
-  }
-  return info;
 }
 
 
@@ -4370,482 +3263,6 @@ async function runSshCommandWithInput(
   }
 }
 
-function parsePartitionOutput(output: string): PartitionResult {
-  const tokens = output.split(/\s+/).map((token) => token.trim()).filter(Boolean);
-  const partitions: string[] = [];
-  let defaultPartition: string | undefined;
-
-  for (const token of tokens) {
-    const isDefault = token.includes('*');
-    const cleaned = token.replace(/\*/g, '');
-    if (!cleaned) {
-      continue;
-    }
-    if (isDefault && !defaultPartition) {
-      defaultPartition = cleaned;
-    }
-    if (!partitions.includes(cleaned)) {
-      partitions.push(cleaned);
-    }
-  }
-
-  return { partitions, defaultPartition };
-}
-
-function parseSimpleList(output: string): string[] {
-  return uniqueList(
-    output
-      .split(/\s+/)
-      .map((value) => value.trim())
-      .filter(Boolean)
-  );
-}
-
-function parsePartitionDefaultTimesOutput(
-  output: string
-): { defaults: Record<string, PartitionDefaults>; defaultPartition?: string } {
-  const defaults: Record<string, PartitionDefaults> = {};
-  let defaultPartition: string | undefined;
-  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const timePattern = /^(\d+-)?\d{1,2}:\d{2}:\d{2}$/;
-  const normalizeTimeValue = (value: string): string | undefined => {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    const upper = trimmed.toUpperCase();
-    if (upper === 'NONE' || upper === 'UNLIMITED') {
-      return undefined;
-    }
-    return timePattern.test(trimmed) ? trimmed : undefined;
-  };
-  const parsePositiveInt = (value: string): number | undefined => {
-    const match = value.match(/\d+/);
-    if (!match) {
-      return undefined;
-    }
-    const parsed = Number(match[0]);
-    if (!Number.isFinite(parsed) || parsed < 1) {
-      return undefined;
-    }
-    return Math.floor(parsed);
-  };
-  const parseMemoryMb = (value: string): number | undefined => {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    const upper = trimmed.toUpperCase();
-    if (upper === 'NONE' || upper === 'UNLIMITED') {
-      return undefined;
-    }
-    const match = upper.match(/^(\d+(?:\.\d+)?)([KMGTP])?$/);
-    if (!match) {
-      return undefined;
-    }
-    const amount = Number(match[1]);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return undefined;
-    }
-    const unit = match[2] || 'M';
-    const multipliers: Record<string, number> = {
-      K: 1 / 1024,
-      M: 1,
-      G: 1024,
-      T: 1024 * 1024,
-      P: 1024 * 1024 * 1024
-    };
-    const multiplier = multipliers[unit] ?? 1;
-    const mb = Math.round(amount * multiplier);
-    return mb > 0 ? mb : undefined;
-  };
-  const parseGpuDefaults = (value: string): { count?: number; type?: string } | undefined => {
-    const parts = value.split(',').map((entry) => entry.trim()).filter(Boolean);
-    for (const part of parts) {
-      if (part.includes('gres/gpu')) {
-        const [left, right] = part.split('=');
-        if (!right) {
-          continue;
-        }
-        const count = parsePositiveInt(right);
-        if (!count) {
-          continue;
-        }
-        const typeMatch = left.match(/gres\/gpu:([^=]+)/);
-        const type = typeMatch ? typeMatch[1] : undefined;
-        return { count, type };
-      }
-      if (part.startsWith('gpu=')) {
-        const count = parsePositiveInt(part.slice('gpu='.length));
-        if (count) {
-          return { count };
-        }
-      }
-      if (part.startsWith('gpu:')) {
-        const segments = part.split(':').map((entry) => entry.trim()).filter(Boolean);
-        if (segments.length >= 2 && segments[0] === 'gpu') {
-          const count = parsePositiveInt(segments[segments.length - 1]);
-          if (!count) {
-            continue;
-          }
-          const type = segments.length >= 3 ? segments[1] : undefined;
-          return { count, type };
-        }
-      }
-    }
-    return undefined;
-  };
-  const applyGpuDefaults = (value: string, target: PartitionDefaults): void => {
-    const gpu = parseGpuDefaults(value);
-    if (!gpu) {
-      return;
-    }
-    if (gpu.count && target.defaultGpuCount === undefined) {
-      target.defaultGpuCount = gpu.count;
-    }
-    if (gpu.type && target.defaultGpuType === undefined) {
-      target.defaultGpuType = gpu.type;
-    }
-  };
-  const applyDefaultToken = (key: string, value: string, target: PartitionDefaults): void => {
-    const keyLower = key.toLowerCase();
-    if (keyLower === 'defaulttime' || keyLower === 'deftime') {
-      const timeValue = normalizeTimeValue(value);
-      if (timeValue && !target.defaultTime) {
-        target.defaultTime = timeValue;
-      }
-      return;
-    }
-    if (keyLower === 'defmempernode') {
-      const memValue = parseMemoryMb(value);
-      if (memValue !== undefined && target.defaultMemoryMb === undefined) {
-        target.defaultMemoryMb = memValue;
-      }
-      return;
-    }
-    if (
-      keyLower === 'defcpupertask' ||
-      keyLower === 'defcpuspertask' ||
-      keyLower === 'defaultcpupertask' ||
-      keyLower === 'defaultcpuspertask'
-    ) {
-      const cpuValue = parsePositiveInt(value);
-      if (cpuValue !== undefined && target.defaultCpusPerTask === undefined) {
-        target.defaultCpusPerTask = cpuValue;
-      }
-      return;
-    }
-    if (keyLower === 'defaultnodes') {
-      const nodesValue = parsePositiveInt(value);
-      if (nodesValue !== undefined && target.defaultNodes === undefined) {
-        target.defaultNodes = nodesValue;
-      }
-      return;
-    }
-    if (keyLower === 'defaulttaskspernode') {
-      const tasksValue = parsePositiveInt(value);
-      if (tasksValue !== undefined && target.defaultTasksPerNode === undefined) {
-        target.defaultTasksPerNode = tasksValue;
-      }
-      return;
-    }
-    if (
-      keyLower === 'defaultgres' ||
-      keyLower === 'defgres' ||
-      keyLower.startsWith('defaulttres') ||
-      keyLower.startsWith('deftres')
-    ) {
-      applyGpuDefaults(value, target);
-    }
-  };
-  const applyJobDefaults = (value: string, target: PartitionDefaults): void => {
-    const trimmed = value.trim();
-    if (!trimmed || trimmed.toLowerCase() === '(null)') {
-      return;
-    }
-    const entries = trimmed.split(',').map((entry) => entry.trim()).filter(Boolean);
-    for (const entry of entries) {
-      const equalsIndex = entry.indexOf('=');
-      if (equalsIndex === -1) {
-        continue;
-      }
-      const key = entry.slice(0, equalsIndex);
-      const val = entry.slice(equalsIndex + 1);
-      if (!key) {
-        continue;
-      }
-      if (key.toLowerCase() === 'gres' || key.toLowerCase() === 'defgres') {
-        applyGpuDefaults(val, target);
-      } else {
-        applyDefaultToken(key, val, target);
-      }
-    }
-  };
-
-  for (const line of lines) {
-    const tokens = line.split(/\s+/).filter(Boolean);
-    let rawName = '';
-    let isDefault = false;
-    const lineDefaults: PartitionDefaults = {};
-    for (const token of tokens) {
-      const equalsIndex = token.indexOf('=');
-      if (equalsIndex === -1) {
-        continue;
-      }
-      const key = token.slice(0, equalsIndex);
-      const value = token.slice(equalsIndex + 1);
-      if (!key) {
-        continue;
-      }
-      if (key === 'PartitionName') {
-        rawName = value;
-        continue;
-      }
-      if (key === 'Default' && value === 'YES') {
-        isDefault = true;
-        continue;
-      }
-      if (key === 'JobDefaults') {
-        applyJobDefaults(value, lineDefaults);
-        continue;
-      }
-      if (key.startsWith('Def') || key.startsWith('Default')) {
-        applyDefaultToken(key, value, lineDefaults);
-      }
-    }
-    if (!rawName) {
-      continue;
-    }
-    const names = rawName
-      .split(',')
-      .map((entry) => entry.replace(/\*/g, '').trim())
-      .filter(Boolean);
-    for (const name of names) {
-      if (!defaults[name]) {
-        defaults[name] = {};
-      }
-      const existing = defaults[name] as Record<string, unknown>;
-      for (const [key, value] of Object.entries(lineDefaults)) {
-        if (value !== undefined) {
-          existing[key] = value;
-        }
-      }
-    }
-    if (isDefault && !defaultPartition) {
-      defaultPartition = names[0];
-    }
-  }
-  return { defaults, defaultPartition };
-}
-
-interface PartitionFreeSummary {
-  freeNodes: number;
-  freeCpuTotal: number;
-  freeCpusPerNode: number;
-  freeGpuTotal: number;
-  freeGpuMax: number;
-  freeGpuTypes: Record<string, number>;
-}
-
-interface FreeResourceCommandIndexes {
-  infoCommandCount: number;
-  nodeIndex: number;
-  jobIndex: number;
-}
-
-function buildClusterInfoCommandSet(
-  cfg: SlurmConnectConfig
-): { commands: string[]; freeResourceIndexes: FreeResourceCommandIndexes } {
-  return buildClusterInfoCommandSetUtil(cfg);
-}
-
-function computeFreeResourceSummary(
-  nodeInfoOutput: string,
-  squeueOutput: string
-): Map<string, PartitionFreeSummary> | undefined {
-  return computeFreeResourceSummaryUtil(nodeInfoOutput, squeueOutput);
-}
-
-function applyFreeResourceSummary(info: ClusterInfo, summary: Map<string, PartitionFreeSummary>): void {
-  applyFreeResourceSummaryUtil(info, summary);
-}
-
-async function pickFromList(title: string, items: string[], allowManual: boolean): Promise<string | undefined> {
-  const picks: vscode.QuickPickItem[] = items.map((item) => ({ label: item }));
-  if (allowManual) {
-    picks.unshift({ label: 'Enter manually' });
-  }
-
-  const picked = await vscode.window.showQuickPick(picks, {
-    title,
-    placeHolder: items.length ? 'Select an item' : 'Enter a value'
-  });
-
-  if (!picked) {
-    return undefined;
-  }
-
-  if (allowManual && picked.label === 'Enter manually') {
-    const manual = await vscode.window.showInputBox({ title, prompt: 'Enter value' });
-    return manual?.trim() || undefined;
-  }
-
-  return picked.label;
-}
-
-async function pickPartition(
-  partitions: string[],
-  defaultPartition?: string
-): Promise<string | undefined | null> {
-  if (partitions.length === 0) {
-    const manual = await vscode.window.showInputBox({
-      title: 'Partition',
-      prompt: 'Enter partition or leave blank to use cluster default'
-    });
-    if (manual === undefined) {
-      return null;
-    }
-    return manual.trim() || undefined;
-  }
-
-  const picks: vscode.QuickPickItem[] = [
-    {
-      label: 'Use cluster default',
-      description: defaultPartition ? `(${defaultPartition})` : undefined
-    },
-    ...partitions.map((partition) => ({
-      label: partition,
-      description: partition === defaultPartition ? 'default' : undefined
-    }))
-  ];
-
-  const picked = await vscode.window.showQuickPick(picks, {
-    title: 'Select partition',
-    placeHolder: 'Choose a partition'
-  });
-
-  if (!picked) {
-    return null;
-  }
-
-  if (picked.label === 'Use cluster default') {
-    return defaultPartition || undefined;
-  }
-
-  return picked.label;
-}
-
-async function pickOptionalValue(title: string, items: string[]): Promise<string | undefined> {
-  if (items.length === 0) {
-    return undefined;
-  }
-
-  const picks: vscode.QuickPickItem[] = [
-    { label: 'None' },
-    ...items.map((item) => ({ label: item }))
-  ];
-  const picked = await vscode.window.showQuickPick(picks, {
-    title,
-    placeHolder: 'Select a value'
-  });
-  if (!picked || picked.label === 'None') {
-    return undefined;
-  }
-  return picked.label;
-}
-
-async function promptNumber(title: string, defaultValue: number, minValue: number): Promise<number | undefined> {
-  const value = await vscode.window.showInputBox({
-    title,
-    value: String(defaultValue),
-    prompt: 'Leave blank to use cluster default.',
-    validateInput: (input) => {
-      const trimmed = input.trim();
-      if (!trimmed) {
-        return undefined;
-      }
-      const parsed = Number(trimmed);
-      if (!Number.isInteger(parsed) || parsed < minValue) {
-        return `Enter an integer >= ${minValue}, or leave blank for default.`;
-      }
-      return undefined;
-    }
-  });
-  if (value === undefined) {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return 0;
-  }
-  return Number(trimmed);
-}
-
-async function promptTime(title: string, defaultValue: string): Promise<string | undefined> {
-  const timePattern = /^(\d+-)?\d{1,2}:\d{2}:\d{2}$/;
-  const value = await vscode.window.showInputBox({
-    title,
-    value: defaultValue,
-    prompt: 'HH:MM:SS or D-HH:MM:SS (leave blank for cluster default)',
-    validateInput: (input) => {
-      const trimmed = input.trim();
-      if (!trimmed) {
-        return undefined;
-      }
-      return timePattern.test(trimmed) ? undefined : 'Invalid time format.';
-    }
-  });
-  if (value === undefined) {
-    return undefined;
-  }
-  return value.trim();
-}
-
-function buildSallocArgs(params: {
-  partition?: string;
-  nodes: number;
-  tasksPerNode: number;
-  cpusPerTask: number;
-  time: string;
-  memoryMb?: number;
-  gpuType?: string;
-  gpuCount?: number;
-  qos?: string;
-  account?: string;
-}): string[] {
-  const args: string[] = [];
-  if (params.partition) {
-    args.push(`--partition=${params.partition}`);
-  }
-  if (params.nodes > 0) {
-    args.push(`--nodes=${params.nodes}`);
-  }
-  if (params.tasksPerNode > 0) {
-    args.push(`--ntasks-per-node=${params.tasksPerNode}`);
-  }
-  if (params.cpusPerTask > 0) {
-    args.push(`--cpus-per-task=${params.cpusPerTask}`);
-  }
-  if (params.time && params.time.trim().length > 0) {
-    args.push(`--time=${params.time}`);
-  }
-  if (params.qos) {
-    args.push(`--qos=${params.qos}`);
-  }
-  if (params.account) {
-    args.push(`--account=${params.account}`);
-  }
-  if (params.memoryMb && params.memoryMb > 0) {
-    args.push(`--mem=${params.memoryMb}`);
-  }
-  if (params.gpuCount && params.gpuCount > 0) {
-    const type = params.gpuType ? params.gpuType.trim() : '';
-    const gres = type ? `gpu:${type}:${params.gpuCount}` : `gpu:${params.gpuCount}`;
-    args.push(`--gres=${gres}`);
-  }
-  return args;
-}
-
 function resolveSessionKey(cfg: SlurmConnectConfig, alias: string): string {
   const trimmed = (cfg.sessionKey || '').trim();
   if (trimmed) {
@@ -5839,27 +4256,6 @@ function buildRemoteCommand(
   const installScript = `echo ${encoded} | base64 -d | bash`;
   const wrapped = `${installScript}; ${baseCommand}`;
   return joinShellCommand(['bash', '-lc', wrapped]);
-}
-
-function buildDefaultAlias(
-  prefix: string,
-  loginHost: string,
-  partition: string | undefined,
-  nodes?: number,
-  cpusPerTask?: number
-): string {
-  const hostShort = loginHost.split('.')[0];
-  const pieces = [prefix || 'slurm', hostShort];
-  if (partition) {
-    pieces.push(partition);
-  }
-  if (nodes && nodes > 0) {
-    pieces.push(`${nodes}n`);
-  }
-  if (cpusPerTask && cpusPerTask > 0) {
-    pieces.push(`${cpusPerTask}c`);
-  }
-  return pieces.join('-').replace(/[^a-zA-Z0-9_-]/g, '-');
 }
 
 function defaultSshConfigPath(): string {
