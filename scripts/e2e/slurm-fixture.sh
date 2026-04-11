@@ -193,6 +193,7 @@ install_proxy_script() {
   log "Installing local vscode-proxy.py into the fixture login node"
   ssh_exec 'mkdir -p ~/.slurm-connect'
   scp -F "${SSH_CONFIG}" "${ROOT_DIR}/media/vscode-proxy.py" "${SSH_ALIAS}:~/.slurm-connect/vscode-proxy.py" >/dev/null
+  scp -r -F "${SSH_CONFIG}" "${ROOT_DIR}/media/vscode_proxy" "${SSH_ALIAS}:~/.slurm-connect/" >/dev/null
   ssh_exec 'chmod 700 ~/.slurm-connect/vscode-proxy.py'
 }
 

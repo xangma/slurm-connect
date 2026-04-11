@@ -158,7 +158,7 @@ def test_resolve_node_address_prefers_slurm_nodeaddr(monkeypatch):
     def fake_run(*args, **kwargs):
         return Result()
 
-    monkeypatch.setattr(proxy.subprocess, "run", fake_run)
+    monkeypatch.setattr(proxy.parsing.subprocess, "run", fake_run)
 
     assert proxy.resolve_node_address("c1", LOGGER) == "172.19.0.7"
 
@@ -169,16 +169,16 @@ def test_choose_session_node_prefers_saved_node_and_updates_job_json(
     session_dir = str(tmp_path)
     job_json = {"node": "c2"}
 
-    monkeypatch.setattr(proxy, "load_job_json", lambda *args, **kwargs: dict(job_json))
-    monkeypatch.setattr(proxy, "get_job_nodelist", lambda *args, **kwargs: "c[1-2]")
-    monkeypatch.setattr(proxy, "expand_nodelist", lambda *args, **kwargs: ["c1", "c2"])
+    monkeypatch.setattr(proxy.slurm, "load_job_json", lambda *args, **kwargs: dict(job_json))
+    monkeypatch.setattr(proxy.slurm, "get_job_nodelist", lambda *args, **kwargs: "c[1-2]")
+    monkeypatch.setattr(proxy.slurm, "expand_nodelist", lambda *args, **kwargs: ["c1", "c2"])
 
     writes = []
 
     def fake_write_job_json(path, payload, logger):
         writes.append((path, payload))
 
-    monkeypatch.setattr(proxy, "write_job_json", fake_write_job_json)
+    monkeypatch.setattr(proxy.slurm, "write_job_json", fake_write_job_json)
 
     assert proxy.choose_session_node(session_dir, "12345", LOGGER) == "c2"
     assert writes == []
@@ -189,11 +189,19 @@ def test_resolve_connect_host_uses_slurm_nodeaddr_when_hostname_is_not_resolvabl
 ):
     def fake_getaddrinfo(host, *args, **kwargs):
         if host == "c1":
-            raise proxy.socket.gaierror(-2, "Name or service not known")
-        return [(proxy.socket.AF_INET, proxy.socket.SOCK_STREAM, 6, "", ("172.19.0.7", 0))]
+            raise proxy.parsing.socket.gaierror(-2, "Name or service not known")
+        return [
+            (
+                proxy.parsing.socket.AF_INET,
+                proxy.parsing.socket.SOCK_STREAM,
+                6,
+                "",
+                ("172.19.0.7", 0),
+            )
+        ]
 
-    monkeypatch.setattr(proxy.socket, "getaddrinfo", fake_getaddrinfo)
-    monkeypatch.setattr(proxy, "resolve_node_address", lambda host, logger: "172.19.0.7")
+    monkeypatch.setattr(proxy.parsing.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(proxy.parsing, "resolve_node_address", lambda host, logger: "172.19.0.7")
 
     assert proxy.resolve_connect_host("c1", LOGGER) == "172.19.0.7"
     assert proxy.resolve_connect_host("127.0.0.1", LOGGER) == "127.0.0.1"

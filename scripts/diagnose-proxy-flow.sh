@@ -258,7 +258,18 @@ if [[ -n "$SSH_TARGET" ]] && [[ $SKIP_REMOTE_PROXY -eq 0 ]]; then
     if [[ -n "$SSH_CONFIG" ]]; then
       SCP_ARGS+=(-F "$SSH_CONFIG")
     fi
+    UPLOAD_PROXY_DIR="$(cd "$(dirname "$UPLOAD_PROXY_FROM")" && pwd)"
+    UPLOAD_PROXY_PACKAGE_FROM="$UPLOAD_PROXY_DIR/vscode_proxy"
+    if grep -q 'from vscode_proxy import' "$UPLOAD_PROXY_FROM" && [[ ! -d "$UPLOAD_PROXY_PACKAGE_FROM" ]]; then
+      echo "error: upload source proxy package not found: $UPLOAD_PROXY_PACKAGE_FROM" >&2
+      exit 1
+    fi
+    REMOTE_PROXY_DIR="$(dirname "$REMOTE_PROXY_PATH")"
+    ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "mkdir -p $REMOTE_PROXY_DIR" >/dev/null
     scp "${SCP_ARGS[@]}" "$UPLOAD_PROXY_FROM" "$SSH_TARGET:$REMOTE_PROXY_PATH" >/dev/null
+    if [[ -d "$UPLOAD_PROXY_PACKAGE_FROM" ]]; then
+      scp -r "${SCP_ARGS[@]}" "$UPLOAD_PROXY_PACKAGE_FROM" "$SSH_TARGET:$REMOTE_PROXY_DIR/" >/dev/null
+    fi
     summary_line "remote-proxy" "uploaded_proxy_from=$UPLOAD_PROXY_FROM"
     summary_line "remote-proxy" "uploaded_proxy_to=$REMOTE_PROXY_PATH"
   fi

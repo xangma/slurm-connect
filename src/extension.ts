@@ -4168,34 +4168,103 @@ function parseAdditionalSshOptionsInput(input: string): Record<string, string> {
   return result;
 }
 
-interface BundledProxyScript {
+interface BundledProxyFile {
+  path: string;
+  mode: number;
   base64: string;
+}
+
+interface BundledProxyBundle {
+  payloadBase64: string;
+  hashManifestBase64: string;
   sha256: string;
 }
 
-interface ProxyInstallPlan extends BundledProxyScript {
+interface ProxyInstallPlan extends BundledProxyBundle {
   installPath: string;
 }
 
-let bundledProxyScriptCache: BundledProxyScript | undefined;
+let bundledProxyBundleCache: BundledProxyBundle | undefined;
 
-async function getBundledProxyScript(): Promise<BundledProxyScript | undefined> {
-  if (bundledProxyScriptCache) {
-    return bundledProxyScriptCache;
+async function collectBundledProxyFiles(baseDir: string, relativeDir: string): Promise<BundledProxyFile[]> {
+  const dirPath = path.join(baseDir, relativeDir);
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  const files: BundledProxyFile[] = [];
+  for (const entry of entries) {
+    const entryRelativePath = path.posix.join(relativeDir, entry.name);
+    const entryPath = path.join(baseDir, entryRelativePath);
+    if (entry.isDirectory()) {
+      if (entry.name === '__pycache__') {
+        continue;
+      }
+      files.push(...(await collectBundledProxyFiles(baseDir, entryRelativePath)));
+      continue;
+    }
+    if (!entry.isFile() || path.extname(entry.name) !== '.py') {
+      continue;
+    }
+    const [data, stats] = await Promise.all([fs.readFile(entryPath), fs.stat(entryPath)]);
+    files.push({
+      path: entryRelativePath,
+      mode: stats.mode & 0o777,
+      base64: data.toString('base64')
+    });
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+async function readBundledProxyFile(baseDir: string, relativePath: string): Promise<BundledProxyFile> {
+  const filePath = path.join(baseDir, relativePath);
+  const [data, stats] = await Promise.all([fs.readFile(filePath), fs.stat(filePath)]);
+  return {
+    path: relativePath,
+    mode: stats.mode & 0o777,
+    base64: data.toString('base64')
+  };
+}
+
+async function getBundledProxyBundle(): Promise<BundledProxyBundle | undefined> {
+  if (bundledProxyBundleCache) {
+    return bundledProxyBundleCache;
   }
   if (!extensionRootPath) {
     return undefined;
   }
-  const filePath = path.join(extensionRootPath, 'media', 'vscode-proxy.py');
   try {
-    const data = await fs.readFile(filePath);
-    const sha256 = crypto.createHash('sha256').update(data).digest('hex');
-    const compressed = zlib.gzipSync(data, { level: 9 });
-    const base64 = compressed.toString('base64');
-    bundledProxyScriptCache = { base64, sha256 };
-    return bundledProxyScriptCache;
+    const mediaRoot = path.join(extensionRootPath, 'media');
+    const proxyFiles = [
+      await readBundledProxyFile(mediaRoot, 'vscode-proxy.py'),
+      ...(await collectBundledProxyFiles(mediaRoot, 'vscode_proxy')),
+    ].sort((left, right) => left.path.localeCompare(right.path));
+    const payload = Buffer.from(JSON.stringify({ files: proxyFiles }), 'utf8');
+    const hashManifest = Buffer.from(
+      JSON.stringify({
+        files: proxyFiles.map((file) => ({
+          path: file.path,
+          mode: file.mode
+        }))
+      }),
+      'utf8'
+    );
+    const hash = crypto.createHash('sha256');
+    for (const file of proxyFiles) {
+      hash.update(file.path, 'utf8');
+      hash.update('\0', 'utf8');
+      hash.update(String(file.mode), 'utf8');
+      hash.update('\0', 'utf8');
+      hash.update(Buffer.from(file.base64, 'base64'));
+      hash.update('\0', 'utf8');
+    }
+    const sha256 = hash.digest('hex');
+    const compressed = zlib.gzipSync(payload, { level: 9 });
+    bundledProxyBundleCache = {
+      payloadBase64: compressed.toString('base64'),
+      hashManifestBase64: hashManifest.toString('base64'),
+      sha256
+    };
+    return bundledProxyBundleCache;
   } catch (error) {
-    getOutputChannel().appendLine(`Failed to read bundled proxy script: ${formatError(error)}`);
+    getOutputChannel().appendLine(`Failed to read bundled proxy bundle: ${formatError(error)}`);
     return undefined;
   }
 }
@@ -4214,23 +4283,42 @@ function normalizeShellHomePath(value: string): string {
 function buildProxyInstallSnippet(plan: ProxyInstallPlan): string {
   const target = normalizeShellHomePath(plan.installPath);
   const targetEscaped = target.replace(/"/g, '\\"');
+  const hashManifest = plan.hashManifestBase64;
   const expected = plan.sha256;
   const chunks: string[] = [];
   const chunkSize = 1024;
-  for (let i = 0; i < plan.base64.length; i += chunkSize) {
-    chunks.push(plan.base64.slice(i, i + chunkSize));
+  for (let i = 0; i < plan.payloadBase64.length; i += chunkSize) {
+    chunks.push(plan.payloadBase64.slice(i, i + chunkSize));
+  }
+  const hashManifestChunks: string[] = [];
+  for (let i = 0; i < hashManifest.length; i += chunkSize) {
+    hashManifestChunks.push(hashManifest.slice(i, i + chunkSize));
   }
   const hashSnippet = [
-    'import hashlib,sys',
-    'path=sys.argv[1]',
-    'try:',
-    '    data=open(path,"rb").read()',
-    'except Exception:',
-    '    sys.exit(1)',
-    'print(hashlib.sha256(data).hexdigest())'
+    'import base64,hashlib,json,os,sys',
+    'root=sys.argv[1]',
+    'entries=json.loads(base64.b64decode("".join([',
+    ...hashManifestChunks.map((chunk) => `    "${chunk}",`),
+    '])).decode("utf-8")).get("files", [])',
+    'h=hashlib.sha256()',
+    'for entry in entries:',
+    '    rel=entry["path"]',
+    '    path=os.path.join(root, rel)',
+    '    try:',
+    '        data=open(path,"rb").read()',
+    '    except Exception:',
+    '        sys.exit(1)',
+    '    h.update(rel.encode("utf-8"))',
+    '    h.update(b"\\0")',
+    '    h.update(str(int(entry.get("mode",0))).encode("ascii"))',
+    '    h.update(b"\\0")',
+    '    h.update(data)',
+    '    h.update(b"\\0")',
+    'print(h.hexdigest())'
   ].join('\n');
   const installSnippet = [
     `target="${targetEscaped}"`,
+    'root="$(dirname "$target")"',
     `expected="${expected}"`,
     'PYTHON=$(command -v python3 || command -v python || true)',
     'if [ -z "$PYTHON" ]; then',
@@ -4239,36 +4327,41 @@ function buildProxyInstallSnippet(plan: ProxyInstallPlan): string {
     'fi',
     'current=""',
     'if [ -f "$target" ]; then',
-    '  current=$("$PYTHON" - "$target" 2>/dev/null <<\'PY\'',
+    '  current=$("$PYTHON" - "$root" 2>/dev/null <<\'PY\'',
     hashSnippet,
     'PY',
     '  )',
     'fi',
     'if [ "$current" != "$expected" ]; then',
     '  umask 077',
-    '  mkdir -p "$(dirname "$target")"',
-    '  "$PYTHON" - "$target" <<\'PY\'',
-    'import base64,gzip,io,os,sys',
-    'path=sys.argv[1]',
+    '  mkdir -p "$root"',
+    '  "$PYTHON" - "$root" <<\'PY\'',
+    'import base64,gzip,io,json,os,sys',
+    'root=sys.argv[1]',
     'data=base64.b64decode("".join([',
     ...chunks.map((chunk) => `    "${chunk}",`),
     ']))',
     'try:',
-    '    data=gzip.decompress(data)',
+    '    payload=gzip.decompress(data)',
     'except AttributeError:',
-    '    data=gzip.GzipFile(fileobj=io.BytesIO(data)).read()',
-    'tmp=path + ".tmp"',
-    'with open(tmp,"wb") as f:',
-    '    f.write(data)',
-    'os.chmod(tmp,0o700)',
-    'os.replace(tmp,path)',
+    '    payload=gzip.GzipFile(fileobj=io.BytesIO(data)).read()',
+    'bundle=json.loads(payload.decode("utf-8"))',
+    'for entry in bundle.get("files", []):',
+    '    rel=entry["path"]',
+    '    path=os.path.join(root, rel)',
+    '    os.makedirs(os.path.dirname(path), exist_ok=True)',
+    '    tmp=path + ".tmp"',
+    '    with open(tmp,"wb") as f:',
+    '        f.write(base64.b64decode(entry["base64"]))',
+    '    os.chmod(tmp,int(entry.get("mode",0o600)))',
+    '    os.replace(tmp,path)',
     'PY',
-    '  current=$("$PYTHON" - "$target" 2>/dev/null <<\'PY\'',
+    '  current=$("$PYTHON" - "$root" 2>/dev/null <<\'PY\'',
     hashSnippet,
     'PY',
     '  )',
     '  if [ "$current" != "$expected" ]; then',
-    '    echo "Slurm Connect: proxy script hash mismatch after install" >&2',
+    '    echo "Slurm Connect: proxy bundle hash mismatch after install" >&2',
     '  fi',
     'fi'
   ];
@@ -4279,7 +4372,7 @@ async function getProxyInstallSnippet(cfg: SlurmConnectConfig): Promise<string |
   if (!cfg.autoInstallProxyScriptOnClusterInfo) {
     return undefined;
   }
-  const bundled = await getBundledProxyScript();
+  const bundled = await getBundledProxyBundle();
   if (!bundled) {
     return undefined;
   }
