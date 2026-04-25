@@ -12,6 +12,7 @@ import { __resetForTests, __runNonInteractiveConnectForTests } from '../../exten
 
 const execFileAsync = promisify(execFile);
 const FIXTURE_ENV_FLAG = 'SLURM_CONNECT_FIXTURE';
+const CLIENT_FIXTURE_ENV_FLAG = 'SLURM_CONNECT_CLIENT_FIXTURE';
 
 type ConfigTarget = vscode.ConfigurationTarget.Workspace;
 
@@ -46,6 +47,38 @@ function resolveFixtureConnection(): FixtureConnection {
   };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function assertExpectedSinfoLine(stdout: string, isClientFixture: boolean): void {
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (isClientFixture) {
+    const expectedPattern = process.env.SLURM_CLIENT_EXPECTED_SINFO_PATTERN || '';
+    if (expectedPattern) {
+      assert.ok(
+        lines.some((line) => new RegExp(expectedPattern).test(line)),
+        `Expected sinfo output to match ${expectedPattern}. Output: ${stdout}`
+      );
+      return;
+    }
+    assert.ok(
+      lines.some((line) => line.split('|').length >= 3),
+      `Expected sinfo output through generated alias. Output: ${stdout}`
+    );
+    return;
+  }
+
+  assert.ok(
+    lines.some((line) => line.startsWith('cpu') && line.includes('|2|idle')),
+    `Expected sinfo output through generated alias. Output: ${stdout}`
+  );
+}
+
 async function rememberConfigValue(
   section: string,
   key: string,
@@ -65,8 +98,10 @@ async function rememberConfigValue(
 suite('Slurm Fixture E2E', function () {
   this.timeout(120000);
 
-  test('runs the connect flow against the disposable Slurm fixture', async function () {
-    if (process.env[FIXTURE_ENV_FLAG] !== '1') {
+  test('runs the connect flow against a Slurm fixture', async function () {
+    const isDockerFixture = process.env[FIXTURE_ENV_FLAG] === '1';
+    const isClientFixture = process.env[CLIENT_FIXTURE_ENV_FLAG] === '1';
+    if (!isDockerFixture && !isClientFixture) {
       this.skip();
       return;
     }
@@ -82,7 +117,7 @@ suite('Slurm Fixture E2E', function () {
 
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'slurm-connect-fixture-'));
     const baseSshConfigPath = path.join(tempDir, 'ssh-config');
-    const includeAlias = 'slurm-fixture-integration';
+    const includeAlias = isClientFixture ? `slurm-client-${process.platform}` : 'slurm-fixture-integration';
     const restoreSteps: Array<() => Promise<void>> = [];
 
     await __resetForTests();
@@ -99,6 +134,7 @@ suite('Slurm Fixture E2E', function () {
           IdentityFile: fixture.privateKeyPath,
           IdentitiesOnly: 'yes',
           Port: fixture.port,
+          StrictHostKeyChecking: 'accept-new',
           UserKnownHostsFile: fixture.knownHostsPath
         },
         vscode.ConfigurationTarget.Workspace,
@@ -118,7 +154,13 @@ suite('Slurm Fixture E2E', function () {
         vscode.ConfigurationTarget.Workspace,
         restoreSteps
       );
-      await rememberConfigValue('slurmConnect', 'defaultPartition', '', vscode.ConfigurationTarget.Workspace, restoreSteps);
+      await rememberConfigValue(
+        'slurmConnect',
+        'defaultPartition',
+        isClientFixture ? process.env.SLURM_CLIENT_DEFAULT_PARTITION || '' : '',
+        vscode.ConfigurationTarget.Workspace,
+        restoreSteps
+      );
       await rememberConfigValue('slurmConnect', 'defaultTime', '', vscode.ConfigurationTarget.Workspace, restoreSteps);
       await rememberConfigValue('slurmConnect', 'defaultNodes', 1, vscode.ConfigurationTarget.Workspace, restoreSteps);
       await rememberConfigValue('slurmConnect', 'defaultTasksPerNode', 1, vscode.ConfigurationTarget.Workspace, restoreSteps);
@@ -150,7 +192,7 @@ suite('Slurm Fixture E2E', function () {
 
       const includeContent = await fs.readFile(result.includeFilePath, 'utf8');
       assert.match(includeContent, new RegExp(`^Host ${includeAlias}$`, 'm'));
-      assert.match(includeContent, new RegExp(`^  HostName ${fixture.host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+      assert.match(includeContent, new RegExp(`^  HostName ${escapeRegExp(fixture.host)}$`, 'm'));
       assert.match(includeContent, new RegExp(`^  User ${fixture.user}$`, 'm'));
       assert.match(includeContent, new RegExp(`^  Port ${fixture.port}$`, 'm'));
 
@@ -186,10 +228,7 @@ suite('Slurm Fixture E2E', function () {
 
       assert.ok(lines.includes(fixture.user), `Expected SSH alias to log in as ${fixture.user}. Output: ${stdout}`);
       assert.ok(lines.includes(fixture.home), `Expected SSH alias to use home ${fixture.home}. Output: ${stdout}`);
-      assert.ok(
-        lines.some((line) => line.startsWith('cpu') && line.includes('|2|idle')),
-        `Expected sinfo output through generated alias. Output: ${stdout}`
-      );
+      assertExpectedSinfoLine(stdout, isClientFixture);
     } finally {
       for (const restore of restoreSteps) {
         await restore();

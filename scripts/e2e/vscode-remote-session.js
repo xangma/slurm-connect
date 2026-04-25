@@ -15,11 +15,14 @@ const {
 const ROOT_DIR = path.resolve(__dirname, '../..');
 const FIXTURE_SCRIPT = path.join(ROOT_DIR, 'scripts/e2e/slurm-fixture.sh');
 const TEST_WORKSPACE_TEMPLATE = path.join(ROOT_DIR, 'test-fixtures/workspace');
-const STATE_DIR = process.env.SLURM_REMOTE_SESSION_STATE_DIR || '/tmp/slurm-connect-rsess';
+const STATE_DIR = process.env.SLURM_REMOTE_SESSION_STATE_DIR || path.join(os.tmpdir(), 'slurm-connect-rsess');
 const FIXTURE_STATE_DIR = process.env.SLURM_FIXTURE_STATE_DIR || path.join(ROOT_DIR, '.e2e/slurm-fixture');
 const REMOTE_SSH_EXTENSION_ID = process.env.SLURM_REMOTE_SSH_EXTENSION_ID || 'ms-vscode-remote.remote-ssh';
 const SSH_HOST_PREFIX = process.env.SLURM_REMOTE_SESSION_HOST_PREFIX || 'slurm-session-e2e';
 const REMOTE_SESSION_TIMEOUT_MS = Number(process.env.SLURM_REMOTE_SESSION_TIMEOUT_MS || 180000);
+const isExternalFixture =
+  process.env.SLURM_REMOTE_SESSION_EXTERNAL_FIXTURE === '1' ||
+  process.env.SLURM_CONNECT_CLIENT_FIXTURE === '1';
 
 function log(message) {
   process.stdout.write(`[remote-session] ${message}\n`);
@@ -63,7 +66,11 @@ async function resolveFixtureConfig() {
 
   for (const filePath of [config.sshConfigPath, config.privateKeyPath, config.knownHostsPath]) {
     if (!(await fileExists(filePath))) {
-      die(`Fixture file not found: ${filePath}. Run npm run e2e:slurm:up first.`);
+      die(
+        isExternalFixture
+          ? `External fixture file not found: ${filePath}. Run npm run e2e:slurm:client:prepare first.`
+          : `Fixture file not found: ${filePath}. Run npm run e2e:slurm:up first.`
+      );
     }
   }
 
@@ -90,6 +97,9 @@ function runCommand(command, args, options = {}) {
         stderr += chunk.toString('utf8');
       });
     }
+    if (options.input !== undefined && child.stdin) {
+      child.stdin.end(options.input, 'utf8');
+    }
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) {
@@ -109,9 +119,92 @@ async function ensureFixtureUp() {
   await runCommand('bash', [FIXTURE_SCRIPT, 'up']);
 }
 
-async function installProxyScript() {
+async function installDockerProxyScript() {
   log('Installing the local proxy package into the fixture');
   await runCommand('bash', [FIXTURE_SCRIPT, 'install-proxy']);
+}
+
+async function collectBundledProxyFiles(baseDir, relativeDir = '') {
+  const absoluteDir = path.join(baseDir, relativeDir);
+  const rootStats = await fs.stat(absoluteDir);
+  if (rootStats.isFile()) {
+    if (path.extname(absoluteDir) !== '.py') {
+      return [];
+    }
+    const data = await fs.readFile(absoluteDir);
+    return [
+      {
+        path: relativeDir.split(path.sep).join('/'),
+        mode: rootStats.mode & 0o777,
+        base64: data.toString('base64')
+      }
+    ];
+  }
+  const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const relativePath = path.join(relativeDir, entry.name);
+    const absolutePath = path.join(baseDir, relativePath);
+    if (entry.isDirectory()) {
+      if (entry.name === '__pycache__') {
+        continue;
+      }
+      files.push(...(await collectBundledProxyFiles(baseDir, relativePath)));
+      continue;
+    }
+    if (!entry.isFile() || path.extname(entry.name) !== '.py') {
+      continue;
+    }
+    const [data, stats] = await Promise.all([fs.readFile(absolutePath), fs.stat(absolutePath)]);
+    files.push({
+      path: relativePath.split(path.sep).join('/'),
+      mode: stats.mode & 0o777,
+      base64: data.toString('base64')
+    });
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+async function installExternalProxyScript(fixture) {
+  log('Installing the local proxy package into the external Slurm login node');
+  const mediaRoot = path.join(ROOT_DIR, 'media');
+  const files = [
+    ...(await collectBundledProxyFiles(mediaRoot, 'vscode_proxy')),
+    ...(await collectBundledProxyFiles(mediaRoot, 'vscode-proxy.py'))
+  ];
+  const installer = [
+    'import base64, json, os, sys',
+    'target = os.path.expanduser("~/.slurm-connect")',
+    'payload = json.load(sys.stdin)',
+    'os.makedirs(target, exist_ok=True)',
+    'for entry in payload["files"]:',
+    '    relative = entry["path"].split("/")',
+    '    path = os.path.join(target, *relative)',
+    '    os.makedirs(os.path.dirname(path), exist_ok=True)',
+    '    with open(path, "wb") as handle:',
+    '        handle.write(base64.b64decode(entry["base64"]))',
+    '    os.chmod(path, int(entry["mode"]))'
+  ].join('\n');
+  await runCommand(
+    'ssh',
+    ['-F', fixture.sshConfigPath, '-T', fixture.host, `python3 -c ${shellQuote(installer)}`],
+    {
+      input: JSON.stringify({ files }),
+      stdio: 'pipe'
+    }
+  );
+}
+
+async function installProxyPackage(fixture) {
+  if (isExternalFixture) {
+    await installExternalProxyScript(fixture);
+    return;
+  }
+  await installDockerProxyScript();
 }
 
 async function installRemoteSshExtension(vscodeExecutablePath, userDataDir, extensionsDir) {
@@ -163,6 +256,36 @@ async function writeUserSettings(userDataDir, baseConfigPath) {
 
 function escapeRegex(input) {
   return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildDefaultAlias(prefix, loginHost, partition, nodes, cpusPerTask) {
+  const hostShort = loginHost.split('.')[0];
+  const pieces = [prefix || 'slurm', hostShort];
+  if (partition) {
+    pieces.push(partition);
+  }
+  if (nodes && nodes > 0) {
+    pieces.push(`${nodes}n`);
+  }
+  if (cpusPerTask && cpusPerTask > 0) {
+    pieces.push(`${cpusPerTask}c`);
+  }
+  return pieces.join('-').replace(/[^a-zA-Z0-9_-]/g, '-');
+}
+
+function sanitizeRemotePathComponent(value) {
+  return String(value).replace(/[^a-zA-Z0-9_.-]/g, '-');
+}
+
+function parseJsonStringArray(value, label) {
+  if (!value) {
+    return [];
+  }
+  const parsed = JSON.parse(value);
+  if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${label} must be a JSON array of strings.`);
+  }
+  return parsed;
 }
 
 async function waitForRemoteMarker(remoteMarkerPath, statusMarkerPath, child) {
@@ -220,9 +343,13 @@ async function verifyRemoteFsMarker(fixture, remoteFsMarkerPath) {
   return marker;
 }
 
-function assertSlurmAllocationMarker(marker, label) {
-  if (!/^c[0-9]+$/.test(String(marker.hostname || ''))) {
-    throw new Error(`${label} did not report a compute-node hostname: ${JSON.stringify(marker)}`);
+function assertSlurmAllocationMarker(marker, label, expectedHostPattern) {
+  const hostname = String(marker.hostname || '').trim();
+  if (!hostname) {
+    throw new Error(`${label} did not report a hostname: ${JSON.stringify(marker)}`);
+  }
+  if (expectedHostPattern && !new RegExp(expectedHostPattern).test(hostname)) {
+    throw new Error(`${label} hostname did not match ${expectedHostPattern}: ${JSON.stringify(marker)}`);
   }
   if (!String(marker.slurmJobId || '').trim()) {
     throw new Error(`${label} did not report a Slurm job id: ${JSON.stringify(marker)}`);
@@ -231,9 +358,11 @@ function assertSlurmAllocationMarker(marker, label) {
 
 async function main() {
   await ensureDir(STATE_DIR);
-  await ensureFixtureUp();
-  await installProxyScript();
+  if (!isExternalFixture) {
+    await ensureFixtureUp();
+  }
   const fixture = await resolveFixtureConfig();
+  await installProxyPackage(fixture);
 
   const sessionDir = await fs.mkdtemp(path.join(STATE_DIR, 'run-'));
   const userDataDir = path.join(sessionDir, 'user-data');
@@ -243,10 +372,20 @@ async function main() {
   const includeConfigPath = path.join(sessionDir, 'slurm-connect.conf');
   const statusMarkerPath = path.join(sessionDir, 'status.json');
   const remoteMarkerPath = path.join(sessionDir, 'remote.json');
-  const remoteFsMarkerPath = `${fixture.home}/.slurm-connect/vscode-remote-session-marker.json`;
-  const remoteAlias = `${SSH_HOST_PREFIX}-${fixture.host.split('.')[0]}-cpu-1n-1c`.replace(/[^a-zA-Z0-9_-]/g, '-');
+  const remoteMarkerName = [
+    'vscode-remote-session-marker',
+    sanitizeRemotePathComponent(process.platform),
+    sanitizeRemotePathComponent(path.basename(sessionDir))
+  ].join('-');
+  const remoteFsMarkerPath = `${fixture.home}/.slurm-connect/${remoteMarkerName}.json`;
+  const defaultPartition = isExternalFixture ? process.env.SLURM_CLIENT_DEFAULT_PARTITION || '' : 'cpu';
+  const remoteAlias = buildDefaultAlias(SSH_HOST_PREFIX, fixture.host, defaultPartition, 1, 1);
+  const expectedComputeHostPattern = isExternalFixture
+    ? process.env.SLURM_CLIENT_EXPECTED_COMPUTE_HOST_PATTERN || ''
+    : '^c[0-9]+$';
   const stdoutLogPath = path.join(sessionDir, 'vscode.stdout.log');
   const stderrLogPath = path.join(sessionDir, 'vscode.stderr.log');
+  const extraSallocArgs = parseJsonStringArray(process.env.SLURM_CLIENT_EXTRA_SALLOC_ARGS_JSON, 'SLURM_CLIENT_EXTRA_SALLOC_ARGS_JSON');
 
   await ensureDir(userDataDir);
   await ensureDir(extensionsDir);
@@ -274,21 +413,25 @@ async function main() {
         IdentityFile: fixture.privateKeyPath,
         IdentitiesOnly: 'yes',
         Port: fixture.port,
+        StrictHostKeyChecking: 'accept-new',
         UserKnownHostsFile: fixture.knownHostsPath
       },
       sshQueryConfigPath: fixture.sshConfigPath,
       temporarySshConfigPath: includeConfigPath,
-      defaultPartition: 'cpu',
+      defaultPartition,
       defaultTime: '',
       defaultNodes: 1,
       defaultTasksPerNode: 1,
       defaultCpusPerTask: 1,
+      extraSallocArgs,
       sshHostPrefix: SSH_HOST_PREFIX,
       localProxyEnabled: false,
       sessionMode: 'ephemeral',
       openInNewWindow: true,
-      remoteWorkspacePath: fixture.home,
-      proxyCommand: 'python3 ~/.slurm-connect/vscode-proxy.py',
+      remoteWorkspacePath: process.env.SLURM_CLIENT_REMOTE_WORKSPACE_PATH || fixture.home,
+      startupCommand: process.env.SLURM_CLIENT_STARTUP_COMMAND || '',
+      moduleLoad: process.env.SLURM_CLIENT_MODULE_LOAD || '',
+      proxyCommand: process.env.SLURM_CLIENT_PROXY_COMMAND || 'python3 ~/.slurm-connect/vscode-proxy.py',
       proxyDebugLogging: true
     }),
     NODE_TLS_REJECT_UNAUTHORIZED: process.env.NODE_TLS_REJECT_UNAUTHORIZED || '0'
@@ -333,11 +476,11 @@ async function main() {
 
   try {
     const marker = await waitForRemoteMarker(remoteMarkerPath, statusMarkerPath, child);
-    assertSlurmAllocationMarker(marker, 'Remote marker');
+    assertSlurmAllocationMarker(marker, 'Remote marker', expectedComputeHostPattern);
     log(`Remote window reported authority ${marker.authority}`);
 
     const remoteFsMarker = await verifyRemoteFsMarker(fixture, remoteFsMarkerPath);
-    assertSlurmAllocationMarker(remoteFsMarker, 'Remote filesystem marker');
+    assertSlurmAllocationMarker(remoteFsMarker, 'Remote filesystem marker', expectedComputeHostPattern);
     log(`Remote filesystem marker confirmed for authority ${remoteFsMarker.authority}`);
 
     const includeContent = await fs.readFile(includeConfigPath, 'utf8');

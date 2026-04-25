@@ -75,3 +75,49 @@ jobs:
       - name: Tear down Slurm fixture
         if: always()
         run: npm run e2e:slurm:clean
+
+  slurm-client-e2e:
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    env:
+      SLURM_CLIENT_SSH_HOST: ${{ secrets.SLURM_CLIENT_SSH_HOST }}
+      SLURM_CLIENT_SSH_PORT: ${{ secrets.SLURM_CLIENT_SSH_PORT }}
+      SLURM_CLIENT_SSH_USER: ${{ secrets.SLURM_CLIENT_SSH_USER }}
+      SLURM_CLIENT_SSH_PRIVATE_KEY: ${{ secrets.SLURM_CLIENT_SSH_PRIVATE_KEY }}
+      SLURM_CLIENT_SSH_PRIVATE_KEY_B64: ${{ secrets.SLURM_CLIENT_SSH_PRIVATE_KEY_B64 }}
+      SLURM_CLIENT_KNOWN_HOSTS: ${{ secrets.SLURM_CLIENT_KNOWN_HOSTS }}
+      SLURM_CLIENT_KNOWN_HOSTS_B64: ${{ secrets.SLURM_CLIENT_KNOWN_HOSTS_B64 }}
+      SLURM_CLIENT_HOME: ${{ vars.SLURM_CLIENT_HOME }}
+      SLURM_CLIENT_DEFAULT_PARTITION: ${{ vars.SLURM_CLIENT_DEFAULT_PARTITION }}
+      SLURM_CLIENT_EXPECTED_SINFO_PATTERN: ${{ vars.SLURM_CLIENT_EXPECTED_SINFO_PATTERN }}
+      SLURM_CLIENT_EXPECTED_COMPUTE_HOST_PATTERN: ${{ vars.SLURM_CLIENT_EXPECTED_COMPUTE_HOST_PATTERN }}
+      SLURM_CLIENT_EXTRA_SALLOC_ARGS_JSON: ${{ vars.SLURM_CLIENT_EXTRA_SALLOC_ARGS_JSON }}
+      SLURM_CLIENT_REMOTE_WORKSPACE_PATH: ${{ vars.SLURM_CLIENT_REMOTE_WORKSPACE_PATH }}
+      SLURM_CLIENT_STARTUP_COMMAND: ${{ vars.SLURM_CLIENT_STARTUP_COMMAND }}
+      SLURM_CLIENT_MODULE_LOAD: ${{ vars.SLURM_CLIENT_MODULE_LOAD }}
+      SLURM_CLIENT_PROXY_COMMAND: ${{ vars.SLURM_CLIENT_PROXY_COMMAND }}
+      SLURM_CLIENT_E2E_REQUIRED: ${{ vars.SLURM_CLIENT_E2E_REQUIRED }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Extension client integration test
+        run: npm run test:integration:slurm-client
+
+      - name: Full Remote-SSH allocation session test
+        run: npm run test:integration:slurm-client-remote-session

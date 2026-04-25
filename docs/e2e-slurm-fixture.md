@@ -39,6 +39,62 @@ To remove the fixture containers and volumes:
 npm run e2e:slurm:clean
 ```
 
+## External OS Client Test
+
+The Docker fixture is Linux-only. To cover client behavior on Linux, macOS, and
+Windows, the CI workflow also defines a separate `slurm-client-e2e` matrix job
+that connects from each runner OS to an externally supplied Slurm login node.
+
+Run it locally with:
+
+```bash
+npm run test:integration:slurm-client
+npm run test:integration:slurm-client-remote-session
+```
+
+The command skips with exit code 0 unless the minimum external fixture settings
+are present:
+
+- `SLURM_CLIENT_SSH_HOST`
+- `SLURM_CLIENT_SSH_USER`
+- one of `SLURM_CLIENT_SSH_PRIVATE_KEY`, `SLURM_CLIENT_SSH_PRIVATE_KEY_B64`, or
+  `SLURM_CLIENT_SSH_PRIVATE_KEY_PATH`
+
+Optional settings:
+
+- `SLURM_CLIENT_SSH_PORT`, default `22`
+- `SLURM_CLIENT_KNOWN_HOSTS`, `SLURM_CLIENT_KNOWN_HOSTS_B64`, or
+  `SLURM_CLIENT_KNOWN_HOSTS_PATH`
+- `SLURM_CLIENT_HOME`, otherwise queried over SSH
+- `SLURM_CLIENT_DEFAULT_PARTITION`, useful for clusters without a default
+  partition
+- `SLURM_CLIENT_EXPECTED_SINFO_PATTERN`, a regular expression checked against
+  `sinfo -h -o "%P|%D|%t"`
+- `SLURM_CLIENT_EXPECTED_COMPUTE_HOST_PATTERN`, a regular expression checked
+  against the hostname reported by the remote VS Code window after allocation
+- `SLURM_CLIENT_EXTRA_SALLOC_ARGS_JSON`, a JSON array of extra `salloc`
+  arguments for clusters that require account, QoS, reservation, or similar
+  flags
+- `SLURM_CLIENT_REMOTE_WORKSPACE_PATH`, otherwise the remote home directory is
+  opened
+- `SLURM_CLIENT_STARTUP_COMMAND`, `SLURM_CLIENT_MODULE_LOAD`, or
+  `SLURM_CLIENT_PROXY_COMMAND` for clusters that need environment setup before
+  running the proxy
+- `SLURM_CLIENT_E2E_REQUIRED=1`, which turns missing configuration into a hard
+  failure instead of a skip
+
+GitHub Actions reads the same values from repository secrets and variables. The
+job intentionally skips on forks or repositories that do not provide an external
+Slurm endpoint.
+
+`npm run test:integration:slurm-client-remote-session` is the full Remote-SSH
+allocation check for the OS matrix. It installs the bundled proxy package on the
+external login node over SSH, launches an isolated VS Code window with
+Remote-SSH, starts a Slurm allocation through Slurm Connect, and verifies that
+the remote window reports both a hostname and a Slurm job id. If
+`SLURM_CLIENT_EXPECTED_COMPUTE_HOST_PATTERN` is set, the reported hostname must
+also match that pattern.
+
 ## What The Smoke Test Covers
 
 `npm run e2e:slurm:smoke` runs:
@@ -107,3 +163,8 @@ npm run e2e:slurm:settings
 - GitHub Actions also runs the fixture smoke test, the extension fixture test,
   and the full Remote-SSH session test as a separate Linux job so the real SSH +
   Slurm path is checked automatically without slowing every local developer loop.
+- GitHub Actions also defines an optional `slurm-client-e2e` OS matrix job for
+  Linux, macOS, and Windows SSH clients. It requires an externally supplied
+  Slurm login node and skips when the endpoint secrets are not configured. When
+  configured, the matrix runs both the login-node connect-flow check and the
+  full Remote-SSH allocation session check.
