@@ -361,6 +361,11 @@ smoke() {
   run_ssh_smoke
 }
 
+install_proxy() {
+  prepare
+  install_proxy_script
+}
+
 settings() {
   prepare
   print_connection_info
@@ -379,6 +384,7 @@ Commands:
   shell     Open a shell inside slurmctld
   ssh       Open an SSH shell to the exposed login node
   smoke     Run targeted readiness checks plus real SSH/Slurm smoke tests
+  install-proxy  Install the local proxy package into a running fixture
   settings  Print the generated connection info and suggested extension settings
 EOF
 }
@@ -394,6 +400,7 @@ main() {
     shell) shell ;;
     ssh) ssh_shell ;;
     smoke) smoke ;;
+    install-proxy) install_proxy ;;
     settings) settings ;;
     *) usage; [[ -n "${cmd}" ]] && exit 1 ;;
   esac

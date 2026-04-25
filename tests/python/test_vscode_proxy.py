@@ -1,6 +1,8 @@
+import errno
 import importlib.util
 import logging
 import sys
+from io import StringIO
 from pathlib import Path
 
 
@@ -17,6 +19,13 @@ def load_proxy_module():
 
 proxy = load_proxy_module()
 LOGGER = logging.getLogger("test.vscode_proxy")
+
+
+def run_proxy_main(monkeypatch, *args):
+    stderr = StringIO()
+    monkeypatch.setattr(proxy.app.sys, "argv", ["vscode-proxy.py", *args])
+    monkeypatch.setattr(proxy.app.sys, "stderr", stderr)
+    return proxy.app.main(), stderr.getvalue()
 
 
 def test_parse_listening_on_line_and_rewrite():
@@ -338,3 +347,53 @@ def test_build_arg_parser_defaults():
     assert args.session_mode == "ephemeral"
     assert args.listen_host == "127.0.0.1"
     assert args.listen_port == 0
+
+
+def test_main_rejects_invalid_numeric_args(monkeypatch):
+    code, stderr = run_proxy_main(monkeypatch, "--byte-limit=0")
+
+    assert code == errno.EINVAL
+    assert "--byte-limit must be > 0." in stderr
+
+
+def test_main_reports_tee_file_open_failures(tmp_path, monkeypatch):
+    missing_parent_path = tmp_path / "missing" / "stdin.log"
+
+    code, stderr = run_proxy_main(monkeypatch, f"--tee-stdin={missing_parent_path}")
+
+    assert code == 1
+    assert "Failed to open stdin tee file" in stderr
+
+
+def test_main_disables_incomplete_local_proxy_tunnel_config(monkeypatch):
+    class FakeLogger:
+        def __init__(self):
+            self.warnings = []
+
+        def warning(self, message, *args):
+            self.warnings.append(message % args if args else message)
+
+        def info(self, *args, **kwargs):
+            pass
+
+        def error(self, *args, **kwargs):
+            pass
+
+        def critical(self, *args, **kwargs):
+            pass
+
+    logger = FakeLogger()
+    monkeypatch.setattr(proxy.app, "configure_logging", lambda _args, _stderr_stream: logger)
+
+    def stop_before_launch(_logger):
+        raise RuntimeError("stop after tunnel validation")
+
+    monkeypatch.setattr(proxy.app, "resolve_workgroup_invoker", stop_before_launch)
+
+    code, _stderr = run_proxy_main(monkeypatch, "--local-proxy-tunnel")
+
+    assert code == errno.EINVAL
+    assert logger.warnings == [
+        "Local proxy tunnel disabled; missing local-proxy-tunnel-host, "
+        "local-proxy-tunnel-port, local-proxy-auth-user, local-proxy-auth-token."
+    ]

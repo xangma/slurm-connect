@@ -6,7 +6,6 @@ import { buildHostEntry } from '../utils/sshConfig';
 import type { ConnectToken } from '../state/connectionState';
 import type {
   LocalProxyTunnelMode,
-  SessionMode,
   SlurmConnectConfig
 } from '../config/types';
 import type {

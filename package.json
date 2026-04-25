@@ -324,7 +324,7 @@
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
     "lint:ts": "eslint src vitest.config.ts --ext .ts",
-    "lint:py": "python3 -m ruff check media/vscode-proxy.py tests/python",
+    "lint:py": "python3 -m ruff check media/vscode-proxy.py media/vscode_proxy tests/python",
     "lint": "npm run lint:ts && npm run lint:py",
     "test": "npm run test:unit",
     "test:unit": "vitest run",

@@ -11,7 +11,6 @@ import {
   SLURM_CONNECT_INCLUDE_END,
   SLURM_CONNECT_INCLUDE_START
 } from '../utils/sshConfig';
-import type { SshCommandRuntime } from './commands';
 
 export interface SshConfigRuntime {
   fileExists(filePath: string): Promise<boolean>;

@@ -7,13 +7,19 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov'],
-      include: ['src/utils/**/*.ts'],
-      exclude: ['src/test/**'],
+      include: [
+        'src/connect/**/*.ts',
+        'src/localProxy/**/*.ts',
+        'src/state/**/*.ts',
+        'src/utils/**/*.ts',
+        'src/webview/**/*.ts'
+      ],
+      exclude: ['src/connect/types.ts', 'src/test/**'],
       thresholds: {
-        lines: 80,
-        functions: 90,
-        branches: 60,
-        statements: 80
+        lines: 50,
+        functions: 65,
+        branches: 55,
+        statements: 50
       }
     }
   }

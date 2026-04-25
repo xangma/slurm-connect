@@ -109,6 +109,11 @@ async function ensureFixtureUp() {
   await runCommand('bash', [FIXTURE_SCRIPT, 'up']);
 }
 
+async function installProxyScript() {
+  log('Installing the local proxy package into the fixture');
+  await runCommand('bash', [FIXTURE_SCRIPT, 'install-proxy']);
+}
+
 async function installRemoteSshExtension(vscodeExecutablePath, userDataDir, extensionsDir) {
   const cliArgs = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath, {
     platform: systemDefaultPlatform,
@@ -215,9 +220,19 @@ async function verifyRemoteFsMarker(fixture, remoteFsMarkerPath) {
   return marker;
 }
 
+function assertSlurmAllocationMarker(marker, label) {
+  if (!/^c[0-9]+$/.test(String(marker.hostname || ''))) {
+    throw new Error(`${label} did not report a compute-node hostname: ${JSON.stringify(marker)}`);
+  }
+  if (!String(marker.slurmJobId || '').trim()) {
+    throw new Error(`${label} did not report a Slurm job id: ${JSON.stringify(marker)}`);
+  }
+}
+
 async function main() {
   await ensureDir(STATE_DIR);
   await ensureFixtureUp();
+  await installProxyScript();
   const fixture = await resolveFixtureConfig();
 
   const sessionDir = await fs.mkdtemp(path.join(STATE_DIR, 'run-'));
@@ -318,14 +333,19 @@ async function main() {
 
   try {
     const marker = await waitForRemoteMarker(remoteMarkerPath, statusMarkerPath, child);
+    assertSlurmAllocationMarker(marker, 'Remote marker');
     log(`Remote window reported authority ${marker.authority}`);
 
     const remoteFsMarker = await verifyRemoteFsMarker(fixture, remoteFsMarkerPath);
+    assertSlurmAllocationMarker(remoteFsMarker, 'Remote filesystem marker');
     log(`Remote filesystem marker confirmed for authority ${remoteFsMarker.authority}`);
 
     const includeContent = await fs.readFile(includeConfigPath, 'utf8');
     if (!new RegExp(`^Host ${escapeRegex(remoteAlias)}$`, 'm').test(includeContent)) {
       throw new Error(`Generated include file did not contain alias ${remoteAlias}`);
+    }
+    if (!/^\s*RemoteCommand .*vscode-proxy\.py/m.test(includeContent)) {
+      throw new Error('Generated include file did not contain the expected proxy RemoteCommand.');
     }
 
     log(`Session artifacts: ${sessionDir}`);

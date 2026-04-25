@@ -184,7 +184,7 @@ function createDependencies(overrides: Partial<SlurmConnectWebviewDependencies> 
 
 describe('SlurmConnectViewProvider', () => {
   let onDidReceiveMessage:
-    | ((message: { command: string; name?: string }) => void | Promise<void>)
+    | ((message: Record<string, unknown>) => void | Promise<void>)
     | undefined;
   let postedMessages: unknown[];
 
@@ -193,12 +193,7 @@ describe('SlurmConnectViewProvider', () => {
     postedMessages = [];
   });
 
-  it('keeps the active profile when loading a missing profile fails', async () => {
-    const provider = new SlurmConnectViewProvider(
-      { extensionUri: {} } as never,
-      createDependencies()
-    );
-
+  function resolveProvider(provider: SlurmConnectViewProvider): void {
     const webview = {
       options: undefined,
       html: '',
@@ -220,6 +215,15 @@ describe('SlurmConnectViewProvider', () => {
         }
       } as never
     );
+  }
+
+  it('keeps the active profile when loading a missing profile fails', async () => {
+    const provider = new SlurmConnectViewProvider(
+      { extensionUri: {} } as never,
+      createDependencies()
+    );
+
+    resolveProvider(provider);
 
     expect(onDidReceiveMessage).toBeTypeOf('function');
     await onDidReceiveMessage?.({ command: 'loadProfile', name: 'missing' });
@@ -230,6 +234,108 @@ describe('SlurmConnectViewProvider', () => {
       activeProfile: 'current',
       profileStatus: 'Profile "missing" not found.',
       profileError: true
+    });
+  });
+
+  it('posts ready payload with cached cluster info and refreshed SSH hosts', async () => {
+    const loadSshHosts = vi.fn(async () => ({ hosts: ['login1'], source: 'config' }));
+    const buildOverridesFromUi = vi.fn(() => ({ defaultPartition: 'gpu' }));
+    const provider = new SlurmConnectViewProvider(
+      { extensionUri: {} } as never,
+      createDependencies({
+        getReadyPayload: async () => ({
+          values: {
+            loginHosts: 'login1',
+            identityFile: '~/.ssh/id_ed25519'
+          },
+          defaults: {},
+          profiles: [{ name: 'current', updatedAt: '2026-01-01T00:00:00Z' }],
+          profileSummaries: {},
+          activeProfile: 'current',
+          connectionState: 'idle',
+          connectionSessionMode: 'persistent',
+          remoteActive: false,
+          saveTarget: 'global'
+        }),
+        getProfileValues: () => ({
+          ...createUiDefaults(),
+          loginHosts: 'login1',
+          identityFile: '~/.ssh/id_ed25519'
+        }),
+        buildAgentStatusMessage: async () => ({ text: 'Agent ready', isError: false }),
+        firstLoginHostFromInput: () => 'login1',
+        getCachedClusterInfo: () => ({
+          info: { partitions: ['gpu'] } as never,
+          fetchedAt: '2026-01-01T00:00:00Z'
+        }),
+        buildOverridesFromUi,
+        loadSshHosts
+      })
+    );
+
+    resolveProvider(provider);
+
+    await onDidReceiveMessage?.({ command: 'ready' });
+    await Promise.resolve();
+
+    expect(postedMessages[0]).toMatchObject({
+      command: 'load',
+      activeProfile: 'current',
+      agentStatus: 'Agent ready',
+      clusterInfo: { partitions: ['gpu'] },
+      clusterInfoCachedAt: '2026-01-01T00:00:00Z'
+    });
+    expect(buildOverridesFromUi).toHaveBeenCalledWith({
+      loginHosts: 'login1',
+      identityFile: '~/.ssh/id_ed25519'
+    });
+    expect(loadSshHosts).toHaveBeenCalledWith({ defaultPartition: 'gpu' });
+    expect(postedMessages).toContainEqual({
+      command: 'sshHosts',
+      hosts: ['login1'],
+      source: 'config',
+      error: undefined
+    });
+  });
+
+  it('resolves SSH host messages using UI overrides', async () => {
+    const buildOverridesFromUi = vi.fn(() => ({ user: 'bob' }));
+    const getConfigWithOverrides = vi.fn(() => createDependencies().getConfigWithOverrides({ user: 'bob' }));
+    const resolveSshHostFromConfig = vi.fn(async () => ({
+      host: 'login1',
+      user: 'bob',
+      identityFile: '~/.ssh/id_ed25519',
+      hasProxyCommand: false,
+      hasProxyJump: false,
+      hasExplicitHost: true
+    }));
+    const provider = new SlurmConnectViewProvider(
+      { extensionUri: {} } as never,
+      createDependencies({
+        buildOverridesFromUi,
+        getConfigWithOverrides,
+        resolveSshHostFromConfig
+      })
+    );
+
+    resolveProvider(provider);
+
+    await onDidReceiveMessage?.({
+      command: 'resolveSshHost',
+      host: ' login1 ',
+      values: { user: 'bob' }
+    });
+
+    expect(buildOverridesFromUi).toHaveBeenCalledWith({ user: 'bob' });
+    expect(getConfigWithOverrides).toHaveBeenCalledWith({ user: 'bob' });
+    expect(resolveSshHostFromConfig).toHaveBeenCalledWith(
+      'login1',
+      expect.objectContaining({ user: 'alice' })
+    );
+    expect(postedMessages[0]).toMatchObject({
+      command: 'sshHostResolved',
+      host: 'login1',
+      user: 'bob'
     });
   });
 });

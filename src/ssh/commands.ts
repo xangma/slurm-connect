@@ -5,7 +5,6 @@ import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 
 import { expandHome } from '../utils/sshConfig';
-import { quoteShellArg } from '../utils/shellArgs';
 import type { SlurmConnectConfig } from '../config/types';
 
 const execFileAsync = promisify(execFile);
@@ -76,7 +75,6 @@ export interface SshCommandRuntime {
   resetState(): void;
 }
 
-const WINDOWS_OPENSSH_PATH = 'C:\\Windows\\System32\\OpenSSH\\ssh.exe';
 const WINDOWS_OPENSSH_AGENT_PIPE = '\\\\.\\pipe\\openssh-ssh-agent';
 const SSH_VERSION_TIMEOUT_MS = 10_000;
 const HAS_WOW64 = Object.prototype.hasOwnProperty.call(process.env, 'PROCESSOR_ARCHITEW6432');
@@ -124,18 +122,6 @@ export function createSshCommandRuntime(deps: SshCommandDependencies): SshComman
     const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
     const configured = String(remoteCfg.get<string>('path') || '').trim();
     return configured ? stripOuterQuotes(configured) : '';
-  }
-
-  async function listSshPathsFromWhere(): Promise<string[]> {
-    try {
-      const { stdout } = await execFileAsync('where', ['ssh']);
-      return stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-    } catch {
-      return [];
-    }
   }
 
   function isGitSshPath(value: string): boolean {
