@@ -331,6 +331,14 @@ function buildProxyArgs(
     if (tunnel.noProxy) {
       args.push(`--local-proxy-no-proxy=${tunnel.noProxy}`);
     }
+    const probeUrl = (process.env.SLURM_CONNECT_SESSION_E2E_PROXY_PROBE_TARGET_URL || '').trim();
+    if (probeUrl) {
+      args.push(`--local-proxy-probe-url=${probeUrl}`);
+      const probeToken = (process.env.SLURM_CONNECT_SESSION_E2E_PROXY_PROBE_EXPECTED_TOKEN || '').trim();
+      if (probeToken) {
+        args.push(`--local-proxy-probe-token=${probeToken}`);
+      }
+    }
   }
   const key = (sessionKey || cfg.sessionKey || '').trim();
   if (cfg.sessionMode !== 'persistent') {

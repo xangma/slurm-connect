@@ -167,6 +167,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="ConnectTimeout (seconds) for compute-node SSH tunnel.",
     )
+    parser.add_argument(
+        "--local-proxy-probe-url",
+        default="",
+        help="Run a one-shot HTTP proxy probe against this URL after proxy env is set.",
+    )
+    parser.add_argument(
+        "--local-proxy-probe-token",
+        default="",
+        help="Expected token for --local-proxy-probe-url responses.",
+    )
     return parser
 
 

@@ -43,6 +43,79 @@ def build_proxy_env_exports(proxy_url: str, no_proxy: str) -> list[str]:
     return exports
 
 
+def build_local_proxy_probe_commands(config: LocalProxyTunnelConfig) -> list[str]:
+    if not config.probe_url:
+        return []
+
+    return [
+        f"export SLURM_CONNECT_LOCAL_PROXY_PROBE_URL={shlex.quote(config.probe_url)}",
+        f"export SLURM_CONNECT_LOCAL_PROXY_PROBE_TOKEN={shlex.quote(config.probe_token)}",
+        'if [ -z "${PYTHON:-}" ]; then',
+        "  PYTHON=$(command -v python3 || command -v python || true)",
+        "fi",
+        'if [ -z "$PYTHON" ]; then',
+        '  echo "Slurm Connect: python not available for local proxy probe." >&2',
+        "  exit 1",
+        "fi",
+        '"$PYTHON" - <<\'PY\'',
+        "import base64",
+        "import http.client",
+        "import os",
+        "import sys",
+        "from urllib.parse import unquote, urlparse",
+        "",
+        "url = os.environ['SLURM_CONNECT_LOCAL_PROXY_PROBE_URL']",
+        "token = os.environ.get('SLURM_CONNECT_LOCAL_PROXY_PROBE_TOKEN', '')",
+        "proxy_url = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')",
+        "if not proxy_url:",
+        "    sys.stderr.write('Slurm Connect: local proxy probe missing HTTP_PROXY.\\n')",
+        "    sys.exit(1)",
+        "proxy = urlparse(proxy_url)",
+        "if proxy.scheme != 'http' or not proxy.hostname:",
+        "    sys.stderr.write('Slurm Connect: local proxy probe requires an HTTP proxy.\\n')",
+        "    sys.exit(1)",
+        "headers = {}",
+        "target = urlparse(url)",
+        "if target.netloc:",
+        "    headers['Host'] = target.netloc",
+        "if token:",
+        "    headers['X-Slurm-Connect-Proxy-Probe'] = token",
+        "if proxy.username or proxy.password:",
+        "    user = unquote(proxy.username or '')",
+        "    password = unquote(proxy.password or '')",
+        "    auth = base64.b64encode(f'{user}:{password}'.encode()).decode()",
+        "    headers['Proxy-Authorization'] = f'Basic {auth}'",
+        "conn = None",
+        "try:",
+        "    conn = http.client.HTTPConnection(",
+        "        proxy.hostname, proxy.port or 80, timeout=30",
+        "    )",
+        "    conn.request('GET', url, headers=headers)",
+        "    response = conn.getresponse()",
+        "    body = response.read().decode('utf-8', 'replace')",
+        "except Exception as exc:",
+        "    sys.stderr.write(f'Slurm Connect: local proxy probe failed: {exc}\\n')",
+        "    sys.exit(1)",
+        "finally:",
+        "    if conn is not None:",
+        "        try:",
+        "            conn.close()",
+        "        except Exception:",
+        "            pass",
+        "if response.status < 200 or response.status >= 300:",
+        "    sys.stderr.write(",
+        "        f'Slurm Connect: local proxy probe returned HTTP {response.status}.\\n'",
+        "    )",
+        "    sys.exit(1)",
+        "if token and token not in body:",
+        "    sys.stderr.write(",
+        "        'Slurm Connect: local proxy probe response did not include token.\\n'",
+        "    )",
+        "    sys.exit(1)",
+        "PY",
+    ]
+
+
 def build_tunnel_shell_command(
     shell_cmd: list[str], config: LocalProxyTunnelConfig
 ) -> list[str]:
@@ -112,7 +185,8 @@ def build_tunnel_shell_command(
     if shell_cmd and shell_cmd[0] == "/bin/bash" and "-l" in shell_cmd:
         exec_shell_cmd = ["/bin/bash"]
     exec_cmd = f"exec {shlex.join(exec_shell_cmd)}"
-    pieces = [*pick_port, start_tunnel, wait_cmd, verify_cmd, *exports, exec_cmd]
+    probe = build_local_proxy_probe_commands(config)
+    pieces = [*pick_port, start_tunnel, wait_cmd, verify_cmd, *exports, *probe, exec_cmd]
     wrapped = "\n".join(pieces)
     return ["/bin/bash", "-lc", wrapped]
 
@@ -128,7 +202,8 @@ def build_login_proxy_shell_command(
     if shell_cmd and shell_cmd[0] == "/bin/bash" and "-l" in shell_cmd:
         exec_shell_cmd = ["/bin/bash"]
     exec_cmd = f"exec {shlex.join(exec_shell_cmd)}"
-    wrapped = "\n".join([*exports, exec_cmd])
+    probe = build_local_proxy_probe_commands(config)
+    wrapped = "\n".join([*exports, *probe, exec_cmd])
     return ["/bin/bash", "-lc", wrapped]
 
 

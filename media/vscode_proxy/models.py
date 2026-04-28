@@ -122,6 +122,8 @@ class LocalProxyTunnelConfig:
     proxy_token: str
     no_proxy: str
     timeout: Optional[int]
+    probe_url: str = ""
+    probe_token: str = ""
 
 
 class TeeStream:

@@ -199,6 +199,9 @@ function shouldSkip(env, privateKey) {
   if (hasMinimumConfig) {
     return false;
   }
+  if (normalizeBoolean(env.SLURM_CLIENT_ALLOW_SKIP)) {
+    return true;
+  }
   return !normalizeBoolean(env.SLURM_CLIENT_E2E_REQUIRED);
 }
 

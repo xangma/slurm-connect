@@ -25,6 +25,7 @@ npm run e2e:slurm:up
 npm run e2e:slurm:smoke
 npm run test:integration:slurm
 npm run e2e:slurm:remote-session
+npm run e2e:slurm:local-proxy-session
 ```
 
 To stop the fixture:
@@ -71,7 +72,7 @@ Optional settings:
 - `SLURM_CLIENT_EXPECTED_SINFO_PATTERN`, a regular expression checked against
   `sinfo -h -o "%P|%D|%t"`
 - `SLURM_CLIENT_EXPECTED_COMPUTE_HOST_PATTERN`, a regular expression checked
-  against the hostname reported by the remote VS Code window after allocation
+  against the hostname reported by the remote filesystem marker after allocation
 - `SLURM_CLIENT_EXTRA_SALLOC_ARGS_JSON`, a JSON array of extra `salloc`
   arguments for clusters that require account, QoS, reservation, or similar
   flags
@@ -80,20 +81,37 @@ Optional settings:
 - `SLURM_CLIENT_STARTUP_COMMAND`, `SLURM_CLIENT_MODULE_LOAD`, or
   `SLURM_CLIENT_PROXY_COMMAND` for clusters that need environment setup before
   running the proxy
+- `SLURM_CLIENT_LOCAL_PROXY_REMOTE_HOST` if compute nodes must SSH back to a
+  different login-host name when creating the local-proxy compute tunnel
+- `SLURM_CLIENT_LOCAL_PROXY_TARGET_HOST` if the client runner must advertise a
+  specific non-loopback IPv4 address for the client-side probe server
+- `SLURM_CLIENT_LOCAL_PROXY_COMPUTE_TUNNEL=0` to test without the compute-node
+  SSH tunnel on clusters where the login-host remote forward is reachable
+  directly from compute nodes
 - `SLURM_CLIENT_E2E_REQUIRED=1`, which turns missing configuration into a hard
-  failure instead of a skip
+  failure instead of a skip. The GitHub Actions client matrix defaults this to
+  `1` for same-repository runs so missing fixture configuration is reported
+  immediately.
 
 GitHub Actions reads the same values from repository secrets and variables. The
-job intentionally skips on forks or repositories that do not provide an external
-Slurm endpoint.
+job skips for fork pull requests where repository secrets are intentionally not
+available. For same-repository pushes and pull requests, missing required
+fixture settings fail the `slurm-client-e2e` matrix instead of silently skipping.
 
 `npm run test:integration:slurm-client-remote-session` is the full Remote-SSH
 allocation check for the OS matrix. It installs the bundled proxy package on the
 external login node over SSH, launches an isolated VS Code window with
 Remote-SSH, starts a Slurm allocation through Slurm Connect, and verifies that
-the remote window reports both a hostname and a Slurm job id. If
+the remote filesystem marker reports both a hostname and a Slurm job id. If
 `SLURM_CLIENT_EXPECTED_COMPUTE_HOST_PATTERN` is set, the reported hostname must
 also match that pattern.
+
+`npm run test:integration:slurm-client-local-proxy` runs the same Remote-SSH
+allocation path with `slurmConnect.localProxyEnabled=true`. The client starts a
+tokenized HTTP probe server, the remote extension host performs an HTTP request
+through the remote `HTTP_PROXY` value, and the client verifies that the probe
+server received the request. In CI this runs in the Linux, macOS, and Windows
+client matrix.
 
 ## What The Smoke Test Covers
 
@@ -123,6 +141,15 @@ that:
 - the remote window opens with `ssh-remote` authority for the generated alias
 - the remote filesystem provider becomes available
 - the remote window can write a marker file back onto the fixture host
+
+`npm run e2e:slurm:local-proxy-session` runs the same local fixture path with
+`slurmConnect.localProxyEnabled=true`, starts a tokenized HTTP server on the
+client, and verifies that a request from the remote allocation returns to that
+client-side server through the local proxy. The probe first tries non-loopback
+client IPv4 addresses, then falls back to `127-0-0-1.sslip.io` so local runs work
+on machines that cannot connect back to their own LAN address. This proxy-focused
+test skips the separate remote filesystem marker assertion; that assertion is
+covered by `npm run e2e:slurm:remote-session`.
 
 ## Suggested Extension Settings
 
@@ -165,6 +192,8 @@ npm run e2e:slurm:settings
   Slurm path is checked automatically without slowing every local developer loop.
 - GitHub Actions also defines an optional `slurm-client-e2e` OS matrix job for
   Linux, macOS, and Windows SSH clients. It requires an externally supplied
-  Slurm login node and skips when the endpoint secrets are not configured. When
-  configured, the matrix runs both the login-node connect-flow check and the
-  full Remote-SSH allocation session check.
+  Slurm login node. Same-repository runs fail fast when the endpoint secrets are
+  missing; fork pull requests skip because GitHub does not expose those secrets
+  to forks. When configured, the matrix runs both the login-node connect-flow
+  check and the full Remote-SSH allocation session checks, including local proxy
+  routing back to the client.

@@ -133,6 +133,8 @@ def main() -> int:
                 timeout=args.local_proxy_tunnel_timeout
                 if args.local_proxy_tunnel_timeout > 0
                 else None,
+                probe_url=args.local_proxy_probe_url or "",
+                probe_token=args.local_proxy_probe_token or "",
             )
 
     workgroup: Optional[str] = None

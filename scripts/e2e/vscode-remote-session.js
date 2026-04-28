@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 const cp = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs/promises');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 
@@ -15,7 +17,11 @@ const {
 const ROOT_DIR = path.resolve(__dirname, '../..');
 const FIXTURE_SCRIPT = path.join(ROOT_DIR, 'scripts/e2e/slurm-fixture.sh');
 const TEST_WORKSPACE_TEMPLATE = path.join(ROOT_DIR, 'test-fixtures/workspace');
-const STATE_DIR = process.env.SLURM_REMOTE_SESSION_STATE_DIR || path.join(os.tmpdir(), 'slurm-connect-rsess');
+const DEFAULT_STATE_DIR =
+  process.platform === 'darwin'
+    ? '/tmp/sc-rsess'
+    : path.join(os.tmpdir(), 'slurm-connect-rsess');
+const STATE_DIR = process.env.SLURM_REMOTE_SESSION_STATE_DIR || DEFAULT_STATE_DIR;
 const FIXTURE_STATE_DIR = process.env.SLURM_FIXTURE_STATE_DIR || path.join(ROOT_DIR, '.e2e/slurm-fixture');
 const REMOTE_SSH_EXTENSION_ID = process.env.SLURM_REMOTE_SSH_EXTENSION_ID || 'ms-vscode-remote.remote-ssh';
 const SSH_HOST_PREFIX = process.env.SLURM_REMOTE_SESSION_HOST_PREFIX || 'slurm-session-e2e';
@@ -23,6 +29,8 @@ const REMOTE_SESSION_TIMEOUT_MS = Number(process.env.SLURM_REMOTE_SESSION_TIMEOU
 const isExternalFixture =
   process.env.SLURM_REMOTE_SESSION_EXTERNAL_FIXTURE === '1' ||
   process.env.SLURM_CONNECT_CLIENT_FIXTURE === '1';
+const enableLocalProxyE2E = process.env.SLURM_REMOTE_SESSION_ENABLE_LOCAL_PROXY_E2E === '1';
+const skipRemoteFsMarker = process.env.SLURM_REMOTE_SESSION_SKIP_REMOTE_FS_MARKER === '1';
 
 function log(message) {
   process.stdout.write(`[remote-session] ${message}\n`);
@@ -288,6 +296,108 @@ function parseJsonStringArray(value, label) {
   return parsed;
 }
 
+function getIpv4Candidates() {
+  const configured = String(process.env.SLURM_CLIENT_LOCAL_PROXY_TARGET_HOST || '').trim();
+  if (configured) {
+    return [configured];
+  }
+  const candidates = [];
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (entry.family === 'IPv4' && !entry.internal && entry.address) {
+        candidates.push(entry.address);
+      }
+    }
+  }
+  return [...new Set([...candidates, '127-0-0-1.sslip.io'])];
+}
+
+function requestLocalUrl(url, timeoutMs = 1500) {
+  return new Promise((resolve, reject) => {
+    const request = http.get(url, { timeout: timeoutMs }, (response) => {
+      response.resume();
+      response.on('end', () => {
+        resolve(response.statusCode || 0);
+      });
+    });
+    request.on('timeout', () => {
+      request.destroy(new Error(`Timed out probing ${url}`));
+    });
+    request.on('error', reject);
+  });
+}
+
+async function startLocalProxyProbeServer(sessionDir) {
+  if (!enableLocalProxyE2E) {
+    return undefined;
+  }
+  const token = crypto.randomBytes(16).toString('hex');
+  const probePath = `/slurm-connect-local-proxy-e2e/${token}`;
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push({
+      method: request.method || '',
+      url: request.url || '',
+      headers: request.headers,
+      remoteAddress: request.socket.remoteAddress || '',
+      at: new Date().toISOString()
+    });
+    if (request.url === `/health/${token}`) {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+    if (request.url === probePath) {
+      response.writeHead(200, { 'Content-Type': 'text/plain' });
+      response.end(`slurm-connect-local-proxy-e2e:${token}`);
+      return;
+    }
+    response.writeHead(404, { 'Content-Type': 'text/plain' });
+    response.end('not found');
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '0.0.0.0', () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+  const port = server.address().port;
+  const candidates = getIpv4Candidates();
+  let selectedHost = '';
+  for (const candidate of candidates) {
+    try {
+      const statusCode = await requestLocalUrl(`http://${candidate}:${port}/health/${token}`);
+      if (statusCode === 204) {
+        selectedHost = candidate;
+        break;
+      }
+    } catch {
+      // Try the next interface address.
+    }
+  }
+  if (!selectedHost) {
+    await new Promise((resolve) => server.close(resolve));
+    throw new Error(
+      `Local proxy E2E could not find a reachable non-loopback client IPv4 address. Candidates: ${candidates.join(', ') || '(none)'}`
+    );
+  }
+  requests.length = 0;
+  const targetUrl = `http://${selectedHost}:${port}${probePath}`;
+  const requestsPath = path.join(sessionDir, 'local-proxy-requests.json');
+  log(`Local proxy E2E target listening at ${targetUrl}`);
+  return {
+    targetUrl,
+    token,
+    requestsPath,
+    getRequests: () => requests.slice(),
+    close: async () => {
+      await fs.writeFile(requestsPath, JSON.stringify(requests, null, 2), 'utf8').catch(() => undefined);
+      await new Promise((resolve) => server.close(resolve));
+    }
+  };
+}
+
 async function waitForRemoteMarker(remoteMarkerPath, statusMarkerPath, child) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < REMOTE_SESSION_TIMEOUT_MS) {
@@ -322,6 +432,34 @@ async function waitForRemoteMarker(remoteMarkerPath, statusMarkerPath, child) {
   }
 
   throw new Error(`Timed out after ${REMOTE_SESSION_TIMEOUT_MS}ms waiting for the remote session marker.`);
+}
+
+async function waitForLocalProxyProbeRequest(localProxyProbe, child) {
+  const targetPath = new URL(localProxyProbe.targetUrl).pathname;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 60000) {
+    const requests = localProxyProbe.getRequests();
+    if (
+      requests.some(
+        (request) =>
+          request.url === targetPath &&
+          request.headers['x-slurm-connect-proxy-probe'] === localProxyProbe.token
+      )
+    ) {
+      return requests;
+    }
+    if (child.exitCode !== null) {
+      throw new Error(
+        `VS Code exited before the local proxy probe reached the client server (exit code ${child.exitCode}). Requests: ${JSON.stringify(requests)}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(
+    `Timed out waiting for the remote local proxy probe to reach the client server. Requests: ${JSON.stringify(
+      localProxyProbe.getRequests()
+    )}`
+  );
 }
 
 async function verifyRemoteFsMarker(fixture, remoteFsMarkerPath) {
@@ -365,6 +503,7 @@ async function main() {
   await installProxyPackage(fixture);
 
   const sessionDir = await fs.mkdtemp(path.join(STATE_DIR, 'run-'));
+  const localProxyProbe = await startLocalProxyProbeServer(sessionDir);
   const userDataDir = path.join(sessionDir, 'user-data');
   const extensionsDir = path.join(sessionDir, 'extensions');
   const workspaceDir = await prepareWorkspace(sessionDir);
@@ -403,8 +542,11 @@ async function main() {
     SLURM_CONNECT_SESSION_E2E_MODE: 'noninteractive',
     SLURM_CONNECT_SESSION_E2E_STATUS_MARKER: statusMarkerPath,
     SLURM_CONNECT_SESSION_E2E_REMOTE_MARKER: remoteMarkerPath,
-    SLURM_CONNECT_SESSION_E2E_REMOTE_FS_MARKER: remoteFsMarkerPath,
+    SLURM_CONNECT_SESSION_E2E_REMOTE_FS_MARKER: skipRemoteFsMarker ? '' : remoteFsMarkerPath,
+    SLURM_CONNECT_SESSION_E2E_SKIP_REMOTE_FS_MARKER: skipRemoteFsMarker ? '1' : '',
     SLURM_CONNECT_SESSION_E2E_EXPECTED_ALIAS: remoteAlias,
+    SLURM_CONNECT_SESSION_E2E_PROXY_PROBE_TARGET_URL: localProxyProbe?.targetUrl || '',
+    SLURM_CONNECT_SESSION_E2E_PROXY_PROBE_EXPECTED_TOKEN: localProxyProbe?.token || '',
     SLURM_CONNECT_SESSION_E2E_CONNECT_OVERRIDES: JSON.stringify({
       loginHosts: [fixture.host],
       user: fixture.user,
@@ -425,7 +567,13 @@ async function main() {
       defaultCpusPerTask: 1,
       extraSallocArgs,
       sshHostPrefix: SSH_HOST_PREFIX,
-      localProxyEnabled: false,
+      localProxyEnabled: enableLocalProxyE2E,
+      localProxyTunnelMode: 'remoteSsh',
+      localProxyComputeTunnel:
+        process.env.SLURM_CLIENT_LOCAL_PROXY_COMPUTE_TUNNEL === undefined
+          ? true
+          : /^(1|true|yes)$/i.test(process.env.SLURM_CLIENT_LOCAL_PROXY_COMPUTE_TUNNEL),
+      localProxyRemoteHost: process.env.SLURM_CLIENT_LOCAL_PROXY_REMOTE_HOST || '',
       sessionMode: 'ephemeral',
       openInNewWindow: true,
       remoteWorkspacePath: process.env.SLURM_CLIENT_REMOTE_WORKSPACE_PATH || fixture.home,
@@ -476,12 +624,19 @@ async function main() {
 
   try {
     const marker = await waitForRemoteMarker(remoteMarkerPath, statusMarkerPath, child);
-    assertSlurmAllocationMarker(marker, 'Remote marker', expectedComputeHostPattern);
+    if (marker.remoteName !== 'ssh-remote') {
+      throw new Error(`Remote marker did not report an SSH remote window: ${JSON.stringify(marker)}`);
+    }
+    if (skipRemoteFsMarker && !localProxyProbe) {
+      throw new Error('Remote filesystem marker was skipped without the local proxy probe proof enabled.');
+    }
     log(`Remote window reported authority ${marker.authority}`);
 
-    const remoteFsMarker = await verifyRemoteFsMarker(fixture, remoteFsMarkerPath);
-    assertSlurmAllocationMarker(remoteFsMarker, 'Remote filesystem marker', expectedComputeHostPattern);
-    log(`Remote filesystem marker confirmed for authority ${remoteFsMarker.authority}`);
+    if (!skipRemoteFsMarker) {
+      const remoteFsMarker = await verifyRemoteFsMarker(fixture, remoteFsMarkerPath);
+      assertSlurmAllocationMarker(remoteFsMarker, 'Remote filesystem marker', expectedComputeHostPattern);
+      log(`Remote filesystem marker confirmed for authority ${remoteFsMarker.authority}`);
+    }
 
     const includeContent = await fs.readFile(includeConfigPath, 'utf8');
     if (!new RegExp(`^Host ${escapeRegex(remoteAlias)}$`, 'm').test(includeContent)) {
@@ -490,6 +645,13 @@ async function main() {
     if (!/^\s*RemoteCommand .*vscode-proxy\.py/m.test(includeContent)) {
       throw new Error('Generated include file did not contain the expected proxy RemoteCommand.');
     }
+    if (localProxyProbe) {
+      if (!/^\s*RemoteForward /m.test(includeContent)) {
+        throw new Error('Generated include file did not contain a RemoteForward for the local proxy.');
+      }
+      await waitForLocalProxyProbeRequest(localProxyProbe, child);
+      log(`Local proxy probe confirmed through client server (${localProxyProbe.requestsPath})`);
+    }
 
     log(`Session artifacts: ${sessionDir}`);
   } finally {
@@ -497,6 +659,9 @@ async function main() {
     await fs.writeFile(stderrLogPath, stderrStream.join(''), 'utf8').catch(() => undefined);
     if (child.pid) {
       await killTree(child.pid, true).catch(() => undefined);
+    }
+    if (localProxyProbe) {
+      await localProxyProbe.close();
     }
   }
 }

@@ -320,6 +320,29 @@ def test_build_tunnel_shell_command_contains_proxy_bootstrap():
     assert "exec /bin/bash" in script
 
 
+def test_build_tunnel_shell_command_runs_probe_after_proxy_exports():
+    config = proxy.LocalProxyTunnelConfig(
+        login_host="login.example.com",
+        login_port=3128,
+        login_user="alice",
+        proxy_user="proxy-user",
+        proxy_token="secret-token",
+        no_proxy="localhost,127.0.0.1",
+        timeout=15,
+        probe_url="http://client-probe.example:4321/slurm-connect-local-proxy-e2e/token",
+        probe_token="probe-token",
+    )
+
+    command = proxy.build_tunnel_shell_command(["/bin/bash", "-l"], config)
+    script = command[2]
+    assert "SLURM_CONNECT_LOCAL_PROXY_PROBE_URL=http://client-probe.example:4321/slurm-connect-local-proxy-e2e/token" in script
+    assert "SLURM_CONNECT_LOCAL_PROXY_PROBE_TOKEN=probe-token" in script
+    assert "http.client.HTTPConnection" in script
+    assert "X-Slurm-Connect-Proxy-Probe" in script
+    assert script.index("export HTTP_PROXY") < script.index("SLURM_CONNECT_LOCAL_PROXY_PROBE_URL")
+    assert script.index("SLURM_CONNECT_LOCAL_PROXY_PROBE_URL") < script.index("exec /bin/bash")
+
+
 def test_build_login_proxy_shell_command_exports_proxy_variables():
     config = proxy.LocalProxyTunnelConfig(
         login_host="login.example.com",

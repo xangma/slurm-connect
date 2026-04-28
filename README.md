@@ -82,13 +82,15 @@ The diagram above was inspired by the [VS Code Remote-SSH architecture diagram](
 - TS unit tests with coverage gate: `npm run test:coverage`
 - VS Code smoke test: `npm run test:integration`
 - VS Code fixture integration test: `npm run test:integration:slurm`
-- Optional OS-matrix Slurm client integration test: `npm run test:integration:slurm-client`
-- Optional OS-matrix Remote-SSH allocation test: `npm run test:integration:slurm-client-remote-session`
+- External Slurm OS-matrix client integration test: `npm run test:integration:slurm-client`
+- External Slurm OS-matrix Remote-SSH allocation test: `npm run test:integration:slurm-client-remote-session`
+- External Slurm OS-matrix Remote-SSH local proxy routing test: `npm run test:integration:slurm-client-local-proxy`
 - Python proxy tests with coverage gate: `npm run test:python`
 - Full local pipeline: `npm run test:ci`
 - Real SSH/Slurm fixture startup: `npm run e2e:slurm:up`
 - Real SSH/Slurm smoke test: `npm run e2e:slurm:smoke`
 - Full Remote-SSH fixture session test: `npm run e2e:slurm:remote-session`
+- Full Remote-SSH fixture local proxy routing test: `npm run e2e:slurm:local-proxy-session`
 - Fixture teardown: `npm run e2e:slurm:clean`
 - Slurm fixture docs: [docs/e2e-slurm-fixture.md](docs/e2e-slurm-fixture.md)
 - Optional UI screenshot refresh: `npm run screenshot:webview -- --out media/slurm-connect-ui.png`

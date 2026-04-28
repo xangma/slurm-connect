@@ -177,16 +177,30 @@ ensure_fixture_user_in_container() {
   "
 }
 
+install_fixture_ssh_material_in_container() {
+  local container="$1"
+  docker cp "${PRIVATE_KEY}" "${container}:/tmp/slurm_connect_e2e_id_ed25519"
+  docker cp "${PUBLIC_KEY}" "${container}:/tmp/slurm_connect_e2e_id_ed25519.pub"
+  docker cp "${AUTHORIZED_KEYS}" "${container}:/tmp/slurm_connect_e2e_authorized_keys"
+  docker exec "${container}" bash -lc "
+    set -euo pipefail
+    install -m 600 -o '${FIXTURE_UID}' -g '${FIXTURE_GID}' /tmp/slurm_connect_e2e_id_ed25519 '${FIXTURE_HOME}/.ssh/id_ed25519'
+    install -m 644 -o '${FIXTURE_UID}' -g '${FIXTURE_GID}' /tmp/slurm_connect_e2e_id_ed25519.pub '${FIXTURE_HOME}/.ssh/id_ed25519.pub'
+    install -m 600 -o '${FIXTURE_UID}' -g '${FIXTURE_GID}' /tmp/slurm_connect_e2e_authorized_keys '${FIXTURE_HOME}/.ssh/authorized_keys'
+    rm -f /tmp/slurm_connect_e2e_id_ed25519 /tmp/slurm_connect_e2e_id_ed25519.pub /tmp/slurm_connect_e2e_authorized_keys
+  "
+}
+
 ensure_fixture_user() {
   log "Creating disposable non-root fixture user ${FIXTURE_USER}"
   ensure_fixture_user_in_container slurmctld
   for ((i = 1; i <= CPU_WORKER_COUNT; i += 1)); do
     ensure_fixture_user_in_container "${COMPOSE_PROJECT_NAME}-cpu-worker-${i}"
   done
-  docker exec slurmctld bash -lc "
-    set -euo pipefail
-    install -m 600 -o '${FIXTURE_UID}' -g '${FIXTURE_GID}' /tmp/authorized_keys_host '${FIXTURE_HOME}/.ssh/authorized_keys'
-  "
+  install_fixture_ssh_material_in_container slurmctld
+  for ((i = 1; i <= CPU_WORKER_COUNT; i += 1)); do
+    install_fixture_ssh_material_in_container "${COMPOSE_PROJECT_NAME}-cpu-worker-${i}"
+  done
 }
 
 install_proxy_script() {

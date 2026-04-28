@@ -333,6 +333,7 @@
     "test:integration:slurm": "npm run compile && node ./scripts/e2e/run-with-display.js node ./out/test/runTest.js --slurm-fixture-e2e",
     "test:integration:slurm-client": "node ./scripts/e2e/test-slurm-client.js",
     "test:integration:slurm-client-remote-session": "node ./scripts/e2e/test-slurm-client-remote-session.js",
+    "test:integration:slurm-client-local-proxy": "node ./scripts/e2e/test-slurm-client-local-proxy.js",
     "test:python": "python3 -m pytest",
     "test:ci": "npm run lint && npm run typecheck && npm run test:coverage && npm run test:integration && npm run test:python && node ./scripts/e2e/test-ci-slurm.js",
     "e2e:slurm:client:prepare": "node ./scripts/e2e/prepare-slurm-client-fixture.js",
@@ -342,6 +343,7 @@
     "e2e:slurm:settings": "bash ./scripts/e2e/slurm-fixture.sh settings",
     "e2e:slurm:smoke": "bash ./scripts/e2e/slurm-fixture.sh smoke",
     "e2e:slurm:remote-session": "npm run compile && node ./scripts/e2e/run-with-display.js node ./scripts/e2e/vscode-remote-session.js",
+    "e2e:slurm:local-proxy-session": "node ./scripts/e2e/test-slurm-local-proxy-session.js",
     "e2e:slurm:down": "bash ./scripts/e2e/slurm-fixture.sh down",
     "e2e:slurm:clean": "bash ./scripts/e2e/slurm-fixture.sh clean",
     "screenshot:webview": "node ./scripts/capture-webview-screenshot.js"

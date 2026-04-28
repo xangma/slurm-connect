@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
+import * as http from 'http';
 import * as zlib from 'zlib';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -920,7 +921,91 @@ function buildSessionE2ERemotePayload(authority: string | undefined): Record<str
   };
 }
 
+async function runSessionE2ELocalProxyProbe(): Promise<Record<string, unknown> | undefined> {
+  const targetUrl = process.env.SLURM_CONNECT_SESSION_E2E_LOCAL_PROXY_TARGET_URL;
+  if (!targetUrl) {
+    return undefined;
+  }
+  const expectedToken = process.env.SLURM_CONNECT_SESSION_E2E_LOCAL_PROXY_EXPECTED_TOKEN || '';
+  const proxyEnv =
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    '';
+  if (!proxyEnv) {
+    throw new Error('Local proxy E2E target was configured, but no HTTP_PROXY/HTTPS_PROXY environment variable is set.');
+  }
+
+  const target = new URL(targetUrl);
+  if (target.protocol !== 'http:') {
+    throw new Error(`Local proxy E2E target must use http:, got ${target.protocol}`);
+  }
+  const proxy = new URL(proxyEnv);
+  if (proxy.protocol !== 'http:') {
+    throw new Error(`Local proxy E2E proxy URL must use http:, got ${proxy.protocol}`);
+  }
+
+  const headers: http.OutgoingHttpHeaders = {
+    Host: target.host,
+    'X-Slurm-Connect-Proxy-Probe': expectedToken
+  };
+  if (proxy.username || proxy.password) {
+    const user = decodeURIComponent(proxy.username);
+    const password = decodeURIComponent(proxy.password);
+    headers['Proxy-Authorization'] = `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
+  }
+
+  const result = await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+    const request = http.request(
+      {
+        hostname: proxy.hostname,
+        port: proxy.port ? Number(proxy.port) : 80,
+        method: 'GET',
+        path: target.href,
+        headers,
+        timeout: 30000
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk) => {
+          chunks.push(Buffer.from(chunk));
+        });
+        response.on('end', () => {
+          resolve({
+            statusCode: response.statusCode || 0,
+            body: Buffer.concat(chunks).toString('utf8')
+          });
+        });
+      }
+    );
+    request.on('timeout', () => {
+      request.destroy(new Error('Timed out waiting for local proxy E2E response.'));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+
+  if (result.statusCode < 200 || result.statusCode >= 300) {
+    throw new Error(`Local proxy E2E request returned HTTP ${result.statusCode}: ${result.body}`);
+  }
+  if (expectedToken && !result.body.includes(expectedToken)) {
+    throw new Error('Local proxy E2E response did not include the expected token.');
+  }
+
+  return {
+    targetUrl,
+    proxyHost: proxy.hostname,
+    proxyPort: proxy.port ? Number(proxy.port) : 80,
+    statusCode: result.statusCode,
+    body: result.body
+  };
+}
+
 async function maybeWriteSessionE2ERemoteFsMarker(authority: string | undefined): Promise<void> {
+  if (/^(1|true|yes)$/i.test(process.env.SLURM_CONNECT_SESSION_E2E_SKIP_REMOTE_FS_MARKER || '')) {
+    return;
+  }
   const remoteMarkerPath = process.env.SLURM_CONNECT_SESSION_E2E_REMOTE_FS_MARKER;
   if (!remoteMarkerPath || !authority) {
     return;
@@ -961,6 +1046,10 @@ async function handleSessionE2ERemoteWindow(): Promise<void> {
   };
   try {
     await maybeWriteSessionE2ERemoteFsMarker(authority);
+    const localProxyProbe = await runSessionE2ELocalProxyProbe();
+    if (localProxyProbe) {
+      payload.localProxyProbe = localProxyProbe;
+    }
     if (expectedAlias && alias !== expectedAlias) {
       payload.error = `Expected alias ${expectedAlias}, got ${alias}`;
     }
