@@ -101,12 +101,15 @@ jobs:
         run: npm run test:unit -- src/test/unit/localProxy.test.ts src/test/unit/localProxyRuntime.test.ts
 
   slurm-client-e2e:
+    # Disabled by default because GitHub-hosted runners cannot reach the local
+    # macOS/Windows/Linux client fixtures used for release validation.
+    if: ${{ vars.SLURM_CLIENT_E2E_ON_GITHUB == '1' }}
     runs-on: ${{ matrix.os }}
     needs: test
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
 
     env:
       SLURM_CLIENT_SSH_HOST: ${{ secrets.SLURM_CLIENT_SSH_HOST }}

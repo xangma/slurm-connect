@@ -42,9 +42,16 @@ npm run e2e:slurm:clean
 
 ## External OS Client Test
 
-The Docker fixture is Linux-only. To cover client behavior on Linux, macOS, and
-Windows, the CI workflow also defines a separate `slurm-client-e2e` matrix job
-that connects from each runner OS to an externally supplied Slurm login node.
+The Docker fixture is Linux-only. To cover client behavior across operating
+systems, run the external client tests from real client machines that can reach
+the fixture host. Current release validation uses this split:
+
+- macOS client coverage runs locally on a Mac.
+- Linux client coverage runs against the external SSH host `len`.
+- Windows client coverage runs against the external SSH host `mac-remote`.
+
+Linux client runs need `xvfb-run` for Electron-based VS Code tests; on Ubuntu,
+install the `xvfb` package.
 
 Run it locally with:
 
@@ -94,6 +101,10 @@ Optional settings:
   `1` for same-repository runs so missing fixture configuration is reported
   immediately.
 
+GitHub Actions has a disabled-by-default `slurm-client-e2e` job for future
+hosted-runner coverage. Set the repository variable
+`SLURM_CLIENT_E2E_ON_GITHUB=1` only when GitHub-hosted macOS and Windows
+runners can reach the configured external Slurm login node. When enabled,
 GitHub Actions reads the same values from repository secrets and variables. The
 job skips for fork pull requests where repository secrets are intentionally not
 available. For same-repository pushes and pull requests, missing required
@@ -134,8 +145,8 @@ also match that pattern.
 allocation path with `slurmConnect.localProxyEnabled=true`. The client starts a
 tokenized HTTP probe server, the remote extension host performs an HTTP request
 through the remote `HTTP_PROXY` value, and the client verifies that the probe
-server received the request. In CI this runs in the Linux, macOS, and Windows
-client matrix.
+server received the request. Run this manually on each release client OS unless
+`SLURM_CLIENT_E2E_ON_GITHUB=1` is configured for reachable hosted runners.
 
 ## What The Smoke Test Covers
 

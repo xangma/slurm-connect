@@ -211,6 +211,7 @@ async function main(): Promise<void> {
     } finally {
       await fs.rm(resultDir, { recursive: true, force: true });
     }
+    process.exit(0);
   } catch (error) {
     console.error('Failed to run VS Code integration tests.');
     console.error(error);

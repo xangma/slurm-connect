@@ -177,6 +177,8 @@ ensure_fixture_user_in_container() {
         useradd -m -d '${FIXTURE_HOME}' -s /bin/bash -u '${FIXTURE_UID}' -g '${FIXTURE_GID}' '${FIXTURE_USER}'
       fi
     fi
+    fixture_password=\$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)
+    printf '%s:%s\n' '${FIXTURE_USER}' \"\${fixture_password}\" | chpasswd
     mkdir -p '${FIXTURE_HOME}/.ssh' '${FIXTURE_HOME}/.slurm-connect'
     chown -R '${FIXTURE_UID}:${FIXTURE_GID}' '${FIXTURE_HOME}'
     chmod 700 '${FIXTURE_HOME}' '${FIXTURE_HOME}/.ssh' '${FIXTURE_HOME}/.slurm-connect'
@@ -197,6 +199,18 @@ install_fixture_ssh_material_in_container() {
   "
 }
 
+configure_login_sshd() {
+  docker exec slurmctld bash -lc "
+    set -euo pipefail
+    cat > /etc/ssh/sshd_config.d/00-slurm-connect-e2e.conf <<'EOF'
+UsePAM no
+PasswordAuthentication no
+EOF
+    sshd -t
+    pkill -HUP sshd
+  "
+}
+
 ensure_fixture_user() {
   log "Creating disposable non-root fixture user ${FIXTURE_USER}"
   ensure_fixture_user_in_container slurmctld
@@ -207,6 +221,7 @@ ensure_fixture_user() {
   for ((i = 1; i <= CPU_WORKER_COUNT; i += 1)); do
     install_fixture_ssh_material_in_container "${COMPOSE_PROJECT_NAME}-cpu-worker-${i}"
   done
+  configure_login_sshd
 }
 
 install_proxy_script() {
