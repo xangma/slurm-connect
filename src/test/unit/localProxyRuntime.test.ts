@@ -2,6 +2,7 @@ import * as dns from 'dns';
 import * as http from 'http';
 import * as net from 'net';
 import * as os from 'os';
+import * as path from 'path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -257,7 +258,7 @@ describe('localProxy runtime', () => {
 
       expect(execFileMock).toHaveBeenCalled();
       const sshArgs = execFileMock.mock.calls[0]?.[1] as string[];
-      expect(sshArgs.slice(0, 2)).toEqual(['-F', `${os.homedir()}/.ssh/config`]);
+      expect(sshArgs.slice(0, 2)).toEqual(['-F', path.join(os.homedir(), '.ssh', 'config')]);
     } finally {
       runtime.stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
     }

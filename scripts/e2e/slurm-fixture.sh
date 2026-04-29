@@ -61,7 +61,13 @@ clone_upstream() {
 
   (
     cd "${UPSTREAM_DIR}"
-    git fetch --depth 1 origin "${UPSTREAM_REF}"
+    if ! git fetch --depth 1 origin "${UPSTREAM_REF}"; then
+      if git cat-file -e "${UPSTREAM_REF}^{commit}" 2>/dev/null; then
+        log "Unable to fetch upstream fixture ref; using existing local ${UPSTREAM_REF}"
+      else
+        die "Unable to fetch upstream fixture ref ${UPSTREAM_REF} and no local copy is available."
+      fi
+    fi
     git checkout --force "${UPSTREAM_REF}"
   )
 }

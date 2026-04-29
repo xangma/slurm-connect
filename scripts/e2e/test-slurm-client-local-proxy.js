@@ -17,7 +17,7 @@ function runCommand(command, args, options = {}) {
     const child = cp.spawn(command, args, {
       stdio: 'inherit',
       env: options.env || process.env,
-      shell: false
+      shell: process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command)
     });
     child.on('error', reject);
     child.on('close', (code) => {

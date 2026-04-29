@@ -51,6 +51,7 @@ Run it locally with:
 ```bash
 npm run test:integration:slurm-client
 npm run test:integration:slurm-client-remote-session
+npm run test:integration:slurm-client-local-proxy
 ```
 
 The command skips with exit code 0 unless the minimum external fixture settings
@@ -97,6 +98,29 @@ GitHub Actions reads the same values from repository secrets and variables. The
 job skips for fork pull requests where repository secrets are intentionally not
 available. For same-repository pushes and pull requests, missing required
 fixture settings fail the `slurm-client-e2e` matrix instead of silently skipping.
+
+To configure the GitHub repository from a local shell that has the GitHub CLI
+authenticated with repository admin access, export the fixture values or put them
+in a dotenv-style file, then run:
+
+```bash
+npm run e2e:slurm:github:configure -- --env-file .env.slurm-client --verify
+```
+
+The setup command writes these repository secrets:
+
+- `SLURM_CLIENT_SSH_HOST`
+- `SLURM_CLIENT_SSH_USER`
+- `SLURM_CLIENT_SSH_PORT`, when set
+- `SLURM_CLIENT_SSH_PRIVATE_KEY_B64`
+- `SLURM_CLIENT_KNOWN_HOSTS_B64`, when set
+
+It writes optional cluster settings as repository variables, including
+`SLURM_CLIENT_E2E_REQUIRED=1`. The command accepts
+`SLURM_CLIENT_SSH_PRIVATE_KEY_PATH` and `SLURM_CLIENT_KNOWN_HOSTS_PATH` locally,
+but stores the file contents as base64 GitHub secrets so multiline SSH material
+survives every client OS in the matrix. Use `--dry-run` to check which settings
+would be written without sending values to GitHub.
 
 `npm run test:integration:slurm-client-remote-session` is the full Remote-SSH
 allocation check for the OS matrix. It installs the bundled proxy package on the

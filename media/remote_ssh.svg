@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="968" height="312" viewBox="0 0 968 312">
+  <defs>
+    <style>
+      .frame { fill: #ffffff; stroke: #3a72c8; stroke-width: 2; }
+      .title { font: 700 24px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; fill: #3a72c8; }
+      .blueBox { fill: #3f6fbe; stroke: #2b4f8b; stroke-width: 2; }
+      .blueHdr { font: 700 20px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; fill: #ffffff; }
+      .orange { fill: #e47e2b; stroke: #b85e1b; stroke-width: 2; }
+      .orangeTxt { font: 700 16px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; fill: #ffffff; }
+      .green { fill: #6aa845; stroke: #4e7f33; stroke-width: 2; }
+      .greenTxt { font: 700 16px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; fill: #ffffff; }
+      .arrow { stroke: #3a72c8; stroke-width: 2; fill: none; }
+    </style>
+
+    <marker id="arrowHead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a72c8"/>
+    </marker>
+  </defs>
+
+  <!-- Outer frames -->
+  <rect class="frame" x="10" y="10" width="380" height="292"/>
+  <rect class="frame" x="430" y="10" width="528" height="292"/>
+
+  <!-- Titles -->
+  <text class="title" x="26" y="48">Local OS</text>
+  <text class="title" x="446" y="48">Remote OS</text>
+
+  <!-- Local VS Code box -->
+  <rect class="blueBox" x="80" y="80" width="240" height="200"/>
+  <text class="blueHdr" x="200" y="120" text-anchor="middle">VS Code</text>
+
+  <rect class="orange" x="115" y="140" width="170" height="44"/>
+  <text class="orangeTxt" x="200" y="168" text-anchor="middle">Theme/UI Extension</text>
+
+  <rect class="orange" x="115" y="200" width="170" height="44"/>
+  <text class="orangeTxt" x="200" y="228" text-anchor="middle">Theme/UI Extension</text>
+
+  <!-- Remote VS Code Server box -->
+  <rect class="blueBox" x="500" y="80" width="240" height="200"/>
+  <text class="blueHdr" x="620" y="120" text-anchor="middle">VS Code Server</text>
+
+  <rect class="orange" x="535" y="140" width="170" height="44"/>
+  <text class="orangeTxt" x="620" y="168" text-anchor="middle">Workspace Extension</text>
+
+  <rect class="orange" x="535" y="200" width="170" height="44"/>
+  <text class="orangeTxt" x="620" y="228" text-anchor="middle">Workspace Extension</text>
+
+  <!-- Arrow between local and remote -->
+  <line class="arrow" x1="320" y1="184" x2="500" y2="184" marker-end="url(#arrowHead)"/>
+
+  <!-- Remote side items -->
+  <!-- Cylinder for Source Code -->
+  <g transform="translate(770,76)">
+
+    <ellipse cx="84" cy="54" rx="78" ry="8" fill="#6aa845" stroke="#4e7f33" stroke-width="2"/>
+    <rect x="6" y="18" width="156" height="36" fill="#6aa845" stroke="#4e7f33" stroke-width="2"/>
+    <ellipse cx="84" cy="18" rx="78" ry="8" fill="#8bc06a" stroke="#4e7f33" stroke-width="2"/>
+    <text class="greenTxt" x="84" y="44" text-anchor="middle">Source Code</text>
+  </g>
+
+  <!-- Green rectangles -->
+  <rect class="green" x="780" y="146" width="170" height="34"/>
+  <text class="greenTxt" x="865" y="168" text-anchor="middle">Terminal Processes</text>
+
+  <rect class="green" x="780" y="190" width="170" height="34"/>
+  <text class="greenTxt" x="865" y="212" text-anchor="middle">Running Application</text>
+
+  <rect class="green" x="780" y="234" width="170" height="34"/>
+  <text class="greenTxt" x="865" y="256" text-anchor="middle">Debugger</text>
+
+  <!-- Arrows from server box to remote items -->
+  <line class="arrow" x1="740" y1="122" x2="770" y2="122" marker-end="url(#arrowHead)"/>
+  <line class="arrow" x1="740" y1="163" x2="780" y2="163" marker-end="url(#arrowHead)"/>
+  <line class="arrow" x1="740" y1="207" x2="780" y2="207" marker-end="url(#arrowHead)"/>
+  <line class="arrow" x1="740" y1="251" x2="780" y2="251" marker-end="url(#arrowHead)"/>
+</svg>

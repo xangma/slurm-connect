@@ -1,16 +1,15 @@
 import * as assert from 'assert';
-import { execFile } from 'child_process';
+import { spawn } from 'child_process';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { promisify } from 'util';
 
 import { suite, test } from 'mocha';
 import * as vscode from 'vscode';
 
 import { __resetForTests, __runNonInteractiveConnectForTests } from '../../extension';
+import { formatSshConfigValue } from '../../utils/sshConfig';
 
-const execFileAsync = promisify(execFile);
 const FIXTURE_ENV_FLAG = 'SLURM_CONNECT_FIXTURE';
 const CLIENT_FIXTURE_ENV_FLAG = 'SLURM_CONNECT_CLIENT_FIXTURE';
 
@@ -77,6 +76,83 @@ function assertExpectedSinfoLine(stdout: string, isClientFixture: boolean): void
     lines.some((line) => line.startsWith('cpu') && line.includes('|2|idle')),
     `Expected sinfo output through generated alias. Output: ${stdout}`
   );
+}
+
+function hasProbeOutput(stdout: string, expectedLineCount: number): boolean {
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .length >= expectedLineCount;
+}
+
+function runSshProbe(args: string[], timeoutMs: number, expectedLineCount = 1): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timeout: NodeJS.Timeout | undefined;
+    const child = spawn('ssh', args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false
+    });
+    const markSettled = (): boolean => {
+      if (settled) {
+        return false;
+      }
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      return true;
+    };
+    const resolveOnce = (value: { stdout: string; stderr: string }) => {
+      if (markSettled()) {
+        resolve(value);
+      }
+    };
+    const rejectOnce = (error: Error) => {
+      if (markSettled()) {
+        reject(error);
+      }
+    };
+    const buildError = (message: string): Error => {
+      const error = new Error(`${message}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      return error;
+    };
+    const maybeResolveWindowsProbe = () => {
+      if (process.platform !== 'win32' || !hasProbeOutput(stdout, expectedLineCount)) {
+        return;
+      }
+      resolveOnce({ stdout, stderr });
+      child.kill();
+    };
+    timeout = setTimeout(() => {
+      child.kill();
+      if (process.platform === 'win32' && hasProbeOutput(stdout, expectedLineCount)) {
+        resolveOnce({ stdout, stderr });
+        return;
+      }
+      rejectOnce(buildError(`ssh ${args.join(' ')} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+      maybeResolveWindowsProbe();
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', (error) => {
+      rejectOnce(error);
+    });
+    child.on('close', (code, signal) => {
+      if (code === 0) {
+        resolveOnce({ stdout, stderr });
+        return;
+      }
+      rejectOnce(buildError(`ssh ${args.join(' ')} exited with ${code === null ? signal : `code ${code}`}`));
+    });
+  });
 }
 
 async function rememberConfigValue(
@@ -197,9 +273,10 @@ suite('Slurm Fixture E2E', function () {
       assert.match(includeContent, new RegExp(`^  Port ${fixture.port}$`, 'm'));
 
       const baseConfigContent = await fs.readFile(baseSshConfigPath, 'utf8');
+      const expectedIncludeTarget = formatSshConfigValue(result.includeFilePath);
       assert.ok(
-        baseConfigContent.includes(result.includeFilePath),
-        `Expected base SSH config to include ${result.includeFilePath}`
+        baseConfigContent.includes(expectedIncludeTarget),
+        `Expected base SSH config to include ${expectedIncludeTarget}`
       );
 
       const logContent = await fs.readFile(result.logFilePath, 'utf8');
@@ -207,19 +284,36 @@ suite('Slurm Fixture E2E', function () {
       assert.ok(logContent.includes(`Login hosts resolved: ${fixture.host}`));
       assert.ok(logContent.includes('Generated SSH host entry:'));
 
-      const { stdout } = await execFileAsync(
-        'ssh',
+      const probeBaseArgs = [
+        '-F',
+        baseSshConfigPath,
+        '-o',
+        'RemoteCommand=none',
+        '-T',
+        includeAlias
+      ];
+      const userProbe = await runSshProbe(
         [
-          '-F',
-          baseSshConfigPath,
-          '-o',
-          'RemoteCommand=none',
-          '-T',
-          includeAlias,
-          `bash -lc 'whoami; printf "%s\\n" "$HOME"; sinfo -h -o "%P|%D|%t" | head -n 1'`
+          ...probeBaseArgs,
+          'whoami'
         ],
-        { timeout: 20000 }
+        20000
       );
+      const homeProbe = await runSshProbe(
+        [
+          ...probeBaseArgs,
+          'printenv HOME'
+        ],
+        20000
+      );
+      const sinfoProbe = await runSshProbe(
+        [
+          ...probeBaseArgs,
+          "sinfo -h -o '%P|%D|%t' | head -n 1"
+        ],
+        20000
+      );
+      const stdout = `${userProbe.stdout}${homeProbe.stdout}${sinfoProbe.stdout}`;
 
       const lines = stdout
         .split(/\r?\n/)

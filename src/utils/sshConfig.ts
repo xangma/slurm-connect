@@ -40,14 +40,15 @@ function isWrappedInQuotes(value: string): boolean {
 }
 
 export function formatSshConfigValue(value: string): string {
-  const trimmed = value.trim();
+  const trimmedRaw = value.trim();
+  const trimmed = /^[A-Za-z]:\\/.test(trimmedRaw) ? trimmedRaw.replace(/\\/g, '/') : trimmedRaw;
   if (!trimmed) {
     return trimmed;
   }
   if (isWrappedInQuotes(trimmed)) {
     return trimmed;
   }
-  if (!/[\s#"]/.test(trimmed)) {
+  if (!/[\s#"\\]/.test(trimmed) && !/^[A-Za-z]:[\\/]/.test(trimmed)) {
     return trimmed;
   }
   const escaped = trimmed.replace(/\\/g, '\\\\').replace(/"/g, '\\"');

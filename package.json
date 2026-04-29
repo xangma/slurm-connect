@@ -2,7 +2,7 @@
   "name": "slurm-connect",
   "displayName": "Slurm Connect",
   "description": "Connect VS Code to Slurm allocations.",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "publisher": "xangma",
   "repository": "https://github.com/xangma/slurm-connect",
   "engines": {
@@ -337,6 +337,7 @@
     "test:python": "python3 -m pytest",
     "test:ci": "npm run lint && npm run typecheck && npm run test:coverage && npm run test:integration && npm run test:python && node ./scripts/e2e/test-ci-slurm.js",
     "e2e:slurm:client:prepare": "node ./scripts/e2e/prepare-slurm-client-fixture.js",
+    "e2e:slurm:github:configure": "node ./scripts/e2e/configure-github-slurm-client.js",
     "e2e:slurm:prepare": "bash ./scripts/e2e/slurm-fixture.sh prepare",
     "e2e:slurm:up": "bash ./scripts/e2e/slurm-fixture.sh up",
     "e2e:slurm:status": "bash ./scripts/e2e/slurm-fixture.sh status",

@@ -3,6 +3,14 @@ All notable changes to this project are documented in this file based on git tag
 
 ## Unreleased
 
+## 0.5.9 - 2026-04-28
+### Fixed
+- Exclude local E2E fixture state, caches, tests, and source-only artifacts from VSIX packages.
+- Fix SSH config parsing for top-level `Include` globs and host details loaded from included config files.
+
+### Changed
+- Run Slurm E2E CI jobs on the same Node.js 22 runtime as the main CI job.
+
 ## 0.5.8 - 2026-02-20
 ### Added
 - Added `slurmConnect.startupCommand` to run explicit remote startup shell commands (for example `. ~/envfile.sh`) before module/proxy launch.

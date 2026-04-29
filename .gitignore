@@ -8,5 +8,6 @@ coverage/
 __pycache__/
 .e2e/
 *.vsix
+.env.slurm-client
 
 .vscode/

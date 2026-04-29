@@ -1,4 +1,4 @@
-# <img src="media/slurm-connect-dark.svg#gh-light-mode-only" alt="Slurm Connect logo" width="28" /> <img src="media/slurm-connect.svg#gh-dark-mode-only" alt="Slurm Connect logo" width="28" /> Slurm Connect (VS Code extension)
+# <img src="media/slurm-connect.png" alt="Slurm Connect logo" width="28" /> Slurm Connect (VS Code extension)
 
 <a href="media/slurm-connect-ui.png"><img src="media/slurm-connect-ui.png" alt="Slurm Connect webview UI" width="300" align="right" /></a>
 
@@ -39,7 +39,7 @@ The extension queries the login host, writes a Slurm Connect SSH include file, e
 Profiles store the values you edit in the Slurm Connect view (connection, resources, and advanced fields). The local proxy enable and proxy debug logging toggles are in the view. Advanced local proxy settings and other global-only settings like SSH host prefix, managed include path, session state directory, proxy auto-install, SSH query config, and SSH host key checking live in VS Code Settings under `slurmConnect`.
 
 **How it works:**
-![Slurm Connect architecture diagram](media/slurm-connect-diagram.svg)
+![Slurm Connect architecture diagram](media/slurm-connect-diagram.png)
 
 The diagram above was inspired by the [VS Code Remote-SSH architecture diagram](https://code.visualstudio.com/docs/remote/ssh).
 
@@ -63,7 +63,7 @@ The diagram above was inspired by the [VS Code Remote-SSH architecture diagram](
 
 | Marketplace | GitHub |
 |---|---|
-| <img src="media/marketplace_qrcode.svg" alt="VS Code Marketplace QR code" width="180" /> | <img src="media/github_qrcode.svg" alt="GitHub repository QR code" width="180" /> |
+| <img src="media/marketplace_qrcode.png" alt="VS Code Marketplace QR code" width="180" /> | <img src="media/github_qrcode.png" alt="GitHub repository QR code" width="180" /> |
 | [Marketplace page](https://marketplace.visualstudio.com/items?itemName=xangma.slurm-connect) | [GitHub repo](https://github.com/xangma/slurm-connect) |
 
 **Docs:**

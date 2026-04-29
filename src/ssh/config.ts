@@ -1,6 +1,8 @@
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
 import type { ResolvedSshHostInfo, SlurmConnectConfig } from '../config/types';
 import {
@@ -11,6 +13,8 @@ import {
   SLURM_CONNECT_INCLUDE_END,
   SLURM_CONNECT_INCLUDE_START
 } from '../utils/sshConfig';
+
+const execFileAsync = promisify(execFile);
 
 export interface SshConfigRuntime {
   fileExists(filePath: string): Promise<boolean>;
@@ -29,12 +33,21 @@ export function resolveSlurmConnectIncludePath(cfg: SlurmConnectConfig): string 
   return trimmed || '~/.ssh/slurm-connect.conf';
 }
 
+export function msysDrivePathToWindowsPath(value: string): string {
+  const match = /^\/([A-Za-z])(?:\/(.*))?$/.exec(value);
+  if (!match) {
+    return value;
+  }
+  return path.win32.join(`${match[1].toUpperCase()}:\\`, match[2] || '');
+}
+
 export function normalizeSshPath(value: string): string {
   const expanded = expandHome(value);
-  if (!path.isAbsolute(expanded)) {
-    return path.resolve(os.homedir(), expanded);
+  const filesystemPath = process.platform === 'win32' ? msysDrivePathToWindowsPath(expanded) : expanded;
+  if (!path.isAbsolute(filesystemPath)) {
+    return path.resolve(os.homedir(), filesystemPath);
   }
-  return path.resolve(expanded);
+  return path.resolve(filesystemPath);
 }
 
 export function resolveSlurmConnectIncludeFilePath(cfg: SlurmConnectConfig): string {
@@ -178,9 +191,40 @@ function hasGlobPattern(value: string): boolean {
 }
 
 function globSegmentToRegex(segment: string): RegExp {
-  const escaped = segment.replace(/[.+^${}()|\\]/g, '\\$&');
-  const withWildcards = escaped.replace(/\\\*/g, '.*').replace(/\\\?/g, '.');
-  return new RegExp(`^${withWildcards}$`);
+  const escapeLiteral = (value: string): string => value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+  let pattern = '';
+  for (let index = 0; index < segment.length; index += 1) {
+    const ch = segment[index];
+    if (ch === '*') {
+      pattern += '.*';
+      continue;
+    }
+    if (ch === '?') {
+      pattern += '.';
+      continue;
+    }
+    if (ch === '[') {
+      const closeIndex = segment.indexOf(']', index + 1);
+      if (closeIndex > index + 1) {
+        const rawBody = segment.slice(index + 1, closeIndex);
+        const negate = rawBody.startsWith('!') || rawBody.startsWith('^');
+        const body = negate ? rawBody.slice(1) : rawBody;
+        if (body.length > 0) {
+          pattern += `[${negate ? '^' : ''}${body.replace(/\\/g, '\\\\').replace(/\]/g, '\\]')}]`;
+          index = closeIndex;
+          continue;
+        }
+      }
+      pattern += '\\[';
+      continue;
+    }
+    pattern += escapeLiteral(ch);
+  }
+  try {
+    return new RegExp(`^${pattern}$`);
+  } catch {
+    return new RegExp(`^${escapeLiteral(segment)}$`);
+  }
 }
 
 async function expandGlobPattern(pattern: string): Promise<string[]> {
@@ -227,7 +271,8 @@ async function expandGlobPattern(pattern: string): Promise<string[]> {
 
 async function expandSshIncludeTarget(value: string, baseDir: string, runtime: Pick<SshConfigRuntime, 'fileExists'>): Promise<string[]> {
   const expanded = expandHome(value);
-  const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(baseDir, expanded);
+  const filesystemPath = process.platform === 'win32' ? msysDrivePathToWindowsPath(expanded) : expanded;
+  const resolved = path.isAbsolute(filesystemPath) ? filesystemPath : path.resolve(baseDir, filesystemPath);
   if (hasGlobPattern(resolved)) {
     return await expandGlobPattern(resolved);
   }
@@ -325,17 +370,19 @@ async function collectExplicitHostConfig(
   configPath: string | undefined,
   host: string,
   runtime: Pick<SshConfigRuntime, 'fileExists'>,
-  seen = new Set<string>()
+  seen = new Set<string>(),
+  initial?: { inHostBlock?: boolean; inExplicitHost?: boolean }
 ): Promise<ExplicitSshHostConfig> {
   const explicit: ExplicitSshHostConfig = { identityFiles: [], hasExplicitHost: false };
   if (!configPath) {
     return explicit;
   }
   const resolved = normalizeSshPath(configPath);
-  if (seen.has(resolved)) {
+  const contextKey = `${resolved}\0${initial?.inHostBlock ? 'block' : 'top'}\0${initial?.inExplicitHost ? 'explicit' : 'normal'}`;
+  if (seen.has(contextKey)) {
     return explicit;
   }
-  seen.add(resolved);
+  seen.add(contextKey);
   let content = '';
   try {
     content = await fs.readFile(resolved, 'utf8');
@@ -343,7 +390,8 @@ async function collectExplicitHostConfig(
     return explicit;
   }
   const lines = content.split(/\r?\n/);
-  let inExplicitHost = false;
+  let inHostBlock = Boolean(initial?.inHostBlock);
+  let inExplicitHost = Boolean(initial?.inExplicitHost);
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) {
@@ -351,14 +399,20 @@ async function collectExplicitHostConfig(
     }
     const includeTargets = extractIncludeTargets(line);
     if (includeTargets.length > 0) {
-      if (!inExplicitHost) {
+      if (inHostBlock && !inExplicitHost) {
         continue;
       }
       const baseDir = path.dirname(resolved);
       for (const target of includeTargets) {
         const expandedPaths = await expandSshIncludeTarget(target, baseDir, runtime);
         for (const includePath of expandedPaths) {
-          const nested = await collectExplicitHostConfig(includePath, host, runtime, seen);
+          const nested = await collectExplicitHostConfig(
+            includePath,
+            host,
+            runtime,
+            seen,
+            inHostBlock ? { inHostBlock, inExplicitHost } : undefined
+          );
           if (!explicit.user && nested.user) {
             explicit.user = nested.user;
           }
@@ -375,6 +429,7 @@ async function collectExplicitHostConfig(
     const hostMatch = /^Host\s+(.+)$/i.exec(trimmed);
     if (hostMatch) {
       const tokens = splitSshConfigArgs(hostMatch[1]);
+      inHostBlock = true;
       inExplicitHost = isHostExplicitMatch(host, tokens);
       if (inExplicitHost) {
         explicit.hasExplicitHost = true;
@@ -382,6 +437,7 @@ async function collectExplicitHostConfig(
       continue;
     }
     if (/^Match\b/i.test(trimmed)) {
+      inHostBlock = true;
       inExplicitHost = false;
       continue;
     }
@@ -650,7 +706,24 @@ export async function writeSlurmConnectIncludeFile(entry: string, includePath: s
   await fs.mkdir(dir, { recursive: true });
   const content = buildSlurmConnectIncludeContent(entry);
   await fs.writeFile(includePath, content, 'utf8');
+  await restrictSshConfigFilePermissions(includePath);
   return includePath;
+}
+
+async function restrictSshConfigFilePermissions(filePath: string): Promise<void> {
+  try {
+    if (process.platform === 'win32') {
+      const username = process.env.USERNAME || os.userInfo().username;
+      if (username) {
+        await execFileAsync('icacls', [filePath, '/inheritance:r']);
+        await execFileAsync('icacls', [filePath, '/grant:r', `${username}:RW`]);
+      }
+      return;
+    }
+    await fs.chmod(filePath, 0o600);
+  } catch {
+    // OpenSSH will surface unusable permissions; avoid blocking config generation on platform ACL quirks.
+  }
 }
 
 export function normalizeRemoteConfigPath(value: unknown): string | undefined {

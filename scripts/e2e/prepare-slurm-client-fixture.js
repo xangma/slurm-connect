@@ -7,6 +7,7 @@ const path = require('path');
 const ROOT_DIR = path.resolve(__dirname, '../..');
 const DEFAULT_STATE_DIR = path.join(ROOT_DIR, '.e2e', 'slurm-client', process.platform);
 const SSH_ALIAS = 'slurm-client-e2e';
+const SINFO_PARTITION_SUMMARY_COMMAND = "sinfo -h -o '%P|%D|%t' | head -n 1";
 
 function log(message) {
   process.stdout.write(`[slurm-client] ${message}\n`);
@@ -36,7 +37,7 @@ async function restrictFilePermissions(filePath) {
       const username = process.env.USERNAME || process.env.USER || '';
       if (username) {
         await runCommand('icacls', [filePath, '/inheritance:r'], { timeoutMs: 10000 });
-        await runCommand('icacls', [filePath, '/grant:r', `${username}:R`], { timeoutMs: 10000 });
+        await runCommand('icacls', [filePath, '/grant:r', `${username}:RW`], { timeoutMs: 10000 });
       }
       return;
     }
@@ -79,23 +80,47 @@ async function resolveKnownHosts(env) {
 
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout;
+    const settle = (callback, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      callback(value);
+    };
     const child = cp.spawn(command, args, {
       cwd: options.cwd || ROOT_DIR,
       env: options.env || process.env,
-      stdio: options.stdio || 'pipe',
+      stdio: options.stdio || ['ignore', 'pipe', 'pipe'],
       shell: false
     });
     let stdout = '';
     let stderr = '';
     const timeoutMs = options.timeoutMs || 0;
-    const timeout = timeoutMs > 0
+    timeout = timeoutMs > 0
       ? setTimeout(() => {
           child.kill();
         }, timeoutMs)
       : undefined;
+    const resolveFromStdoutLine = () => {
+      if (!options.resolveOnStdoutLine) {
+        return;
+      }
+      const line = stdout.split(/\r?\n/).map((entry) => entry.trim()).find(Boolean);
+      if (!line) {
+        return;
+      }
+      settle(resolve, { stdout, stderr });
+      child.kill();
+    };
     if (child.stdout) {
       child.stdout.on('data', (chunk) => {
         stdout += chunk.toString('utf8');
+        resolveFromStdoutLine();
       });
     }
     if (child.stderr) {
@@ -104,17 +129,11 @@ function runCommand(command, args, options = {}) {
       });
     }
     child.on('error', (error) => {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-      reject(error);
+      settle(reject, error);
     });
     child.on('close', (code, signal) => {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
       if (code === 0) {
-        resolve({ stdout, stderr });
+        settle(resolve, { stdout, stderr });
         return;
       }
       const error = new Error(
@@ -122,7 +141,7 @@ function runCommand(command, args, options = {}) {
       );
       error.stdout = stdout;
       error.stderr = stderr;
-      reject(error);
+      settle(reject, error);
     });
   });
 }
@@ -173,7 +192,7 @@ async function queryRemoteHome(sshConfigPath) {
   const { stdout } = await runCommand(
     'ssh',
     ['-F', sshConfigPath, '-T', SSH_ALIAS, 'printf "%s\\n" "$HOME"'],
-    { timeoutMs: 30000 }
+    { timeoutMs: 30000, resolveOnStdoutLine: process.platform === 'win32' }
   );
   return stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || '';
 }
@@ -181,8 +200,8 @@ async function queryRemoteHome(sshConfigPath) {
 async function verifySlurmAccess(sshConfigPath) {
   const { stdout } = await runCommand(
     'ssh',
-    ['-F', sshConfigPath, '-T', SSH_ALIAS, 'sinfo -h -o "%P|%D|%t" | head -n 1'],
-    { timeoutMs: 30000 }
+    ['-F', sshConfigPath, '-T', SSH_ALIAS, SINFO_PARTITION_SUMMARY_COMMAND],
+    { timeoutMs: 30000, resolveOnStdoutLine: process.platform === 'win32' }
   );
   const line = stdout.split(/\r?\n/).map((entry) => entry.trim()).find(Boolean);
   if (!line || !line.includes('|')) {
@@ -284,5 +303,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  prepareClientFixtureFromEnv
+  prepareClientFixtureFromEnv,
+  SINFO_PARTITION_SUMMARY_COMMAND
 };
