@@ -48,6 +48,7 @@ describe('VSIX package manifest', () => {
       'tests/**',
       'test-fixtures/**',
       'scripts/**',
+      'docs/release.md',
       '**/__pycache__/**',
       '**/*.pyc',
       'media/*.emf',

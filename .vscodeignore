@@ -25,6 +25,8 @@ tests/**
 test-fixtures/**
 scripts/**
 
+docs/release.md
+
 node_modules/**
 !node_modules/jsonc-parser/
 !node_modules/jsonc-parser/**
