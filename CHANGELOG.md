@@ -3,6 +3,12 @@ All notable changes to this project are documented in this file based on git tag
 
 ## Unreleased
 
+### Added
+- Add an opt-in shared compute-node proxy tunnel so arbitrary `sbatch` jobs can inherit local HTTP(S) routing even when login-host `GatewayPorts` is disabled.
+
+### Fixed
+- Reject login-host wildcard reverse forwards when SSH silently creates only loopback listeners.
+
 ## 0.5.9 - 2026-04-28
 ### Fixed
 - Exclude local E2E fixture state, caches, tests, and source-only artifacts from VSIX packages.

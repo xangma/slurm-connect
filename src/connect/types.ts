@@ -35,6 +35,7 @@ export interface LocalProxyPlan {
     authUser: string;
     authToken: string;
     noProxy?: string;
+    shareWithJobs?: boolean;
   };
 }
 

@@ -145,6 +145,7 @@ function createConfig(overrides: Partial<SlurmConnectConfig> = {}): SlurmConnect
     localProxyRemoteBind: '0.0.0.0',
     localProxyRemoteHost: '',
     localProxyComputeTunnel: false,
+    localProxyShareComputeTunnel: false,
     localProxyTunnelMode: 'dedicated',
     extraSallocArgs: [],
     promptForExtraSallocArgs: false,
@@ -182,7 +183,18 @@ describe('localProxy runtime', () => {
     netConnectOverrides.clear();
   });
 
-  function createRuntime(): LocalProxyRuntime {
+  function createRuntime(
+    runSshCommand: (
+      host: string,
+      cfg: SlurmConnectConfig,
+      command: string
+    ) => Promise<string> = async (_host, _cfg, command) =>
+      command.includes('getsockname')
+        ? '45000\n'
+        : command.includes('ss -H -ltn')
+          ? 'LISTEN 0 128 0.0.0.0:45000 0.0.0.0:*\n'
+          : ''
+  ): LocalProxyRuntime {
     return createLocalProxyRuntime({
       getOutputChannel: () =>
         ({
@@ -198,8 +210,7 @@ describe('localProxy runtime', () => {
       resolveSshToolPath: async () => '/usr/bin/ssh',
       normalizeSshErrorText: (error) => String(error),
       pickSshErrorSummary: (text) => text,
-      runSshCommand: async (_host, _cfg, command) =>
-        command.includes('getsockname') ? '45000\n' : '',
+      runSshCommand,
       runPreSshCommandInTerminal: async () => undefined
     });
   }
@@ -264,6 +275,26 @@ describe('localProxy runtime', () => {
     }
   });
 
+  it('closes rejected loopback-only wildcard forwards', async () => {
+    const runtime = createRuntime(async (_host, _cfg, command) =>
+      command.includes('getsockname')
+        ? '45000\n'
+        : command.includes('ss -H -ltn')
+          ? 'LISTEN 0 128 127.0.0.1:45000 0.0.0.0:*\n'
+          : ''
+    );
+
+    await expect(runtime.ensureLocalProxyPlan(createConfig(), 'login.example.com')).rejects.toThrow(
+      'Remote proxy listener not available.'
+    );
+
+    const closeCalls = execFileMock.mock.calls.filter((call) => {
+      const args = call[1] as string[];
+      return args.includes('-O') && args.includes('exit');
+    });
+    expect(closeCalls).toHaveLength(3);
+  });
+
   it('passes session e2e proxy probe args to compute tunnel proxy commands', () => {
     const runtime = createRuntime();
     const originalUrl = process.env.SLURM_CONNECT_SESSION_E2E_PROXY_PROBE_TARGET_URL;
@@ -309,6 +340,26 @@ describe('localProxy runtime', () => {
       } else {
         process.env.SLURM_CONNECT_SESSION_E2E_PROXY_PROBE_EXPECTED_TOKEN = originalToken;
       }
+    }
+  });
+
+  it('passes shared compute tunnel configuration to the remote proxy', async () => {
+    const runtime = createRuntime();
+
+    try {
+      const config = createConfig({
+        localProxyComputeTunnel: true,
+        localProxyShareComputeTunnel: true,
+        localProxyTunnelMode: 'remoteSsh',
+        proxyCommand: 'python3 ~/.slurm-connect/vscode-proxy.py'
+      });
+      const plan = await runtime.ensureLocalProxyPlan(config, 'login.example.com');
+      const command = runtime.buildRemoteCommand(config, [], undefined, undefined, undefined, undefined, plan);
+
+      expect(plan.computeTunnel?.shareWithJobs).toBe(true);
+      expect(command).toContain('--local-proxy-share-compute-tunnel');
+    } finally {
+      runtime.stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
     }
   });
 

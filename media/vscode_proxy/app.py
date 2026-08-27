@@ -133,6 +133,7 @@ def main() -> int:
                 timeout=args.local_proxy_tunnel_timeout
                 if args.local_proxy_tunnel_timeout > 0
                 else None,
+                share_with_jobs=args.local_proxy_share_compute_tunnel,
                 probe_url=args.local_proxy_probe_url or "",
                 probe_token=args.local_proxy_probe_token or "",
             )

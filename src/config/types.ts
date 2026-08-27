@@ -25,6 +25,7 @@ export interface SlurmConnectConfig {
   localProxyRemoteBind: string;
   localProxyRemoteHost: string;
   localProxyComputeTunnel: boolean;
+  localProxyShareComputeTunnel: boolean;
   localProxyTunnelMode: LocalProxyTunnelMode;
   extraSallocArgs: string[];
   promptForExtraSallocArgs: boolean;

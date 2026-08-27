@@ -46,6 +46,7 @@ function createConfig(overrides: Partial<SlurmConnectConfig> = {}): SlurmConnect
     localProxyRemoteBind: '0.0.0.0',
     localProxyRemoteHost: '',
     localProxyComputeTunnel: false,
+    localProxyShareComputeTunnel: false,
     localProxyTunnelMode: 'remoteSsh',
     extraSallocArgs: ['--constraint=a100'],
     promptForExtraSallocArgs: false,

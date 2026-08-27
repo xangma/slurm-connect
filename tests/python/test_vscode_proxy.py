@@ -320,6 +320,29 @@ def test_build_tunnel_shell_command_contains_proxy_bootstrap():
     assert "exec /bin/bash" in script
 
 
+def test_build_tunnel_shell_command_can_share_with_batch_jobs():
+    config = proxy.LocalProxyTunnelConfig(
+        login_host="login.example.com",
+        login_port=3128,
+        login_user="alice",
+        proxy_user="proxy-user",
+        proxy_token="secret-token",
+        no_proxy="localhost,127.0.0.1",
+        timeout=15,
+        share_with_jobs=True,
+    )
+
+    command = proxy.build_tunnel_shell_command(["/bin/bash", "-l"], config)
+    script = command[2]
+    assert " -g " in script
+    assert "-L 0.0.0.0:$LOCAL_PROXY_PORT:127.0.0.1:3128" in script
+    assert "LOCAL_PROXY_HOST=$(hostname -f" in script
+    assert (
+        'export HTTP_PROXY="http://proxy-user:secret-token@$LOCAL_PROXY_HOST:$LOCAL_PROXY_PORT"'
+        in script
+    )
+
+
 def test_build_tunnel_shell_command_runs_probe_after_proxy_exports():
     config = proxy.LocalProxyTunnelConfig(
         login_host="login.example.com",
@@ -370,6 +393,7 @@ def test_build_arg_parser_defaults():
     assert args.session_mode == "ephemeral"
     assert args.listen_host == "127.0.0.1"
     assert args.listen_port == 0
+    assert args.local_proxy_share_compute_tunnel is False
 
 
 def test_main_rejects_invalid_numeric_args(monkeypatch):

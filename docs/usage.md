@@ -62,7 +62,7 @@ Profiles include connection, resource, and advanced form values.
 - **Open logs**: Opens the Slurm Connect output log (capped at 5 MB; older entries are truncated).
 - **Remote-SSH log**: Opens the Remote-SSH log.
 
-Global settings such as the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config path live in VS Code Settings (`slurmConnect`). The view shows local proxy enable and proxy debug logging toggles; configure NO_PROXY, ports, and tunnel settings in Settings. The compute-node tunnel (`localProxyComputeTunnel`) forces proxy traffic through 127.0.0.1 on the compute node (helpful when `GatewayPorts` is disabled). Loopback targets (localhost/127.0.0.1/::1) are never proxied.
+Global settings such as the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config path live in VS Code Settings (`slurmConnect`). The view shows local proxy enable and proxy debug logging toggles; configure NO_PROXY, ports, and tunnel settings in Settings. The compute-node tunnel (`localProxyComputeTunnel`) forces proxy traffic through the compute node (helpful when `GatewayPorts` is disabled). Enable `localProxyShareComputeTunnel` if ordinary `sbatch` jobs should inherit and use that tunnel. Loopback targets (localhost/127.0.0.1/::1) are never proxied.
 
 ### Action bar
 - **Connect**: Creates the SSH host entry, opens Remote-SSH, and starts the allocation.

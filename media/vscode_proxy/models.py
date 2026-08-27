@@ -122,6 +122,7 @@ class LocalProxyTunnelConfig:
     proxy_token: str
     no_proxy: str
     timeout: Optional[int]
+    share_with_jobs: bool = False
     probe_url: str = ""
     probe_token: str = ""
 
