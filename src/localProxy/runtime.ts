@@ -12,6 +12,7 @@ import {
   buildLocalProxyTunnelConfigKey,
   buildLocalProxyTunnelTarget,
   buildNoProxyValue,
+  isRemoteForwardBindSatisfied,
   isHostAllowed,
   isProxyAuthValid,
   normalizeProxyPort,
@@ -331,6 +332,9 @@ function buildProxyArgs(
     if (tunnel.noProxy) {
       args.push(`--local-proxy-no-proxy=${tunnel.noProxy}`);
     }
+    if (tunnel.shareWithJobs) {
+      args.push('--local-proxy-share-compute-tunnel');
+    }
     const probeUrl = (process.env.SLURM_CONNECT_SESSION_E2E_PROXY_PROBE_TARGET_URL || '').trim();
     if (probeUrl) {
       args.push(`--local-proxy-probe-url=${probeUrl}`);
@@ -503,6 +507,30 @@ export function createLocalProxyRuntime(deps: LocalProxyDependencies): LocalProx
     bindHost: string,
     remotePort: number
   ): Promise<boolean> {
+    const normalizedBind = (bindHost || '').trim().toLowerCase();
+    const isWildcardBind =
+      !normalizedBind ||
+      normalizedBind === '0.0.0.0' ||
+      normalizedBind === '::' ||
+      normalizedBind === '[::]';
+    if (isWildcardBind) {
+      const command = [
+        'if command -v ss >/dev/null 2>&1; then',
+        '  ss -H -ltn',
+        'elif command -v netstat >/dev/null 2>&1; then',
+        '  netstat -lnt',
+        'else',
+        '  exit 127',
+        'fi'
+      ].join('\n');
+      try {
+        const output = await deps.runSshCommand(loginHost, cfg, command);
+        return isRemoteForwardBindSatisfied(output, bindHost, remotePort);
+      } catch {
+        return false;
+      }
+    }
+
     const host = resolveRemoteBindConnectHost(bindHost);
     const script = [
       'import socket,sys',
@@ -560,8 +588,18 @@ export function createLocalProxyRuntime(deps: LocalProxyDependencies): LocalProx
       await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
       return true;
     } catch {
-      await cleanupControlPath(state.controlPath);
       return false;
+    }
+  }
+
+  async function closeLocalProxyTunnelState(state: LocalProxyTunnelState): Promise<void> {
+    try {
+      const sshPath = await deps.resolveSshToolPath('ssh');
+      await execFileAsync(sshPath, ['-S', state.controlPath, '-O', 'exit', state.target], { timeout: 5000 });
+    } catch {
+      // The tunnel may already have exited.
+    } finally {
+      await cleanupControlPath(state.controlPath);
     }
   }
 
@@ -570,12 +608,9 @@ export function createLocalProxyRuntime(deps: LocalProxyDependencies): LocalProx
     if (!state) {
       return;
     }
-    const args = ['-S', state.controlPath, '-O', 'exit', state.target];
-    void deps.resolveSshToolPath('ssh')
-      .then(async (sshPath) => await execFileAsync(sshPath, args, { timeout: 5000 }))
-      .catch(() => undefined);
     localProxyTunnelState = undefined;
     persistLocalProxyTunnelState(undefined);
+    void closeLocalProxyTunnelState(state);
   }
 
   function buildLocalProxyTunnelArgs(
@@ -656,13 +691,13 @@ export function createLocalProxyRuntime(deps: LocalProxyDependencies): LocalProx
       };
       if (!(await checkLocalProxyTunnel(state, cfg))) {
         log.appendLine('Local proxy tunnel did not respond to control check.');
-        await cleanupControlPath(controlPath);
+        await closeLocalProxyTunnelState(state);
         lastError = new Error('SSH tunnel failed to start.');
         continue;
       }
       if (!(await verifyRemoteForwardListener(cfg, loginHost, remoteBind, remotePort))) {
         log.appendLine(`Local proxy tunnel listener not detected on ${remoteBind}:${remotePort}.`);
-        await cleanupControlPath(controlPath);
+        await closeLocalProxyTunnelState(state);
         lastError = new Error('Remote proxy listener not available.');
         continue;
       }
@@ -959,7 +994,8 @@ export function createLocalProxyRuntime(deps: LocalProxyDependencies): LocalProx
           port: remotePort,
           authUser: localProxyState.authUser,
           authToken: localProxyState.authToken,
-          noProxy: noProxy || undefined
+          noProxy: noProxy || undefined,
+          shareWithJobs: cfg.localProxyShareComputeTunnel
         }
       : undefined;
     const proxyHostForEnv = computeTunnel ? '127.0.0.1' : remoteHost;

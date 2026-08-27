@@ -122,8 +122,10 @@ def build_tunnel_shell_command(
     login_target = config.login_host
     if config.login_user:
         login_target = f"{config.login_user}@{login_target}"
+    tunnel_bind = "0.0.0.0" if config.share_with_jobs else "127.0.0.1"
+    proxy_host = "$LOCAL_PROXY_HOST" if config.share_with_jobs else "127.0.0.1"
     proxy_url = (
-        f"http://{config.proxy_user}:{config.proxy_token}@127.0.0.1:$LOCAL_PROXY_PORT"
+        f"http://{config.proxy_user}:{config.proxy_token}@{proxy_host}:$LOCAL_PROXY_PORT"
     )
     ssh_tokens = [
         "ssh",
@@ -140,6 +142,8 @@ def build_tunnel_shell_command(
         "-o",
         "ServerAliveCountMax=3",
     ]
+    if config.share_with_jobs:
+        ssh_tokens.append("-g")
     if config.timeout:
         ssh_tokens.extend(["-o", f"ConnectTimeout={config.timeout}"])
     ssh_tokens.extend(
@@ -147,38 +151,56 @@ def build_tunnel_shell_command(
             "-N",
             "-f",
             "-L",
-            f"127.0.0.1:$LOCAL_PROXY_PORT:127.0.0.1:{config.login_port}",
+            f"{tunnel_bind}:$LOCAL_PROXY_PORT:127.0.0.1:{config.login_port}",
             shlex.quote(login_target),
         ]
     )
     ssh_cmd = " ".join(ssh_tokens)
     pick_port = [
         "LOCAL_PROXY_PORT=\"\"",
-        "PYTHON=$(command -v python3 || command -v python || true)",
-        "if [ -n \"$PYTHON\" ]; then",
-        "  LOCAL_PROXY_PORT=$($PYTHON - <<'PY'",
-        "import socket",
-        "s=socket.socket()",
-        "s.bind(('127.0.0.1',0))",
-        "print(s.getsockname()[1])",
-        "s.close()",
-        "PY",
-        "  )",
-        "fi",
-        f"if [ -z \"$LOCAL_PROXY_PORT\" ]; then LOCAL_PROXY_PORT={config.login_port}; fi",
+        f"LOCAL_PROXY_BIND={tunnel_bind}",
+        "LOCAL_PROXY_HOST=127.0.0.1",
     ]
+    if config.share_with_jobs:
+        pick_port.extend(
+            [
+                "LOCAL_PROXY_HOST=$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)",
+                (
+                    'if [ -z "$LOCAL_PROXY_HOST" ]; then '
+                    'echo "Slurm Connect: unable to determine compute-node proxy hostname" >&2; '
+                    "exit 1; fi"
+                ),
+            ]
+        )
+    pick_port.extend(
+        [
+            "export LOCAL_PROXY_BIND",
+            "PYTHON=$(command -v python3 || command -v python || true)",
+            "if [ -n \"$PYTHON\" ]; then",
+            "  LOCAL_PROXY_PORT=$($PYTHON - <<'PY'",
+            "import os, socket",
+            "s=socket.socket()",
+            "s.bind((os.environ['LOCAL_PROXY_BIND'],0))",
+            "print(s.getsockname()[1])",
+            "s.close()",
+            "PY",
+            "  )",
+            "fi",
+            f"if [ -z \"$LOCAL_PROXY_PORT\" ]; then LOCAL_PROXY_PORT={config.login_port}; fi",
+        ]
+    )
     start_tunnel = (
         f"{ssh_cmd} || {{ echo \"Slurm Connect: proxy tunnel SSH failed\" >&2; exit 1; }}"
     )
     wait_cmd = (
         "for i in $(seq 1 50); do "
-        "(echo > /dev/tcp/127.0.0.1/$LOCAL_PROXY_PORT) >/dev/null 2>&1 && break; "
+        "(echo > /dev/tcp/$LOCAL_PROXY_HOST/$LOCAL_PROXY_PORT) >/dev/null 2>&1 && break; "
         "sleep 0.1; "
         "done"
     )
     verify_cmd = (
-        "(echo > /dev/tcp/127.0.0.1/$LOCAL_PROXY_PORT) >/dev/null 2>&1 "
-        "|| { echo \"Slurm Connect: proxy tunnel failed to open 127.0.0.1:$LOCAL_PROXY_PORT\" >&2; exit 1; }"
+        "(echo > /dev/tcp/$LOCAL_PROXY_HOST/$LOCAL_PROXY_PORT) >/dev/null 2>&1 "
+        "|| { echo \"Slurm Connect: proxy tunnel failed to open $LOCAL_PROXY_HOST:$LOCAL_PROXY_PORT\" >&2; exit 1; }"
     )
     exports = build_proxy_env_exports(proxy_url, config.no_proxy)
     exec_shell_cmd = shell_cmd

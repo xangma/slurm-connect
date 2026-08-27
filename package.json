@@ -183,6 +183,11 @@
           "default": true,
           "description": "Create a compute-node SSH tunnel to the login host proxy (needed when GatewayPorts is disabled)."
         },
+        "slurmConnect.localProxyShareComputeTunnel": {
+          "type": "boolean",
+          "default": false,
+          "description": "Expose the authenticated compute-node proxy tunnel to other compute nodes so sbatch jobs that inherit the proxy environment can use it. Requires compute-node network reachability."
+        },
         "slurmConnect.localProxyTunnelMode": {
           "type": "string",
           "enum": [

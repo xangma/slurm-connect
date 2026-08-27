@@ -106,7 +106,8 @@ Example:
 "slurmConnect.localProxyEnabled": true,
 "slurmConnect.localProxyNoProxy": ["localhost", "127.0.0.1", ".cluster.local"],
 "slurmConnect.localProxyRemoteBind": "0.0.0.0",
-"slurmConnect.localProxyComputeTunnel": true
+"slurmConnect.localProxyComputeTunnel": true,
+"slurmConnect.localProxyShareComputeTunnel": false
 ```
 
 Notes:
@@ -126,3 +127,16 @@ When enabled (default), Slurm Connect starts an SSH tunnel from the compute node
 - The tunnel respects `slurmConnect.sshConnectTimeoutSeconds` (or `remote.SSH.connectTimeout` if you set it to 0).
 
 Disable it only if your compute nodes can directly reach the login-host bind address specified by `slurmConnect.localProxyRemoteBind`, and your SSH server allows those remote forwards.
+
+### Use the proxy from arbitrary sbatch jobs
+Keep `slurmConnect.localProxyComputeTunnel` enabled and opt in to sharing its authenticated listener:
+
+```json
+"slurmConnect.localProxyEnabled": true,
+"slurmConnect.localProxyComputeTunnel": true,
+"slurmConnect.localProxyShareComputeTunnel": true
+```
+
+Reconnect after changing the setting. Slurm Connect then exports a proxy URL containing the interactive compute node hostname instead of `127.0.0.1`. A normal `sbatch job.sh` submission inherits that URL, so the job script needs no proxy-specific commands. Explicitly use `sbatch --export=ALL job.sh` if your site changes Slurm's default export behavior; `--export=NONE` prevents this from working.
+
+The VS Code allocation and its tunnel must remain alive while the batch job uses the proxy, and job nodes must be able to connect to the interactive compute node. The listener still requires the short-lived proxy credentials, but it is reachable on the cluster network while the session is active. Leave this setting disabled when only the interactive session needs proxy access.

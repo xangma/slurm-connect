@@ -34,6 +34,7 @@ All settings live under the `slurmConnect` namespace.
 | `slurmConnect.localProxyRemoteBind` | string | `"0.0.0.0"` | Bind address for the login-host reverse tunnel. |
 | `slurmConnect.localProxyRemoteHost` | string | `""` | Hostname or IP that compute nodes use to reach the login host proxy. Defaults to the selected login host. |
 | `slurmConnect.localProxyComputeTunnel` | boolean | `true` | Create a compute-node SSH tunnel to the login host proxy (needed when GatewayPorts is disabled). When enabled, proxy env vars point to 127.0.0.1 on the compute node. Settings-only (not shown in the panel UI). |
+| `slurmConnect.localProxyShareComputeTunnel` | boolean | `false` | Expose the authenticated compute-node tunnel to other compute nodes and export the interactive node hostname, allowing ordinary `sbatch` jobs to inherit it. Requires compute-to-compute reachability and an active interactive allocation. |
 | `slurmConnect.localProxyTunnelMode` | string | `"remoteSsh"` | How to expose the local proxy on the login host. `remoteSsh` reuses the Remote-SSH connection (single SSH session; requires `remote.SSH.useExecServer=false`). `dedicated` opens a separate SSH reverse tunnel. |
 | `slurmConnect.extraSallocArgs` | array | `[]` | Extra salloc arguments appended to every request (e.g. --gres=gpu:1). |
 | `slurmConnect.promptForExtraSallocArgs` | boolean | `false` | Prompt for additional salloc arguments each time you connect. |

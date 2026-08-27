@@ -9,6 +9,7 @@ import {
   isHostAllowed,
   isLoopbackHost,
   isProxyAuthValid,
+  isRemoteForwardBindSatisfied,
   normalizeProxyPort,
   parseProxyTarget,
   resolveRemoteBindConnectHost,
@@ -68,6 +69,18 @@ describe('localProxy utilities', () => {
     );
     expect(buildLocalProxyControlPath('same-key')).toContain('slurm-connect-tunnel-');
     expect(resolveRemoteBindConnectHost('[::]')).toBe('127.0.0.1');
+  });
+
+  it('requires the requested wildcard remote-forward listener scope', () => {
+    const loopbackOnly = [
+      'LISTEN 0 128 127.0.0.1:49875 0.0.0.0:*',
+      'LISTEN 0 128 [::1]:49875 [::]:*'
+    ].join('\n');
+    const wildcard = 'LISTEN 0 128 0.0.0.0:49875 0.0.0.0:*';
+
+    expect(isRemoteForwardBindSatisfied(loopbackOnly, '0.0.0.0', 49875)).toBe(false);
+    expect(isRemoteForwardBindSatisfied(wildcard, '0.0.0.0', 49875)).toBe(true);
+    expect(isRemoteForwardBindSatisfied(loopbackOnly, '127.0.0.1', 49875)).toBe(true);
   });
 
   it('parses proxy targets from absolute and relative URLs', () => {

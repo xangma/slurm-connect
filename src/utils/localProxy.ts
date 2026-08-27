@@ -214,6 +214,31 @@ export function resolveRemoteBindConnectHost(bindHost: string): string {
   return trimmed;
 }
 
+export function isRemoteForwardBindSatisfied(
+  listenerOutput: string,
+  bindHost: string,
+  remotePort: number
+): boolean {
+  const listeners = new Set<string>();
+  const port = Math.floor(remotePort);
+  for (const token of listenerOutput.split(/\s+/)) {
+    const match = /^(?:\[([^\]]+)\]|(.+)):(\d+)$/.exec(token.trim());
+    if (!match || Number(match[3]) !== port) {
+      continue;
+    }
+    listeners.add(normalizeHostForMatch(match[1] || match[2] || ''));
+  }
+
+  const requested = normalizeHostForMatch(bindHost);
+  if (!requested || requested === '0.0.0.0') {
+    return listeners.has('0.0.0.0') || listeners.has('*');
+  }
+  if (requested === '::') {
+    return listeners.has('::') || listeners.has('*');
+  }
+  return listeners.has(requested);
+}
+
 export function parseProxyTarget(req: ProxyRequestLike): {
   hostname: string;
   port: number;
