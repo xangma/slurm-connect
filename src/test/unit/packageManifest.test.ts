@@ -35,6 +35,24 @@ describe('VSIX package manifest', () => {
     expect(readme).not.toMatch(/!\[[^\]]*\]\([^)]*\.svg(?:[#?][^)]*)?\)/iu);
   });
 
+  it('ships matching Marketplace and Activity Bar branding', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as {
+      icon?: string;
+      contributes?: {
+        viewsContainers?: {
+          activitybar?: Array<{ id?: string; icon?: string }>;
+        };
+      };
+    };
+    const activityIcon = manifest.contributes?.viewsContainers?.activitybar
+      ?.find((container) => container.id === 'slurmConnect')?.icon;
+
+    expect(manifest.icon).toBe('media/slurm-connect-dark.png');
+    expect(activityIcon).toBe('media/slurm-connect.svg');
+    expect(fs.existsSync(path.join(root, manifest.icon!))).toBe(true);
+    expect(fs.existsSync(path.join(root, activityIcon!))).toBe(true);
+  });
+
   it('excludes local-only and generated artifacts from release packages', () => {
     const ignored = readVsCodeIgnore();
     const requiredIgnores = [

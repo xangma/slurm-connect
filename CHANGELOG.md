@@ -1,13 +1,14 @@
 # Changelog
 All notable changes to this project are documented in this file based on git tags and commit history.
 
-## Unreleased
+## 0.5.11 - 2026-08-27
 
 ### Added
 - Add an opt-in shared compute-node proxy tunnel so arbitrary `sbatch` jobs can inherit local HTTP(S) routing even when login-host `GatewayPorts` is disabled.
 
 ### Fixed
 - Reject login-host wildcard reverse forwards when SSH silently creates only loopback listeners.
+- Use the Slurm Connect mark consistently in Marketplace and README branding.
 
 ## 0.5.9 - 2026-04-28
 ### Fixed

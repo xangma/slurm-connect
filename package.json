@@ -5,6 +5,7 @@
   "version": "0.5.10",
   "publisher": "xangma",
   "repository": "https://github.com/xangma/slurm-connect",
+  "icon": "media/slurm-connect-dark.png",
   "engines": {
     "vscode": "^1.85.0"
   },
