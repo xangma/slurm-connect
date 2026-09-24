@@ -27,7 +27,12 @@ export interface ConnectFlowRuntime {
     options: vscode.QuickPickOptions
   ): Thenable<vscode.QuickPickItem | undefined>;
   withProgress<T>(options: vscode.ProgressOptions, task: () => Promise<T>): Promise<T>;
-  runSshCommand(loginHost: string, cfg: SlurmConnectConfig, command: string): Promise<string>;
+  runSshCommand(
+    loginHost: string,
+    cfg: SlurmConnectConfig,
+    command: string,
+    options?: { promptForAuth?: boolean }
+  ): Promise<string>;
   maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost: string): Promise<boolean>;
   queryPartitions(loginHost: string, cfg: SlurmConnectConfig): Promise<PartitionResult>;
   querySimpleList(loginHost: string, cfg: SlurmConnectConfig, command: string): Promise<string[]>;
@@ -145,19 +150,57 @@ export async function runConnectFlow(
     return { didConnect: false };
   }
 
+  let sshNeedsPasswordPrompt = false;
+  try {
+    await runtime.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Checking SSH access to ${loginHost}`,
+        cancellable: false
+      },
+      async () => runtime.runSshCommand(loginHost, cfg, 'true', {
+        promptForAuth: Boolean(cfg.identityFile)
+      })
+    );
+    log.appendLine(`SSH access to ${loginHost} verified.`);
+  } catch (error) {
+    if (!wasCancelled()) {
+      const detail = runtime.formatError(error);
+      if (!cfg.identityFile && /permission denied.*password/i.test(detail)) {
+        sshNeedsPasswordPrompt = true;
+        const message = `SSH reached ${loginHost}, but non-interactive authentication failed. Remote-SSH may prompt for a password; resource queries will be skipped. Check the Remote-SSH log if login fails.`;
+        log.appendLine(`${message} ${detail}`);
+        runtime.showWarningMessage(message);
+      } else {
+        const message = describeSshPreflightFailure(loginHost, detail);
+        log.appendLine(message);
+        runtime.showErrorMessage(message);
+        return { didConnect: false };
+      }
+    }
+    if (wasCancelled()) {
+      return { didConnect: false };
+    }
+  }
+  if (cancelAndReturn()) {
+    return { didConnect: false };
+  }
+
   let partition: string | undefined;
   let qos: string | undefined;
   let account: string | undefined;
 
   if (interactive) {
-    const { partitions, defaultPartition } = await runtime.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: 'Querying Slurm resources',
-        cancellable: false
-      },
-      async () => runtime.queryPartitions(loginHost, cfg)
-    );
+    const { partitions, defaultPartition } = sshNeedsPasswordPrompt
+      ? { partitions: [], defaultPartition: cfg.defaultPartition || undefined }
+      : await runtime.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Querying Slurm resources',
+          cancellable: false
+        },
+        async () => runtime.queryPartitions(loginHost, cfg)
+      );
 
     const partitionPick = await pickPartition(runtime, partitions, cfg.defaultPartition || defaultPartition);
     if (partitionPick === null) {
@@ -168,16 +211,18 @@ export async function runConnectFlow(
       return { didConnect: false };
     }
 
-    qos = await pickOptionalValue(
-      runtime,
-      'Select QoS (optional)',
-      await runtime.querySimpleList(loginHost, cfg, cfg.qosCommand)
-    );
-    account = await pickOptionalValue(
-      runtime,
-      'Select account (optional)',
-      await runtime.querySimpleList(loginHost, cfg, cfg.accountCommand)
-    );
+    if (!sshNeedsPasswordPrompt) {
+      qos = await pickOptionalValue(
+        runtime,
+        'Select QoS (optional)',
+        await runtime.querySimpleList(loginHost, cfg, cfg.qosCommand)
+      );
+      account = await pickOptionalValue(
+        runtime,
+        'Select account (optional)',
+        await runtime.querySimpleList(loginHost, cfg, cfg.accountCommand)
+      );
+    }
     if (cancelAndReturn()) {
       return { didConnect: false };
     }
@@ -231,7 +276,7 @@ export async function runConnectFlow(
     }
   }
 
-  if (!partition || partition.trim().length === 0) {
+  if (!sshNeedsPasswordPrompt && (!partition || partition.trim().length === 0)) {
     const resolvedPartition = await runtime.resolveDefaultPartitionForHost(loginHost, cfg);
     if (resolvedPartition) {
       partition = resolvedPartition;
@@ -243,7 +288,9 @@ export async function runConnectFlow(
   }
 
   if (!time || time.trim().length === 0) {
-    const resolvedTime = await runtime.resolvePartitionDefaultTimeForHost(loginHost, partition, cfg);
+    const resolvedTime = sshNeedsPasswordPrompt
+      ? undefined
+      : await runtime.resolvePartitionDefaultTimeForHost(loginHost, partition, cfg);
     if (resolvedTime) {
       time = resolvedTime;
       log.appendLine(`Using partition default time: ${time}`);
@@ -495,6 +542,26 @@ export async function runConnectFlow(
     loginHost,
     sessionMode: cfg.sessionMode
   };
+}
+
+function describeSshPreflightFailure(host: string, detail: string): string {
+  const reason = detail.trim() || 'SSH command failed';
+  if (/host key verification failed|remote host identification has changed/i.test(reason)) {
+    return `SSH host key verification failed for ${host}: ${reason}`;
+  }
+  if (/pre-ssh command failed/i.test(reason)) {
+    return `Pre-SSH setup failed for ${host}. Check the configured login or VPN command: ${reason}`;
+  }
+  if (/permission denied|authentication failed|too many authentication failures|no supported authentication methods|no identities|sign_and_send_pubkey|identity file|read_passphrase/i.test(reason)) {
+    return `SSH authentication failed for ${host}. Check your username, SSH key or agent, and cluster login method: ${reason}`;
+  }
+  if (/could not resolve hostname|name or service not known|temporary failure in name resolution|getaddrinfo|nodename nor servname provided/i.test(reason)) {
+    return `Cannot resolve login host ${host}. Check the host name or DNS connection: ${reason}`;
+  }
+  if (/timed out|network is unreachable|no route to host|connection refused|connection reset|connection closed/i.test(reason)) {
+    return `SSH connection to ${host} failed. Check network access, VPN, and the SSH service: ${reason}`;
+  }
+  return `SSH check failed for ${host}: ${reason}`;
 }
 
 export function buildSallocArgs(params: {

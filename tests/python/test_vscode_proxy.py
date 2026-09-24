@@ -1,9 +1,12 @@
 import errno
 import importlib.util
 import logging
+import subprocess
 import sys
 from io import StringIO
 from pathlib import Path
+
+import pytest
 
 
 def load_proxy_module():
@@ -19,6 +22,60 @@ def load_proxy_module():
 
 proxy = load_proxy_module()
 LOGGER = logging.getLogger("test.vscode_proxy")
+
+
+@pytest.mark.parametrize(
+    ("stderr", "category"),
+    [
+        ("sbatch: error: Requested node configuration is not available", "resource request rejected"),
+        ("sbatch: error: Invalid account or account/partition combination", "account or QoS rejected"),
+        ("sbatch: error: Unable to contact slurm controller", "scheduler unavailable"),
+    ],
+)
+def test_persistent_submission_preserves_sbatch_failure(monkeypatch, tmp_path, stderr, category):
+    monkeypatch.setattr(
+        proxy.slurm.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", stderr),
+    )
+    with pytest.raises(RuntimeError, match=category) as failure:
+        proxy.submit_persistent_job(
+            invoker=None,
+            workgroup=None,
+            salloc_args=["--nodes=99"],
+            session_key="test",
+            session_dir=str(tmp_path / "session"),
+            idle_timeout=0,
+            stale_seconds=60,
+            logger=LOGGER,
+        )
+    assert stderr in str(failure.value)
+
+
+def test_persistent_session_error_reaches_remote_ssh_stderr(monkeypatch):
+    monkeypatch.setattr(proxy.app, "configure_logging", lambda *args: LOGGER)
+    monkeypatch.setattr(proxy.app, "resolve_workgroup_invoker", lambda *args: None)
+    monkeypatch.setattr(
+        proxy.app,
+        "ensure_persistent_session",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Slurm resource request rejected: unavailable")),
+    )
+    result, stderr = run_proxy_main(monkeypatch, "--session-mode", "persistent")
+    assert result == 1
+    assert "Slurm resource request rejected: unavailable" in stderr
+
+
+def test_persistent_pending_job_reports_slurm_reason(monkeypatch):
+    monkeypatch.setattr(proxy.slurm, "get_job_state", lambda _job_id, _logger: "PENDING")
+    monkeypatch.setattr(
+        proxy.slurm.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "(Resources)\n", ""),
+    )
+    message = proxy.slurm.describe_unready_job("12345", 60, LOGGER)
+    assert "accepted job 12345" in message
+    assert "still PENDING" in message
+    assert "reason: Resources" in message
 
 
 def run_proxy_main(monkeypatch, *args):

@@ -222,6 +222,76 @@ describe('connect flow helpers', () => {
       '/work/project'
     );
     expect(runtime.waitForRemoteConnectionOrTimeout).toHaveBeenCalledWith(30_000, 500);
+    expect(runtime.runSshCommand).toHaveBeenCalledWith('login.example.com', cfg, 'true', {
+      promptForAuth: false
+    });
+  });
+
+  it.each([
+    ['Permission denied (publickey,password).', 'SSH authentication failed'],
+    ['Could not resolve hostname login.example.com', 'Cannot resolve login host'],
+    ['ssh: connect to host login.example.com port 22: Connection timed out', 'SSH connection to'],
+    ['Host key verification failed.', 'SSH host key verification failed'],
+    ['Pre-SSH command failed: VPN exited 1', 'Pre-SSH setup failed']
+  ])('stops before resource queries when SSH preflight fails: %s', async (detail, expected) => {
+    const runtime = createRuntime({
+      runSshCommand: vi.fn(async () => { throw new Error(detail); })
+    });
+
+    const result = await runConnectFlow(runtime, createConfig({ identityFile: '/home/alice/.ssh/id_ed25519' }), { interactive: false });
+
+    expect(result.didConnect).toBe(false);
+    expect(runtime.runSshCommand).toHaveBeenCalledWith('login.example.com', expect.anything(), 'true', {
+      promptForAuth: true
+    });
+    expect(runtime.showErrorMessage).toHaveBeenCalledWith(expect.stringContaining(expected));
+    expect(runtime.queryPartitions).not.toHaveBeenCalled();
+    expect(runtime.connectToHost).not.toHaveBeenCalled();
+  });
+
+  it('lets Remote-SSH prompt for a password when the batch SSH check reaches the host', async () => {
+    const runtime = createRuntime({
+      runSshCommand: vi.fn(async () => { throw new Error('Permission denied (publickey,password).'); })
+    });
+
+    const result = await runConnectFlow(runtime, createConfig(), { interactive: false });
+
+    expect(result.didConnect).toBe(true);
+    expect(runtime.runSshCommand).toHaveBeenCalledWith('login.example.com', expect.anything(), 'true', {
+      promptForAuth: false
+    });
+    expect(runtime.showWarningMessage).toHaveBeenCalledWith(expect.stringContaining('may prompt for a password'));
+    expect(runtime.showErrorMessage).not.toHaveBeenCalled();
+    expect(runtime.queryPartitions).not.toHaveBeenCalled();
+    expect(runtime.querySimpleList).not.toHaveBeenCalled();
+    expect(runtime.resolveDefaultPartitionForHost).not.toHaveBeenCalled();
+    expect(runtime.connectToHost).toHaveBeenCalled();
+  });
+
+  it('uses manual resource inputs without further SSH queries when password login is needed', async () => {
+    const runtime = createRuntime({
+      runSshCommand: vi.fn(async () => { throw new Error('Permission denied (publickey,password).'); }),
+      showInputBox: vi.fn(async (options) => {
+        if (options.title === 'Partition') {
+          return 'gpu';
+        }
+        if (options.title === 'Wall time') {
+          return '';
+        }
+        return options.value;
+      })
+    });
+
+    const result = await runConnectFlow(runtime, createConfig({ defaultPartition: '' }));
+
+    expect(result.didConnect).toBe(true);
+    expect(runtime.queryPartitions).not.toHaveBeenCalled();
+    expect(runtime.querySimpleList).not.toHaveBeenCalled();
+    expect(runtime.resolveDefaultPartitionForHost).not.toHaveBeenCalled();
+    expect(runtime.resolvePartitionDefaultTimeForHost).not.toHaveBeenCalled();
+    expect(vi.mocked(runtime.buildRemoteCommand).mock.calls[0][1]).toEqual(
+      expect.arrayContaining(['--partition=gpu', '--time=24:00:00'])
+    );
   });
 
   it('retries Remote-SSH local proxy forwards with an alternate port after connect failure', async () => {

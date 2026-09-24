@@ -1622,7 +1622,8 @@ function createConnectFlowRuntime(): ConnectFlowRuntime {
     showInputBox: (options) => vscode.window.showInputBox(options),
     showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
     withProgress: async (options, task) => await vscode.window.withProgress(options, () => task()),
-    runSshCommand: (loginHost, cfg, command) => sshRuntime.runSshCommand(loginHost, cfg, command),
+    runSshCommand: (loginHost, cfg, command, options) =>
+      sshRuntime.runSshCommand(loginHost, cfg, command, options),
     maybePromptForSshAuthOnConnect: (cfg, loginHost) =>
       sshRuntime.maybePromptForSshAuthOnConnect(cfg, loginHost),
     queryPartitions: (loginHost, cfg) => queryPartitionsConnect(createClusterQueryRuntime(), loginHost, cfg),

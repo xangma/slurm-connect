@@ -1,6 +1,13 @@
 # Changelog
 All notable changes to this project are documented in this file based on git tags and commit history.
 
+## 0.5.12 - 2026-09-24
+
+### Fixed
+- Check SSH access before starting a Slurm connection and distinguish DNS, network, host-key, setup, and authentication failures.
+- Let password-based Remote-SSH login proceed without repeated non-interactive resource queries.
+- Show persistent-job submission errors and pending-job reasons in the Remote-SSH log, including resource, account/QoS, and scheduler failures when Slurm reports them.
+
 ## 0.5.11 - 2026-08-27
 
 ### Added

@@ -35,6 +35,7 @@ from .parsing import (
 from .slurm import (
     build_salloc_command,
     build_srun_command,
+    describe_unready_job,
     detect_workgroup,
     ensure_persistent_session,
     is_recent_lock,
@@ -216,8 +217,9 @@ def main() -> int:
                 state_dir=state_dir,
                 logger=logger,
             )
-        except Exception:
+        except Exception as exc:
             logger.critical("Failed to establish persistent session.", exc_info=True)
+            stderr_stream.write(f"Persistent session setup failed: {exc}\n")
             close_tees()
             return 1
         persistent_session_info = session_info
@@ -241,6 +243,11 @@ def main() -> int:
             logger,
             stop_event=shutdown_event,
         ):
+            message = describe_unready_job(
+                session_info.job_id, args.session_ready_timeout, logger
+            )
+            logger.error(message)
+            stderr_stream.write(f"{message}\n")
             shutdown_event.set()
             if client_thread:
                 client_thread.join(timeout=1)

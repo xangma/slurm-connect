@@ -64,7 +64,12 @@ export interface SshCommandRuntime {
   pickSshErrorSummary(text: string): string;
   buildAgentStatusMessage(identityPathRaw: string): Promise<{ text: string; isError: boolean }>;
   maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost: string): Promise<boolean>;
-  runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string>;
+  runSshCommand(
+    host: string,
+    cfg: SlurmConnectConfig,
+    command: string,
+    options?: { promptForAuth?: boolean }
+  ): Promise<string>;
   runSshCommandWithInput(
     host: string,
     cfg: SlurmConnectConfig,
@@ -445,6 +450,17 @@ export function createSshCommandRuntime(deps: SshCommandDependencies): SshComman
     }
     args.push('-T', '-o', `BatchMode=${options.batchMode ? 'yes' : 'no'}`, '-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
     appendSshHostKeyCheckingArgs(args, cfg);
+    const queryOptionNames = new Set([
+      'proxyjump', 'proxycommand', 'port', 'identityagent', 'identitiesonly',
+      'certificatefile', 'userknownhostsfile', 'globalknownhostsfile',
+      'hostkeyalgorithms', 'pubkeyacceptedalgorithms', 'preferredauthentications',
+      'kbdinteractiveauthentication', 'gssapiauthentication'
+    ]);
+    for (const [name, value] of Object.entries(cfg.additionalSshOptions || {})) {
+      if (queryOptionNames.has(name.toLowerCase()) && value) {
+        args.push('-o', `${name}=${value}`);
+      }
+    }
     if (cfg.identityFile) {
       args.push('-i', expandHome(cfg.identityFile));
     }
@@ -1015,7 +1031,12 @@ export function createSshCommandRuntime(deps: SshCommandDependencies): SshComman
     return true;
   }
 
-  async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
+  async function runSshCommand(
+    host: string,
+    cfg: SlurmConnectConfig,
+    command: string,
+    options?: { promptForAuth?: boolean }
+  ): Promise<string> {
     await deps.ensurePreSshCommand(cfg, `SSH query to ${host}`);
     const args = buildSshArgs(host, cfg, command, { batchMode: true });
     const sshPath = await resolveSshToolPath('ssh');
@@ -1025,7 +1046,9 @@ export function createSshCommandRuntime(deps: SshCommandDependencies): SshComman
       return stdout.trim();
     } catch (error) {
       const errorText = normalizeSshErrorText(error);
-      const retry = await maybePromptForSshAuth(cfg, errorText);
+      const retry = options?.promptForAuth === false
+        ? undefined
+        : await maybePromptForSshAuth(cfg, errorText);
       if (retry?.kind === 'agent') {
         try {
           const { stdout } = await execFileAsync(sshPath, args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });

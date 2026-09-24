@@ -342,6 +342,30 @@ def wait_for_job_running(
             time.sleep(2)
 
 
+def describe_unready_job(job_id: str, timeout: int, logger: logging.Logger) -> str:
+    state = get_job_state(job_id, logger)
+    if state == "PENDING":
+        reason = ""
+        try:
+            result = subprocess.run(
+                ["squeue", "-h", "-j", job_id, "-o", "%r"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            if result.returncode == 0:
+                reason = (result.stdout or "").strip().strip("()")
+        except Exception:
+            logger.debug("Failed to query pending reason for job %s.", job_id, exc_info=True)
+        suffix = f" (reason: {reason})" if reason and reason.lower() != "none" else ""
+        return f"Slurm accepted job {job_id}, but it is still PENDING after {timeout}s{suffix}."
+    state_detail = f" (state: {state})" if state else ""
+    return f"Slurm job {job_id} did not reach RUNNING after {timeout}s{state_detail}."
+
+
 def get_job_nodelist(job_id: str, logger: logging.Logger) -> Optional[str]:
     try:
         result = subprocess.run(
@@ -685,6 +709,50 @@ def write_monitor_script(
     return monitor_path
 
 
+def describe_sbatch_failure(stderr: str, stdout: str) -> str:
+    detail = " ".join((stderr or stdout or "").split()) or "No error details returned by sbatch."
+    lower = detail.lower()
+    if any(
+        phrase in lower
+        for phrase in (
+            "unable to contact slurm controller",
+            "unable to contact slurmctld",
+            "socket timed out",
+            "connection refused",
+        )
+    ):
+        category = "Slurm scheduler unavailable"
+    elif any(
+        phrase in lower
+        for phrase in (
+            "invalid account",
+            "invalid qos",
+            "association",
+            "not permitted",
+            "access denied",
+            "accounting/qos policy",
+        )
+    ):
+        category = "Slurm account or QoS rejected"
+    elif any(
+        phrase in lower
+        for phrase in (
+            "requested node configuration is not available",
+            "requested nodes are busy",
+            "insufficient resources",
+            "invalid partition",
+            "invalid gres",
+            "invalid generic resource",
+            "memory specification can not be satisfied",
+            "time limit",
+        )
+    ):
+        category = "Slurm resource request rejected"
+    else:
+        category = "Slurm job submission failed"
+    return f"{category}: {detail}"
+
+
 def submit_persistent_job(
     invoker: Optional[WorkgroupInvoker],
     workgroup: Optional[str],
@@ -722,12 +790,13 @@ def submit_persistent_job(
         errors="replace",
     )
     if result.returncode != 0:
+        message = describe_sbatch_failure(result.stderr or "", result.stdout or "")
         logger.critical(
             "sbatch failed (exit %s): %s",
             result.returncode,
-            (result.stderr or "").strip(),
+            message,
         )
-        raise RuntimeError("sbatch failed")
+        raise RuntimeError(message)
 
     stdout = (result.stdout or "").strip()
     job_id = stdout.split(";", 1)[0].strip()

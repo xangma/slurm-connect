@@ -70,6 +70,8 @@ Global settings such as the SSH host prefix, managed include path, session state
 - **Open in new window**: Opens the connection in a new VS Code window.
 - **Status hints**: Show connection state and last cluster info timestamp.
 
+Before opening Remote-SSH, Connect runs a short SSH command on the selected login host. DNS, network, host-key, and SSH authentication failures stop the connection with a specific error. If the server offers password login but the non-interactive check cannot authenticate, Remote-SSH can still prompt for the password; Connect skips resource queries that also require non-interactive SSH. Slurm submits the allocation after Remote-SSH logs in; later Slurm errors appear in the **Remote-SSH log**. Persistent-session `sbatch` failures include Slurm's reason and identify resource, account/QoS, or scheduler failures when possible. If Slurm accepts a job but it stays pending past the connection timeout, the log shows its pending reason when available. The check confirms access to the login host, not that Slurm will accept the job or that resources are currently available.
+
 ## UI tips
 - The sticky action bar keeps **Connect**, connection status, and the cluster info timestamp visible while you scroll.
 - The Profiles section shows a summary row with saved resource defaults and derived totals before you load a profile.
