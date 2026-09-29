@@ -210,8 +210,7 @@ describe('localProxy runtime', () => {
       resolveSshToolPath: async () => '/usr/bin/ssh',
       normalizeSshErrorText: (error) => String(error),
       pickSshErrorSummary: (text) => text,
-      runSshCommand,
-      runPreSshCommandInTerminal: async () => undefined
+      runSshCommand
     });
   }
 

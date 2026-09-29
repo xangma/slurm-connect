@@ -62,6 +62,7 @@ export interface ResolvedSshHostInfo {
   identityFile?: string;
   port?: string;
   certificateFile?: string;
+  remoteCommand?: string;
   hasProxyCommand: boolean;
   hasProxyJump: boolean;
   hasExplicitHost: boolean;

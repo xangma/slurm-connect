@@ -565,6 +565,7 @@ export async function resolveSshHostFromConfig(
       port,
       identityFile,
       certificateFile,
+      remoteCommand: pickFirstValue(parsed.remotecommand),
       hasProxyCommand,
       hasProxyJump,
       hasExplicitHost: explicit.hasExplicitHost
