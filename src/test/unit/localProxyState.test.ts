@@ -4,6 +4,7 @@ vi.mock('vscode', () => ({}));
 
 import {
   applyStoredConnectionStateIfMissing,
+  extractSessionKeyFromRemoteCommand,
   getCachedRemoteHome,
   getStoredConnectionState,
   resolveSessionKey,
@@ -85,6 +86,20 @@ describe('local proxy state helpers', () => {
       sessionMode: 'ephemeral',
       loginHost: 'login1'
     });
+  });
+
+  it('extracts the session key from a generated RemoteCommand', () => {
+    const remoteCommand =
+      "bash -lc 'echo ZWNobw== | base64 -d | bash; module load python/3.11.7 && python ~/.slurm-connect/vscode-proxy.py -vv " +
+      "'\\''--log-file=~/.slurm-connect/vscode-proxy-[PID].log'\\'' --session-mode=persistent " +
+      '--session-key=slurm-login05-ext-lrd_all_serial-1n-1c --session-client-id=abc --session-idle-timeout=600 ' +
+      "--salloc-arg=--partition=lrd_all_serial --salloc-arg=-A --salloc-arg=DestE_340_26'";
+    expect(extractSessionKeyFromRemoteCommand(remoteCommand)).toBe('slurm-login05-ext-lrd_all_serial-1n-1c');
+    expect(extractSessionKeyFromRemoteCommand("bash -lc 'python proxy.py --session-key='\\''my key'\\'''")).toBe(
+      'my key'
+    );
+    expect(extractSessionKeyFromRemoteCommand('bash -lc "python proxy.py --session-mode=ephemeral"')).toBeUndefined();
+    expect(extractSessionKeyFromRemoteCommand(undefined)).toBeUndefined();
   });
 
   it('prefers an explicit session key over the generated alias', () => {

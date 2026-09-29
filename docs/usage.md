@@ -66,7 +66,7 @@ Global settings such as the SSH host prefix, managed include path, session state
 
 ### Action bar
 - **Connect**: Creates the SSH host entry, opens Remote-SSH, and starts the allocation.
-- **Cancel job (disconnects)**: Cancels the persistent session allocation and disconnects.
+- **Cancel job (disconnects)**: Closes the Remote-SSH window, then cancels the persistent session allocation via the login host (so Remote-SSH cannot reconnect into a fresh allocation).
 - **Open in new window**: Opens the connection in a new VS Code window.
 - **Status hints**: Show connection state and last cluster info timestamp.
 

@@ -81,23 +81,13 @@ export interface LocalProxyDependencies {
   normalizeSshErrorText(error: unknown): string;
   pickSshErrorSummary(text: string): string;
   runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string>;
-  runPreSshCommandInTerminal(
-    command: string,
-    options?: {
-      terminalName?: string;
-      promptMessage?: string;
-      failureMessage?: string;
-      wrapInBash?: boolean;
-    }
-  ): Promise<void>;
 }
 
 export interface LocalProxyRuntime {
   cancelPersistentSessionJob(
     loginHost: string,
-    sessionKey: string | undefined,
-    cfg: SlurmConnectConfig,
-    options?: { useTerminal?: boolean }
+    sessionKey: string,
+    cfg: SlurmConnectConfig
   ): Promise<boolean>;
   ensureLocalProxyPlan(
     cfg: SlurmConnectConfig,
@@ -258,43 +248,26 @@ function buildSessionJobLookupScript(stateDir: string, sessionKey: string): stri
   ].join('\n');
 }
 
-function buildLocalCancelPersistentSessionCommand(stateDir: string, sessionKey?: string): string {
-  const key = (sessionKey || '').trim();
+export function buildLoginHostCancelPersistentSessionCommand(stateDir: string, sessionKey: string): string {
+  // Runs on the login host (not inside the allocation), so the job id comes from the
+  // session state written by the proxy rather than from SLURM_JOB_ID.
+  const encodedScript = Buffer.from(buildSessionJobLookupScript(stateDir, sessionKey), 'utf8').toString('base64');
   const lines = [
     'set +e',
-    'JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-}}"',
-    'if [ -n "$JOB_ID" ]; then',
-    '  echo "Slurm Connect: cancelling job $JOB_ID (from SLURM_JOB_ID)"',
-    '  scancel "$JOB_ID"',
-    '  exit $?',
-    'fi'
+    'PYTHON=$(command -v python3 || command -v python || true)',
+    'if [ -z "$PYTHON" ]; then',
+    '  echo "Slurm Connect: python not available to resolve session job." >&2',
+    '  exit 1',
+    'fi',
+    `JOB_ID=$(printf %s ${encodedScript} | base64 -d | "$PYTHON" - | tr -d "\\r" | tail -n 1)`,
+    'if [ -z "$JOB_ID" ]; then',
+    '  echo "Slurm Connect: no session job found." >&2',
+    '  exit 1',
+    'fi',
+    'echo "Slurm Connect: cancelling job $JOB_ID"',
+    'scancel "$JOB_ID"'
   ];
-  if (!key) {
-    lines.push('echo "Slurm Connect: no session key available to look up job id."');
-    lines.push('exit 1');
-    return lines.join('\n');
-  }
-  const script = buildSessionJobLookupScript(stateDir, key);
-  return lines
-    .concat([
-      'PYTHON=$(command -v python3 || command -v python || true)',
-      'if [ -z "$PYTHON" ]; then',
-      '  echo "Slurm Connect: python not available to resolve session job."',
-      '  exit 1',
-      'fi',
-      'JOB_ID=$("$PYTHON" - <<\'PY\'',
-      script,
-      'PY',
-      ')',
-      'JOB_ID=$(printf "%s" "$JOB_ID" | tr -d "\\r" | tail -n 1)',
-      'if [ -z "$JOB_ID" ]; then',
-      '  echo "Slurm Connect: no session job found."',
-      '  exit 1',
-      'fi',
-      'echo "Slurm Connect: cancelling job $JOB_ID"',
-      'scancel "$JOB_ID"'
-    ])
-    .join('\n');
+  return `bash -lc ${quoteShellArg(lines.join('\n'))}`;
 }
 
 function buildProxyArgs(
@@ -1043,39 +1016,28 @@ export function createLocalProxyRuntime(deps: LocalProxyDependencies): LocalProx
 
   async function cancelPersistentSessionJob(
     loginHost: string,
-    sessionKey: string | undefined,
-    cfg: SlurmConnectConfig,
-    _options?: { useTerminal?: boolean }
+    sessionKey: string,
+    cfg: SlurmConnectConfig
   ): Promise<boolean> {
     const log = deps.getOutputChannel();
     try {
       const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
-      if (vscode.env.remoteName === 'ssh-remote') {
-        const localCommand = buildLocalCancelPersistentSessionCommand(stateDir, sessionKey);
-        const label = sessionKey || 'current session';
-        log.appendLine(`Cancelling session "${label}" in remote terminal (loginHost=${loginHost}).`);
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'Cancelling Slurm allocation',
-            cancellable: false
-          },
-          async () =>
-            await deps.runPreSshCommandInTerminal(localCommand, {
-              terminalName: 'Slurm Connect Cancel',
-              promptMessage: '',
-              failureMessage: 'Cancel command failed in the terminal. Check terminal output for details.',
-              wrapInBash: true
-            })
-        );
-        log.appendLine(`Session cancel completed for "${label}".`);
-        void vscode.window.showInformationMessage(`Cancelled Slurm allocation for "${label}".`);
-        return true;
-      }
-      void vscode.window.showWarningMessage(
-        'Cancel job is only supported from an active remote session. Connect to the session first.'
+      const command = buildLoginHostCancelPersistentSessionCommand(stateDir, sessionKey);
+      log.appendLine(`Cancelling session "${sessionKey}" via login host ${loginHost}.`);
+      const output = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Cancelling Slurm allocation',
+          cancellable: false
+        },
+        async () => await deps.runSshCommand(loginHost, cfg, command)
       );
-      return false;
+      if (output) {
+        log.appendLine(output);
+      }
+      log.appendLine(`Session cancel completed for "${sessionKey}".`);
+      void vscode.window.showInformationMessage(`Cancelled Slurm allocation for "${sessionKey}".`);
+      return true;
     } catch (error) {
       const message = `Failed to cancel session ${sessionKey}: ${deps.formatError(error)}`;
       log.appendLine(message);

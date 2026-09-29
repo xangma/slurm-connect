@@ -92,11 +92,14 @@ import {
 } from './ssh/remoteSsh';
 import {
   applyStoredConnectionStateIfMissing as applyStoredConnectionStateIfMissingLocalProxyState,
+  extractSessionKeyFromRemoteCommand as extractSessionKeyFromRemoteCommandLocalProxyState,
   getCachedRemoteHome as getCachedRemoteHomeLocalProxyState,
   getStoredConnectionState as getStoredConnectionStateLocalProxyState,
   resolveSessionKey as resolveSessionKeyLocalProxyState,
   storeConnectionState as storeConnectionStateLocalProxyState,
-  storeRemoteHome as storeRemoteHomeLocalProxyState
+  storePendingSessionCancel as storePendingSessionCancelLocalProxyState,
+  storeRemoteHome as storeRemoteHomeLocalProxyState,
+  takePendingSessionCancel as takePendingSessionCancelLocalProxyState
 } from './localProxy/state';
 import {
   createLocalProxyRuntime,
@@ -259,8 +262,7 @@ function getLocalProxyRuntime(): LocalProxyRuntime {
       resolveSshToolPath: (tool) => sshRuntime.resolveSshToolPath(tool),
       normalizeSshErrorText: sshRuntime.normalizeSshErrorText,
       pickSshErrorSummary: sshRuntime.pickSshErrorSummary,
-      runSshCommand: (host, cfg, command) => sshRuntime.runSshCommand(host, cfg, command),
-      runPreSshCommandInTerminal
+      runSshCommand: (host, cfg, command) => sshRuntime.runSshCommand(host, cfg, command)
     });
   }
   return localProxyRuntime;
@@ -281,6 +283,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await runStartupMigrations();
   syncConnectionStateFromEnvironment();
   void resumeLocalProxyForRemoteSession();
+  void runPendingSessionCancel();
   const disposable = vscode.commands.registerCommand('slurmConnect.connect', async () => connectCommand());
   context.subscriptions.push(disposable);
 
@@ -1467,75 +1470,71 @@ async function handleCancelSessionMessage(): Promise<void> {
     void vscode.window.showWarningMessage('No persistent Slurm session is active to cancel.');
     return;
   }
+  const alias = resolveRemoteSshAlias();
+  if (!alias) {
+    void vscode.window.showWarningMessage(
+      'Cancel job is only supported from an active remote session. Connect to the session first.'
+    );
+    return;
+  }
+  const cfg = getConfig();
+  // The window's generated SSH host entry records the login host and session key the proxy was
+  // started with; remembered connection state may belong to an earlier connection.
+  let loginHost: string | undefined;
+  let sessionKey: string | undefined;
+  try {
+    const resolved = await resolveSshHostFromConfig(alias, cfg);
+    loginHost = resolved.hostname;
+    sessionKey = extractSessionKeyFromRemoteCommandLocalProxyState(resolved.remoteCommand);
+  } catch (error) {
+    getOutputChannel().appendLine(`Cancel job: failed to resolve SSH host ${alias}: ${formatError(error)}`);
+  }
+  sessionKey = sessionKey || resolveSessionKey(cfg, alias);
   getOutputChannel().appendLine(
-    `Cancel job requested. remoteName=${vscode.env.remoteName || 'local'}, alias=${lastConnectionAlias || '(none)'}, sessionKey=${lastConnectionSessionKey || '(none)'}, loginHost=${lastConnectionLoginHost || '(none)'}`
+    `Cancel job requested. alias=${alias}, sessionKey=${sessionKey}, loginHost=${loginHost || '(none)'}`
   );
-  const label = lastConnectionSessionKey || lastConnectionAlias || 'current session';
+  if (!loginHost) {
+    void vscode.window.showWarningMessage('Unable to resolve the login host to cancel the Slurm job.');
+    return;
+  }
   const choice = await vscode.window.showWarningMessage(
-    `Cancel job "${label}"? This will end the allocation and close the remote connection. Close this dialog to keep it running.`,
+    `Cancel job "${sessionKey}"? This will end the allocation and close the remote connection. Close this dialog to keep it running.`,
     { modal: true },
     'Cancel job'
   );
   if (choice !== 'Cancel job') {
     return;
   }
-  const cfg = getConfig();
-  const aliasFromRemote = resolveRemoteSshAlias();
-  const stored = getStoredConnectionState();
-  const aliasForSession = lastConnectionAlias || stored?.alias || aliasFromRemote || '';
-  const sessionKey =
-    lastConnectionSessionKey ||
-    stored?.sessionKey ||
-    (aliasForSession ? resolveSessionKey(cfg, aliasForSession) : '');
-  let loginHost =
-    lastConnectionLoginHost ||
-    stored?.loginHost ||
-    (cfg.loginHosts.length > 0 ? cfg.loginHosts[0] : undefined);
-  if (!loginHost && aliasForSession) {
-    try {
-      const resolved = await resolveSshHostFromConfig(aliasForSession, cfg);
-      loginHost = resolved.hostname || resolved.host || loginHost;
-    } catch {
-      // Ignore; we'll fall back to the existing value.
-    }
-  }
-  const isRemoteSession = vscode.env.remoteName === 'ssh-remote';
-  getOutputChannel().appendLine(
-    `Cancel job resolved. alias=${aliasForSession || '(none)'}, sessionKey=${sessionKey || '(none)'}, loginHost=${loginHost || '(none)'}, remote=${isRemoteSession}`
-  );
-  if (!sessionKey) {
-    getOutputChannel().appendLine(
-      'Cancel job: session key unavailable; will rely on SLURM_JOB_ID in the remote terminal.'
-    );
-  }
-  let cancelSent = false;
-  if (loginHost || isRemoteSession) {
-    cancelSent = await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
-      useTerminal: true
-    });
-  } else {
-    getOutputChannel().appendLine(
-      'Cancel job failed to resolve login host or session key; cannot proceed.'
-    );
+  // Cancelling from inside the allocation kills the VS Code server, and Remote-SSH then
+  // reconnects through the proxy, which allocates a new job. Close the window first; the
+  // reloaded local window cancels the job via the login host (see runPendingSessionCancel).
+  await storePendingSessionCancelLocalProxyState(extensionGlobalState, {
+    loginHost,
+    sessionKey,
+    requestedAt: Date.now()
+  });
+  setConnectionState('disconnecting');
+  if (!(await disconnectFromHost(alias))) {
+    await takePendingSessionCancelLocalProxyState(extensionGlobalState);
+    setConnectionState('connected');
     void vscode.window.showWarningMessage(
-      'Unable to resolve the login host or session key to cancel the Slurm job.'
+      'Could not close the Remote-SSH window, so the job was not cancelled. Disconnect and try again.'
     );
   }
-  if (!cancelSent) {
+}
+
+async function runPendingSessionCancel(): Promise<void> {
+  if (vscode.env.remoteName === 'ssh-remote') {
     return;
   }
-  setConnectionState('disconnecting');
-  const disconnected = await disconnectFromHost(aliasForSession || lastConnectionAlias);
-  if (disconnected) {
+  const pending = await takePendingSessionCancelLocalProxyState(extensionGlobalState);
+  if (!pending) {
+    return;
+  }
+  if (await cancelPersistentSessionJob(pending.loginHost, pending.sessionKey, getConfig())) {
     lastConnectionSessionKey = undefined;
     lastConnectionSessionMode = undefined;
     lastConnectionLoginHost = undefined;
-    setConnectionState('idle');
-  } else {
-    setConnectionState('connected');
-    void vscode.window.showWarningMessage(
-      'Job cancel command was sent, but the Remote-SSH window stayed connected. Disconnect manually if needed.'
-    );
   }
 }
 
@@ -2312,11 +2311,10 @@ function wrapPythonScriptCommand(encodedScript: string, emptyFallback: string): 
 
 async function cancelPersistentSessionJob(
   loginHost: string,
-  sessionKey: string | undefined,
-  cfg: SlurmConnectConfig,
-  options?: { useTerminal?: boolean }
+  sessionKey: string,
+  cfg: SlurmConnectConfig
 ): Promise<boolean> {
-  return await getLocalProxyRuntime().cancelPersistentSessionJob(loginHost, sessionKey, cfg, options);
+  return await getLocalProxyRuntime().cancelPersistentSessionJob(loginHost, sessionKey, cfg);
 }
 
 async function ensureLocalProxyPlan(
